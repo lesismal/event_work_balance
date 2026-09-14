@@ -4,9 +4,9 @@
 
 一个 Linux C11 网络库，采用单个 edge-triggered epoll event loop 和逻辑线程池。connection 是调度单位：每个 connection 自己维护有序事件队列，同时可以由任意空闲 worker 执行，不与固定线程绑定。
 
-[![架构总览](docs/assets/architecture-overview.zh-CN.svg)](docs/architecture.html)
+[![完整架构与执行流程图](docs/assets/architecture-full.zh-CN.png)](docs/architecture.html)
 
-_点击架构图可打开支持中英文切换的完整交互架构文档。_
+_点击完整架构与流程图可打开支持中英文切换的交互架构文档。_
 
 ## 设计
 

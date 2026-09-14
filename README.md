@@ -4,9 +4,9 @@
 
 A Linux C11 networking library built around one edge-triggered epoll event loop and a logical worker pool. Connections are the scheduling unit: each connection owns an ordered event queue, while any idle worker may execute it without a fixed connection-to-thread binding.
 
-[![Architecture overview](docs/assets/architecture-overview.svg)](docs/architecture.html)
+[![Complete architecture and execution flows](docs/assets/architecture-full.en.png)](docs/architecture.html)
 
-_Click the diagram to open the interactive, bilingual architecture document._
+_Click the complete diagram to open the interactive, bilingual architecture document._
 
 ## Design
 

@@ -114,6 +114,13 @@
     .flow-card { margin-top: 18px; padding: 28px; }
     .flow { display: none; grid-template-columns: repeat(5, 1fr); gap: 16px; position: relative; }
     .flow.active { display: grid; }
+    .capture .flow, .capture .flow[hidden] { display: grid !important; margin-bottom: 34px; }
+    .capture .flow:last-child { margin-bottom: 0; }
+    .capture .flow::before { grid-column: 1 / -1; color: var(--cyan); font: 800 11px "SFMono-Regular", monospace; letter-spacing: .1em; }
+    .capture #flow-read::before { content: "READ & SCHEDULE"; }
+    .capture #flow-write::before { content: "WRITE BACKPRESSURE"; }
+    .capture #flow-close::before { content: "CLOSE & RECLAIM"; }
+    .capture .tabs { display: none; }
     .step { min-height: 190px; padding: 18px; border-radius: 14px; background: #0b121d; border: 1px solid #24334b; position: relative; }
     .step:not(:last-child)::after { content: "→"; position: absolute; right: -24px; top: 43%; color: #60708a; z-index: 2; }
     .step-no { color: var(--blue); font: 800 10px "SFMono-Regular", monospace; letter-spacing: .12em; }
@@ -393,7 +400,7 @@
       ['connection 不绑定 worker', 'Connections are not bound to workers'], ['每次由当时可用的空闲线程领取并执行', 'Each round is claimed by whichever worker is idle'],
       ['一次领取，持续排空', 'One claim, drain to empty'], ['执行期间 scheduled 保持 true，禁止重复投递', 'scheduled stays true during execution, preventing duplicate submission'],
       ['唯一的内核 I/O 编排者，所有连接共享。', 'The sole kernel I/O coordinator, shared by every connection.'],
-      ['；', '; '], ['其他值 → connection。', 'any other value → connection.'],
+      ['；', '; '], ['其他值 → connection。', 'any other value → connection.'], ['→ listener；', '→ listener;'], ['→ command；其他值 → connection。', '→ command; any other value → connection.'],
       ['本轮：空闲 worker #2 → fd 42', 'this round: idle worker #2 → fd 42'], ['下轮：可能 worker #0 → fd 42', 'next round: possibly worker #0 → fd 42'],
       ['ready queue 保存 connection，而不是裸事件；pthread_cond_t 唤醒任意一个空闲 worker。', 'The ready queue stores connections, not raw events; pthread_cond_t wakes any idle worker.'],
       ['调整 EPOLLOUT；', ' adjusts EPOLLOUT; '], ['统一关闭。', ' performs serialized closure.'],
@@ -448,7 +455,12 @@
       document.querySelectorAll('[data-language]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.language === language)));
     }
     document.querySelectorAll('[data-language]').forEach(button => button.addEventListener('click', () => setLanguage(button.dataset.language)));
-    setLanguage('en');
+    const pageParameters = new URLSearchParams(location.search);
+    if (pageParameters.get('capture') === '1') document.body.classList.add('capture');
+    setLanguage(pageParameters.get('lang') === 'zh-CN' ? 'zh-CN' : 'en');
+    if (document.documentElement.lang === 'zh-CN' && document.body.classList.contains('capture')) {
+      document.head.appendChild(Object.assign(document.createElement('style'), { textContent: '.capture #flow-read::before{content:"读取与调度"}.capture #flow-write::before{content:"写背压"}.capture #flow-close::before{content:"关闭与回收"}' }));
+    }
 
     const tabs = [...document.querySelectorAll('[role="tab"]')];
     const panels = [...document.querySelectorAll('[role="tabpanel"]')];
