@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="单 epoll event loop、逐 fd 事件队列与逻辑线程池架构文档">
+  <meta name="description" content="Architecture of a single epoll event loop, per-connection event queues, and a logical worker pool">
   <title>Single-loop epoll · Architecture</title>
   <style>
     :root {
@@ -57,6 +57,10 @@
     .brand { display: flex; align-items: center; gap: 12px; font-weight: 760; letter-spacing: -.02em; }
     .brand-mark { width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid #3c5d88; border-radius: 9px; color: var(--cyan); background: #0c1725; }
     .nav-note { color: var(--muted); font-size: 13px; }
+    .nav-end { display: flex; align-items: center; gap: 15px; }
+    .language { display: flex; padding: 3px; border: 1px solid var(--line); border-radius: 9px; background: #0a1019; }
+    .language button { border: 0; border-radius: 6px; padding: 6px 9px; color: #748198; background: transparent; cursor: pointer; font: 700 10px "SFMono-Regular", monospace; }
+    .language button[aria-pressed="true"] { color: var(--ink); background: #1a2637; }
     header { padding: 74px 0 46px; display: grid; grid-template-columns: 1.3fr .7fr; gap: 48px; align-items: end; }
     .eyebrow { color: var(--cyan); font: 700 12px/1.3 "SFMono-Regular", monospace; letter-spacing: .16em; text-transform: uppercase; }
     h1 { font-size: clamp(44px, 6.2vw, 88px); line-height: .98; margin: 19px 0 24px; letter-spacing: -.062em; max-width: 950px; }
@@ -186,7 +190,7 @@
   <div class="shell">
     <nav>
       <div class="brand"><span class="brand-mark mono">ep</span> Single-loop epoll</div>
-      <div class="nav-note mono">architecture / implementation-aligned</div>
+      <div class="nav-end"><div class="nav-note mono">architecture / implementation-aligned</div><div class="language" aria-label="Language"><button type="button" data-language="en" aria-pressed="true">EN</button><button type="button" data-language="zh-CN" aria-pressed="false">中文</button></div></div>
     </nav>
 
     <header>
@@ -379,6 +383,73 @@
     <footer><span>Source of truth: src/epoll_server.c</span><span class="mono">EPOLL · ET · eventfd · pthread</span></footer>
   </div>
   <script>
+    const translations = new Map([
+      ['一个 I/O 核心，', 'One I/O core,'], ['逐连接串行。', 'ordered per connection.'],
+      ['单个 epoll event loop 管理所有 fd 和 I/O 关注；每个 connection 用自己的 FIFO 保存事件顺序；线程池动态选择空闲 worker，一次排空该 connection 的全部事件。', 'One epoll event loop manages every fd and I/O interest. Each connection preserves event order in its own FIFO, while the pool dynamically selects an idle worker to drain that connection.'],
+      ['核心不变量', 'Core invariant'], ['调度单位是', 'The scheduling unit is the'], ['，不是单个事件。connection 与 worker 没有固定绑定；但同一时刻，一个 connection 最多只有一个 worker 执行。', ', not an individual event. Connections are not permanently bound to workers, but each connection has at most one executor at any instant.'],
+      ['系统关系图', 'System relationship'], ['实线代表事件/任务前向流动，虚线代表 worker 经 command queue + eventfd 返回 event loop 的控制请求。', 'Solid lines show events and tasks moving forward; the dashed line shows control requests returning to the event loop through the command queue and eventfd.'],
+      ['连接调度契约', 'Connection scheduling contract'],
+      ['顺序保存在 connection 内', 'Order lives inside the connection'], ['事件先进入逐连接 FIFO，再参与线程池调度', 'Events enter the per-connection FIFO before pool scheduling'],
+      ['connection 不绑定 worker', 'Connections are not bound to workers'], ['每次由当时可用的空闲线程领取并执行', 'Each round is claimed by whichever worker is idle'],
+      ['一次领取，持续排空', 'One claim, drain to empty'], ['执行期间 scheduled 保持 true，禁止重复投递', 'scheduled stays true during execution, preventing duplicate submission'],
+      ['唯一的内核 I/O 编排者，所有连接共享。', 'The sole kernel I/O coordinator, shared by every connection.'],
+      ['；', '; '], ['其他值 → connection。', 'any other value → connection.'],
+      ['本轮：空闲 worker #2 → fd 42', 'this round: idle worker #2 → fd 42'], ['下轮：可能 worker #0 → fd 42', 'next round: possibly worker #0 → fd 42'],
+      ['ready queue 保存 connection，而不是裸事件；pthread_cond_t 唤醒任意一个空闲 worker。', 'The ready queue stores connections, not raw events; pthread_cond_t wakes any idle worker.'],
+      ['调整 EPOLLOUT；', ' adjusts EPOLLOUT; '], ['统一关闭。', ' performs serialized closure.'],
+      ['关键流程', 'Critical flows'], ['选择一个路径查看从内核事件到业务执行，再回到 event loop 的完整闭环。', 'Select a path to follow the complete loop from kernel event to logical execution and back to the event loop.'],
+      ['固定归属下的不均衡负载示意', 'Uneven load under fixed ownership'], ['动态调度下的均衡负载示意', 'Balanced load under dynamic dispatch'],
+      ['读取与调度', 'Read & schedule'], ['写背压', 'Write backpressure'], ['关闭与回收', 'Close & reclaim'],
+      ['epoll 返回事件', 'epoll returns an event'], ['通过', 'Use'], ['直接取得 connection，无需 fd → 对象查表。', 'to obtain the connection directly—no fd-to-object lookup.'],
+      ['连接队列去重', 'Coalesce queued reads'], ['持连接锁扫描尚未执行的队列；已有 IN 时合并新 IN。', 'Under the connection lock, scan unexecuted events and coalesce a new IN if one is already queued.'],
+      ['投递 connection', 'Submit the connection'], ['若原先未调度，锁内先设 scheduled，再把整个 connection 放入 ready queue，而非逐事件投递。', 'If idle, set scheduled under the lock and submit the entire connection to the ready queue—not each event separately.'],
+      ['空闲 worker 领取', 'An idle worker claims it'], ['任意空闲 worker 领取后，独占执行该 connection 的 FIFO，直到所有已排队事件处理完。', 'Any idle worker may claim it, then exclusively drains that connection FIFO until all queued events finish.'],
+      ['原子退出', 'Atomic exit'], ['持锁确认队列为空才清除 scheduled。之后的新事件可再次投递，并可能由另一个 worker 执行。', 'Clear scheduled only after confirming an empty queue under the lock. A later event resubmits the connection and may run on another worker.'],
+      ['业务提交数据', 'Application submits data'], ['复制数据并持锁追加到 connection 的 send queue。', 'Copy the data and append it to the connection send queue under its lock.'],
+      ['通知 I/O 核心', 'Notify the I/O core'], ['worker 追加 REFRESH command，并写 eventfd 唤醒 event loop。', 'The worker appends a REFRESH command and writes eventfd to wake the event loop.'],
+      ['开启写关注', 'Enable write interest'], ['event loop 发现待发送队列非空，通过 MOD 加入 EPOLLOUT。', 'The event loop sees pending output and adds EPOLLOUT with MOD.'],
+      ['尽力发送', 'Drain available writes'], ['worker 持连接锁推进 offset；写到 EAGAIN 时保留余量。', 'The worker advances the offset under the connection lock and preserves the remainder at EAGAIN.'],
+      ['解除写关注', 'Disable write interest'], ['队列清空后再次 REFRESH，由 event loop 移除 EPOLLOUT。', 'After the queue empties, another REFRESH makes the event loop remove EPOLLOUT.'],
+      ['检测终止条件', 'Detect termination'], ['EOF、ERR、HUP、RDHUP 或业务主动关闭都汇入同一路径。', 'EOF, ERR, HUP, RDHUP, and application closure converge on one path.'],
+      ['标记 closing', 'Mark closing'], ['持连接锁只允许第一个调用者创建 CLOSE command。', 'The connection lock allows only the first caller to create a CLOSE command.'],
+      ['引用保护命令', 'Retain for the command'], ['command 持有一份 connection 引用，避免跨线程悬空。', 'The command holds a connection reference to prevent a cross-thread dangling pointer.'],
+      ['event loop 关闭', 'Event loop closes'], ['统一执行 DEL、close、on_close，并从连接链表移除。', 'Perform DEL, close, on_close, and unlinking in one place.'],
+      ['最终回收', 'Final reclamation'], ['event loop、worker、command 各自释放所有权；引用归零后释放对象。', 'The event loop, worker, and command release ownership; the object is freed at zero references.'],
+      ['让任务追随空闲算力，而不是固守连接归属', 'Let work follow idle capacity—not fixed connection ownership'], ['无连接亲和性不是偶然结果，而是为了解决“连接分配完成后，实际负载仍持续变化”的动态不均衡。', 'No connection affinity is intentional: it addresses dynamic imbalance after the initial connection distribution, as real workloads keep changing.'],
+      ['fd 长期归属某个 worker', 'An fd stays with one worker'], ['类似经典 Nginx 多 worker 进程模型：每个 worker 有自己的事件循环和连接集合。即使接入阶段尽量均分，后续负载仍可能倾斜。', 'As in a classic Nginx-style multi-worker process model, each worker owns an event loop and connection set. Even if accepts are initially balanced, later workload may skew.'],
+      ['连接数量均衡，不代表事件频率与业务任务量均衡', 'Equal connection counts do not imply equal event rates or task volume'], ['少数热点或重任务连接可能集中在同一 worker', 'A few hot or expensive connections may cluster on one worker'], ['繁忙 worker 排队时，其他 worker 仍可能空闲', 'One worker may queue work while another remains idle'],
+      ['connection 每轮由空闲 worker 领取', 'An idle worker claims each connection round'], ['所有可执行 connection 进入共享 ready queue。线程池把下一份连接任务交给当时空闲的 worker，调度依据是实时可用算力，而不是历史 fd 归属。', 'Runnable connections enter one shared ready queue. The pool gives the next connection to a currently idle worker, using real-time capacity rather than historical fd ownership.'],
+      ['connection 是可迁移的调度单位，不固定绑定线程', 'The connection is a movable scheduling unit with no fixed thread binding'], ['空闲 worker 主动消费 ready queue，吸收任务量波动', 'Idle workers consume the ready queue and absorb workload variation'], ['每轮仍由单 worker 排空 FIFO，动态均衡不破坏顺序', 'One worker still drains each FIFO, so dynamic balancing preserves order'],
+      ['平衡的对象是“待执行任务量”，而不只是 fd 数量。', 'Balance pending work—not merely fd counts.'], ['动态 worker 选择提升线程池利用率；connection 自身队列继续承担顺序与并发隔离。', 'Dynamic worker selection improves utilization; the connection queue continues to provide ordering and concurrency isolation.'],
+      ['背景参考：Nginx 官方资料说明其采用多个 worker 进程，每个 worker 具有事件处理能力和连接容量；具体接入分配还会受到 accept_mutex、EPOLLEXCLUSIVE 或 reuseport 等机制影响。参见', 'Background: official Nginx material describes multiple worker processes, each with event processing and connection capacity. Accept distribution also depends on mechanisms such as accept_mutex, EPOLLEXCLUSIVE, or reuseport. See'], ['与', 'and'], ['。', '.'],
+      ['并发设计的三条边界', 'Three concurrency boundaries'], ['这三条规则共同把“一个全局 I/O 循环”和“多个业务执行线程”组合成可推理的系统。', 'Together, these rules make one global I/O loop and multiple logical workers a system that remains easy to reason about.'],
+      ['fd 控制权属于 event loop', 'fd control belongs to the event loop'], ['worker 不直接修改 epoll 注册或最终 close；它只通过 command queue 表达意图，减少 fd 重用与生命周期竞争。', 'Workers never directly change epoll registration or perform the final close. They express intent through the command queue, reducing fd-reuse and lifetime races.'],
+      ['顺序属于 connection', 'Order belongs to the connection'], ['事件先进入逐 connection FIFO；scheduled 为 true 的整个期间不会再次投递。领取它的 worker 连续排空队列，因此同一连接不会有两个线程并发执行，也不会乱序。', 'Events enter a per-connection FIFO. While scheduled is true, the connection is not submitted again. Its worker drains the queue, so two threads never execute one connection concurrently or out of order.'],
+      ['线程没有连接亲和性', 'Workers have no connection affinity'], ['connection 不固定绑定某个 worker，用共享 ready queue 避免 fd 数量或任务量分布不均造成的 worker 负载倾斜。本轮可能由 worker #2 执行，下轮可能由 worker #0 执行；顺序保证来自连接队列与状态锁，而非线程绑定。', 'A connection is not fixed to one worker. The shared ready queue reduces worker skew caused by uneven fd counts or task volume. Worker #2 may run this round and worker #0 the next; ordering comes from the connection queue and state lock, not thread affinity.']
+    ]);
+    const localizedNodes = [];
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    while (walker.nextNode()) {
+      const node = walker.currentNode;
+      const key = node.nodeValue.trim();
+      if (translations.has(key)) localizedNodes.push({ node, zh: key, en: translations.get(key) });
+    }
+    const localizedAttributes = [...document.querySelectorAll('[aria-label]')].map(node => ({ node, zh: node.getAttribute('aria-label') })).filter(item => translations.has(item.zh));
+    function setLanguage(language) {
+      const english = language === 'en';
+      document.documentElement.lang = english ? 'en' : 'zh-CN';
+      document.title = english ? 'Single-loop epoll · Architecture' : '单 Event Loop epoll · 架构';
+      localizedNodes.forEach(item => {
+        const leading = item.node.nodeValue.match(/^\s*/)[0];
+        const trailing = item.node.nodeValue.match(/\s*$/)[0];
+        item.node.nodeValue = leading + (english ? item.en : item.zh) + trailing;
+      });
+      localizedAttributes.forEach(item => item.node.setAttribute('aria-label', english ? translations.get(item.zh) : item.zh));
+      document.querySelectorAll('[data-language]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.language === language)));
+    }
+    document.querySelectorAll('[data-language]').forEach(button => button.addEventListener('click', () => setLanguage(button.dataset.language)));
+    setLanguage('en');
+
     const tabs = [...document.querySelectorAll('[role="tab"]')];
     const panels = [...document.querySelectorAll('[role="tabpanel"]')];
     function selectTab(tab) {

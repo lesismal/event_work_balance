@@ -1,38 +1,46 @@
 # Single-loop epoll server
 
-一个 Linux C11 网络库，采用单个 edge-triggered epoll event loop 和逻辑线程池。
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-## 设计
+A Linux C11 networking library built around one edge-triggered epoll event loop and a logical worker pool. Connections are the scheduling unit: each connection owns an ordered event queue, while any idle worker may execute it without a fixed connection-to-thread binding.
 
-- 监听 fd 注册时 `epoll_event.data.ptr == NULL`；连接建立后创建 `epoll_connection`，后续事件的 `data.ptr` 直接指向该结构。
-- 每个连接拥有 mutex、FIFO 事件队列和待发送数据队列。
-- event loop 负责 accept、收集读/写/错误事件及所有 `epoll_ctl`/close 操作。
-- 事件首次进入空闲连接队列时，通过带 mutex/condition variable 的线程池投递。一个连接始终只由一个 worker 串行处理，不同连接可并行。
-- ET 读循环持续到 `EAGAIN`；写循环持续到队列清空或 `EAGAIN`。存在待发送数据时注册 `EPOLLOUT`，清空后移除。
-- 若连接队列中已有尚未执行的读事件，新读事件会合并丢弃；正在执行的读事件不算“未执行”，避免在 `recv` 返回 `EAGAIN` 边界丢失新 edge。
-- 通过 `eventfd` 将 worker 的写关注更新和关闭请求送回 event loop，引用计数保护跨线程连接生命周期。
+[![Architecture overview](docs/assets/architecture-overview.svg)](docs/architecture.html)
 
-## 构建和运行
+_Click the diagram to open the interactive, bilingual architecture document._
+
+## Design
+
+- The listening fd is registered with `epoll_event.data.ptr == NULL`. Once accepted, each fd is wrapped in an `epoll_connection`, and subsequent events carry a direct pointer to that object.
+- Every connection owns a mutex, a FIFO event queue, and a pending-send queue.
+- The event loop owns accept, read/write/error event collection, every `epoll_ctl` operation, and final fd closure.
+- A connection is submitted to the worker pool only when its first queued event changes it from idle to scheduled. One worker drains all events for that connection in FIFO order.
+- Connections have no worker affinity. Each scheduling round may be handled by any idle worker, balancing actual task load instead of only fd counts.
+- A single connection is never executed by multiple workers concurrently. The connection mutex and `scheduled` state preserve ordering without fixed thread binding.
+- ET reads continue until `EAGAIN`. Writes continue until the send queue is empty or the socket returns `EAGAIN`; `EPOLLOUT` is enabled only while buffered output remains.
+- If an unexecuted read event already exists in a connection queue, another read event is coalesced. A read currently being executed does not count as queued, preventing an edge from being lost around the final `recv(...)=EAGAIN` boundary.
+- Workers return write-interest updates and close requests to the event loop through a command queue and `eventfd`. Reference counting protects connection lifetime across threads.
+
+## Build and run
 
 ```sh
 make
 ./echo_server 9000
 ```
 
-另一个终端可执行：
+From another terminal:
 
 ```sh
 printf 'hello\n' | nc 127.0.0.1 9000
 ```
 
-运行并发集成测试：
+Run the concurrent integration test:
 
 ```sh
 make test
 ```
 
-公共接口位于 `include/epoll_server.h`。`on_data` 在对应连接的逻辑 worker 上调用，可解析协议并调用 `epoll_connection_send`；发送函数会复制传入数据，因此回调返回后原缓冲区可立即复用。
+The public API is in [`include/epoll_server.h`](include/epoll_server.h). `on_data` runs on the logical worker currently executing that connection; it may parse the protocol and call `epoll_connection_send`. The send function copies its input, so the caller may immediately reuse the original buffer.
 
-## 架构文档
+## Architecture document
 
-打开 [`docs/architecture.html`](docs/architecture.html) 可查看 event loop、逐 fd 事件队列和逻辑线程池之间的关系，以及读取调度、写背压、关闭回收的交互流程图。
+Open [`docs/architecture.html`](docs/architecture.html) for the bilingual relationship diagram and the read scheduling, write backpressure, dynamic load balancing, and close/reclamation flows. English is selected by default.
