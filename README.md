@@ -32,3 +32,7 @@ make test
 ```
 
 公共接口位于 `include/epoll_server.h`。`on_data` 在对应连接的逻辑 worker 上调用，可解析协议并调用 `epoll_connection_send`；发送函数会复制传入数据，因此回调返回后原缓冲区可立即复用。
+
+## 架构文档
+
+打开 [`docs/architecture.html`](docs/architecture.html) 可查看 event loop、逐 fd 事件队列和逻辑线程池之间的关系，以及读取调度、写背压、关闭回收的交互流程图。
