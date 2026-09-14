@@ -1,4 +1,4 @@
-# Single-loop epoll server
+# Epoll Server
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -12,11 +12,12 @@ _Click the complete diagram to open the interactive, bilingual architecture docu
 
 - The listening fd is registered with `epoll_event.data.ptr == NULL`. Once accepted, each fd is wrapped in an `epoll_connection`, and subsequent events carry a direct pointer to that object.
 - Every connection owns a mutex, a FIFO event queue, and a pending-send queue.
-- The event loop owns accept, read/write/error event collection, every `epoll_ctl` operation, and final fd closure.
+- Accepted connections register `EPOLLIN`, `EPOLLPRI`, `EPOLLERR`, `EPOLLHUP`, and `EPOLLRDHUP` in ET mode. The event loop owns event collection, every `epoll_ctl` operation, and final fd closure.
 - A connection is submitted to the worker pool only when its first queued event changes it from idle to scheduled. One worker drains all events for that connection in FIFO order.
 - Connections have no worker affinity. Each scheduling round may be handled by any idle worker, balancing actual task load instead of only fd counts.
 - A single connection is never executed by multiple workers concurrently. The connection mutex and `scheduled` state preserve ordering without fixed thread binding.
 - ET reads continue until `EAGAIN`. Writes continue until the send queue is empty or the socket returns `EAGAIN`; `EPOLLOUT` is enabled only while buffered output remains.
+- When no output is pending, `epoll_connection_send` first attempts a direct send. Queued output can be flushed with either `write` or configurable `writev` batching (`use_writev`).
 - If an unexecuted read event already exists in a connection queue, another read event is coalesced. A read currently being executed does not count as queued, preventing an edge from being lost around the final `recv(...)=EAGAIN` boundary.
 - Workers return write-interest updates and close requests to the event loop through a command queue and `eventfd`. Reference counting protects connection lifetime across threads.
 

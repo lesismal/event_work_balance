@@ -29,6 +29,7 @@ int main(int argc, char **argv) {
         .backlog = 256,
         .worker_count = 4,
         .max_events = 256,
+        .use_writev = argc > 2 && strtoul(argv[2], NULL, 10) != 0,
     };
     epoll_server_callbacks_t callbacks = {.on_data = echo_data};
     running_server = epoll_server_create(&config, &callbacks, NULL);

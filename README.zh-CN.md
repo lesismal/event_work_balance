@@ -12,11 +12,12 @@ _点击完整架构与流程图可打开支持中英文切换的交互架构文�
 
 - 监听 fd 注册时 `epoll_event.data.ptr == NULL`；连接建立后创建 `epoll_connection`，后续事件的 `data.ptr` 直接指向该结构。
 - 每个连接拥有 mutex、FIFO 事件队列和待发送数据队列。
-- event loop 负责 accept、收集读/写/错误事件，以及全部 `epoll_ctl` 操作和最终 fd 关闭。
+- accept 后的连接以 ET 模式注册 `EPOLLIN`、`EPOLLPRI`、`EPOLLERR`、`EPOLLHUP` 和 `EPOLLRDHUP`；event loop 负责事件收集、全部 `epoll_ctl` 操作和最终 fd 关闭。
 - 首个事件使 connection 从空闲变为已调度时，才把 connection 投递到线程池。一个 worker 按 FIFO 顺序排空该 connection 的全部事件。
 - connection 与 worker 没有亲和性。每轮可由任意空闲 worker 执行，平衡的是实际任务量，而不只是 fd 数量。
 - 同一个 connection 不会同时被多个 worker 执行。connection mutex 和 `scheduled` 状态在不绑定固定线程的情况下保证事件顺序。
 - ET 读循环持续到 `EAGAIN`；写循环持续到队列清空或 `EAGAIN`。仅在存在待发送数据时注册 `EPOLLOUT`，清空后移除。
+- 没有待发送数据时，`epoll_connection_send` 会先尝试直接发送；排队数据可配置使用普通 `write` 或 `writev` 批量发送（`use_writev`）。
 - 若连接队列中已有尚未执行的读事件，新读事件会被合并。正在执行的读事件不算“尚未执行”，避免在最后一次 `recv(...)=EAGAIN` 的边界丢失新 edge。
 - worker 通过 command queue 和 `eventfd` 将写关注更新和关闭请求送回 event loop；引用计数保护跨线程 connection 生命周期。
 

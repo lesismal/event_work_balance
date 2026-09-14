@@ -317,11 +317,11 @@
             <article class="step"><span class="step-no">STEP 05</span><h3>原子退出</h3><p>持锁确认队列为空才清除 scheduled。之后的新事件可再次投递，并可能由另一个 worker 执行。</p><code>empty · true → false</code></article>
           </div>
           <div class="flow" id="flow-write" role="tabpanel" aria-labelledby="tab-write" hidden>
-            <article class="step"><span class="step-no">STEP 01</span><h3>业务提交数据</h3><p>复制数据并持锁追加到 connection 的 send queue。</p><code>epoll_connection_send()</code></article>
-            <article class="step"><span class="step-no">STEP 02</span><h3>通知 I/O 核心</h3><p>worker 追加 REFRESH command，并写 eventfd 唤醒 event loop。</p><code>COMMAND_REFRESH</code></article>
-            <article class="step"><span class="step-no">STEP 03</span><h3>开启写关注</h3><p>event loop 发现待发送队列非空，通过 MOD 加入 EPOLLOUT。</p><code>EPOLLIN | EPOLLOUT | ET</code></article>
-            <article class="step"><span class="step-no">STEP 04</span><h3>尽力发送</h3><p>worker 持连接锁推进 offset；写到 EAGAIN 时保留余量。</p><code>send until EAGAIN</code></article>
-            <article class="step"><span class="step-no">STEP 05</span><h3>解除写关注</h3><p>队列清空后再次 REFRESH，由 event loop 移除 EPOLLOUT。</p><code>EPOLLIN | ET</code></article>
+            <article class="step"><span class="step-no">STEP 01</span><h3>空队列直接发送</h3><p>send queue 为空且没有 flush 时，持 connection 锁先调用 send，完整写入则立即返回。</p><code>empty → send(MSG_NOSIGNAL)</code></article>
+            <article class="step"><span class="step-no">STEP 02</span><h3>必要时才入队</h3><p>已有排队数据、flush 正在执行、部分写入或 EAGAIN 时，才把剩余数据追加到队尾。</p><code>partial / EAGAIN → enqueue</code></article>
+            <article class="step"><span class="step-no">STEP 03</span><h3>开启写关注</h3><p>首次产生排队数据时发送 REFRESH command，由 event loop 加入 EPOLLOUT。</p><code>COMMAND_REFRESH → EPOLLOUT</code></article>
+            <article class="step"><span class="step-no">STEP 04</span><h3>摘取批次再发送</h3><p>锁内摘空共享队列，锁外使用 write 或可配置 writev；已完成 item 进入本地清理链表。</p><code>detach → write[v] → completed</code></article>
+            <article class="step"><span class="step-no">STEP 05</span><h3>锁内确认排空</h3><p>再次持锁接管并发新数据；确认队列为空后先保持空队列并清除 flushing，再解锁并移除 EPOLLOUT。</p><code>empty → flushing=false → unlock</code></article>
           </div>
           <div class="flow" id="flow-close" role="tabpanel" aria-labelledby="tab-close" hidden>
             <article class="step"><span class="step-no">STEP 01</span><h3>检测终止条件</h3><p>EOF、ERR、HUP、RDHUP 或业务主动关闭都汇入同一路径。</p><code>alive = false</code></article>
@@ -412,11 +412,11 @@
       ['投递 connection', 'Submit the connection'], ['若原先未调度，锁内先设 scheduled，再把整个 connection 放入 ready queue，而非逐事件投递。', 'If idle, set scheduled under the lock and submit the entire connection to the ready queue—not each event separately.'],
       ['空闲 worker 领取', 'An idle worker claims it'], ['任意空闲 worker 领取后，独占执行该 connection 的 FIFO，直到所有已排队事件处理完。', 'Any idle worker may claim it, then exclusively drains that connection FIFO until all queued events finish.'],
       ['原子退出', 'Atomic exit'], ['持锁确认队列为空才清除 scheduled。之后的新事件可再次投递，并可能由另一个 worker 执行。', 'Clear scheduled only after confirming an empty queue under the lock. A later event resubmits the connection and may run on another worker.'],
-      ['业务提交数据', 'Application submits data'], ['复制数据并持锁追加到 connection 的 send queue。', 'Copy the data and append it to the connection send queue under its lock.'],
-      ['通知 I/O 核心', 'Notify the I/O core'], ['worker 追加 REFRESH command，并写 eventfd 唤醒 event loop。', 'The worker appends a REFRESH command and writes eventfd to wake the event loop.'],
-      ['开启写关注', 'Enable write interest'], ['event loop 发现待发送队列非空，通过 MOD 加入 EPOLLOUT。', 'The event loop sees pending output and adds EPOLLOUT with MOD.'],
-      ['尽力发送', 'Drain available writes'], ['worker 持连接锁推进 offset；写到 EAGAIN 时保留余量。', 'The worker advances the offset under the connection lock and preserves the remainder at EAGAIN.'],
-      ['解除写关注', 'Disable write interest'], ['队列清空后再次 REFRESH，由 event loop 移除 EPOLLOUT。', 'After the queue empties, another REFRESH makes the event loop remove EPOLLOUT.'],
+      ['空队列直接发送', 'Send immediately on an empty queue'], ['send queue 为空且没有 flush 时，持 connection 锁先调用 send，完整写入则立即返回。', 'When the send queue is empty and no flush is active, call send under the connection lock and return immediately if it completes.'],
+      ['必要时才入队', 'Queue only when needed'], ['已有排队数据、flush 正在执行、部分写入或 EAGAIN 时，才把剩余数据追加到队尾。', 'Append the remainder only when data is already queued, a flush is active, or send is partial or returns EAGAIN.'],
+      ['开启写关注', 'Enable write interest'], ['首次产生排队数据时发送 REFRESH command，由 event loop 加入 EPOLLOUT。', 'When queued data first appears, send a REFRESH command so the event loop adds EPOLLOUT.'],
+      ['摘取批次再发送', 'Detach a batch, then write'], ['锁内摘空共享队列，锁外使用 write 或可配置 writev；已完成 item 进入本地清理链表。', 'Detach and clear the shared queue under the lock, then use write or configurable writev outside it; completed items move to a local cleanup list.'],
+      ['锁内确认排空', 'Confirm empty under the lock'], ['再次持锁接管并发新数据；确认队列为空后先保持空队列并清除 flushing，再解锁并移除 EPOLLOUT。', 'Re-lock to claim concurrently queued data. Once empty, keep the queue empty and clear flushing before unlocking and removing EPOLLOUT.'],
       ['检测终止条件', 'Detect termination'], ['EOF、ERR、HUP、RDHUP 或业务主动关闭都汇入同一路径。', 'EOF, ERR, HUP, RDHUP, and application closure converge on one path.'],
       ['标记 closing', 'Mark closing'], ['持连接锁只允许第一个调用者创建 CLOSE command。', 'The connection lock allows only the first caller to create a CLOSE command.'],
       ['引用保护命令', 'Retain for the command'], ['command 持有一份 connection 引用，避免跨线程悬空。', 'The command holds a connection reference to prevent a cross-thread dangling pointer.'],

@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -15,9 +16,14 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
-enum { CONNECTION_EVENT_MASK = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP };
+enum {
+    CONNECTION_EVENT_MASK =
+        EPOLLIN | EPOLLPRI | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP,
+    MAX_WRITEV_ITEMS = 64
+};
 
 typedef struct event_item {
     uint32_t events;
@@ -51,6 +57,7 @@ struct epoll_connection {
     bool closing;
     bool closed;
     bool write_interest;
+    bool flushing_output;
     atomic_uint references;
     struct epoll_connection *ready_next;
     struct epoll_connection *all_next;
@@ -71,6 +78,7 @@ struct epoll_server {
     int listen_fd;
     int wake_fd;
     size_t max_events;
+    bool use_writev;
     thread_pool_t pool;
     epoll_server_callbacks_t callbacks;
     void *user_data;
@@ -166,32 +174,69 @@ static void request_command(epoll_connection_t *connection, command_type_t type)
 int epoll_connection_send(epoll_connection_t *connection, const void *data, size_t size) {
     if (!connection || (!data && size) || size == 0)
         return size == 0 ? 0 : -1;
-    send_item_t *item = calloc(1, sizeof(*item));
-    if (!item)
-        return -1;
-    item->data = malloc(size);
-    if (!item->data) {
-        free(item);
-        return -1;
-    }
-    memcpy(item->data, data, size);
-    item->size = size;
 
     pthread_mutex_lock(&connection->mutex);
     if (connection->closing || connection->closed) {
         pthread_mutex_unlock(&connection->mutex);
-        free(item->data);
-        free(item);
         errno = EPIPE;
         return -1;
     }
+    bool queue_was_empty = connection->send_head == NULL;
+    size_t sent = 0;
+    if (queue_was_empty && !connection->flushing_output) {
+        for (;;) {
+            ssize_t written = send(connection->fd, data, size, MSG_NOSIGNAL);
+            if (written > 0) {
+                sent = (size_t)written;
+                break;
+            }
+            if (written < 0 && errno == EINTR)
+                continue;
+            if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                int error = errno;
+                pthread_mutex_unlock(&connection->mutex);
+                errno = error;
+                epoll_connection_close(connection);
+                return -1;
+            }
+            break;
+        }
+        if (sent == size) {
+            pthread_mutex_unlock(&connection->mutex);
+            return 0;
+        }
+    }
+
+    send_item_t *item = calloc(1, sizeof(*item));
+    if (!item) {
+        int error = errno;
+        pthread_mutex_unlock(&connection->mutex);
+        if (sent)
+            epoll_connection_close(connection);
+        errno = error;
+        return -1;
+    }
+    item->size = size - sent;
+    item->data = malloc(item->size);
+    if (!item->data) {
+        int error = errno;
+        pthread_mutex_unlock(&connection->mutex);
+        free(item);
+        if (sent)
+            epoll_connection_close(connection);
+        errno = error;
+        return -1;
+    }
+    memcpy(item->data, (const unsigned char *)data + sent, item->size);
     if (connection->send_tail)
         connection->send_tail->next = item;
     else
         connection->send_head = item;
     connection->send_tail = item;
+    bool request_write_interest = queue_was_empty && !connection->flushing_output;
     pthread_mutex_unlock(&connection->mutex);
-    request_command(connection, COMMAND_REFRESH);
+    if (request_write_interest)
+        request_command(connection, COMMAND_REFRESH);
     return 0;
 }
 
@@ -210,33 +255,101 @@ int epoll_connection_fd(const epoll_connection_t *connection) {
     return connection ? connection->fd : -1;
 }
 
+static ssize_t write_pending(epoll_connection_t *connection, send_item_t *head) {
+    if (!connection->server->use_writev)
+        return write(connection->fd, head->data + head->offset, head->size - head->offset);
+
+    struct iovec vectors[MAX_WRITEV_ITEMS];
+    int count = 0;
+    for (send_item_t *item = head; item && count < MAX_WRITEV_ITEMS; item = item->next) {
+        vectors[count].iov_base = item->data + item->offset;
+        vectors[count].iov_len = item->size - item->offset;
+        ++count;
+    }
+    return writev(connection->fd, vectors, count);
+}
+
+static void append_completed(send_item_t **head, send_item_t **tail, send_item_t *item) {
+    item->next = NULL;
+    if (*tail)
+        (*tail)->next = item;
+    else
+        *head = item;
+    *tail = item;
+}
+
+static void restore_pending_locked(epoll_connection_t *connection,
+                                   send_item_t *head,
+                                   send_item_t *tail) {
+    if (!head)
+        return;
+    tail->next = connection->send_head;
+    connection->send_head = head;
+    if (!connection->send_tail)
+        connection->send_tail = tail;
+}
+
 static bool flush_output(epoll_connection_t *connection) {
+    send_item_t *pending;
+    send_item_t *pending_tail;
+    send_item_t *completed_head = NULL;
+    send_item_t *completed_tail = NULL;
+
+    pthread_mutex_lock(&connection->mutex);
+    if (connection->closing || connection->closed || connection->flushing_output) {
+        bool usable = !connection->closing && !connection->closed;
+        pthread_mutex_unlock(&connection->mutex);
+        return usable;
+    }
+    connection->flushing_output = true;
+    pending = connection->send_head;
+    pending_tail = connection->send_tail;
+    connection->send_head = connection->send_tail = NULL;
+    pthread_mutex_unlock(&connection->mutex);
+
     for (;;) {
-        pthread_mutex_lock(&connection->mutex);
-        send_item_t *item = connection->send_head;
-        if (!item) {
-            pthread_mutex_unlock(&connection->mutex);
-            request_command(connection, COMMAND_REFRESH);
-            return true;
-        }
-        ssize_t written = send(connection->fd, item->data + item->offset,
-                               item->size - item->offset, MSG_NOSIGNAL);
-        if (written > 0) {
-            item->offset += (size_t)written;
-            if (item->offset == item->size) {
-                connection->send_head = item->next;
-                if (!connection->send_head)
-                    connection->send_tail = NULL;
-                free(item->data);
-                free(item);
+        if (!pending) {
+            pthread_mutex_lock(&connection->mutex);
+            pending = connection->send_head;
+            pending_tail = connection->send_tail;
+            connection->send_head = connection->send_tail = NULL;
+            if (!pending) {
+                /* Publish the empty queue before releasing the lock.  A sender
+                 * arriving afterwards observes flushing_output == false and
+                 * either writes immediately or requests EPOLLOUT itself. */
+                connection->flushing_output = false;
+                pthread_mutex_unlock(&connection->mutex);
+                free_sends(completed_head);
+                request_command(connection, COMMAND_REFRESH);
+                return true;
             }
             pthread_mutex_unlock(&connection->mutex);
+        }
+
+        ssize_t written = write_pending(connection, pending);
+        if (written > 0) {
+            size_t consumed = (size_t)written;
+            while (pending && consumed >= pending->size - pending->offset) {
+                consumed -= pending->size - pending->offset;
+                send_item_t *done = pending;
+                pending = pending->next;
+                append_completed(&completed_head, &completed_tail, done);
+            }
+            if (pending)
+                pending->offset += consumed;
+            if (!pending)
+                pending_tail = NULL;
             continue;
         }
         int error = errno;
-        pthread_mutex_unlock(&connection->mutex);
         if (written < 0 && error == EINTR)
             continue;
+
+        pthread_mutex_lock(&connection->mutex);
+        restore_pending_locked(connection, pending, pending_tail);
+        connection->flushing_output = false;
+        pthread_mutex_unlock(&connection->mutex);
+        free_sends(completed_head);
         if (written < 0 && (error == EAGAIN || error == EWOULDBLOCK)) {
             request_command(connection, COMMAND_REFRESH);
             return true;
@@ -264,6 +377,25 @@ static bool drain_input(epoll_connection_t *connection) {
     }
 }
 
+static bool drain_priority_input(epoll_connection_t *connection) {
+    unsigned char byte;
+    for (;;) {
+        ssize_t count = recv(connection->fd, &byte, sizeof(byte), MSG_OOB);
+        if (count > 0) {
+            if (connection->server->callbacks.on_data)
+                connection->server->callbacks.on_data(connection, &byte,
+                                                       (size_t)count,
+                                                       connection->server->user_data);
+            continue;
+        }
+        if (count == 0)
+            return false;
+        if (errno == EINTR)
+            continue;
+        return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINVAL;
+    }
+}
+
 static void process_connection(epoll_connection_t *connection) {
     for (;;) {
         pthread_mutex_lock(&connection->mutex);
@@ -288,6 +420,8 @@ static void process_connection(epoll_connection_t *connection) {
         uint32_t events = item->events;
         free(item);
         bool alive = !closed;
+        if (alive && (events & EPOLLPRI))
+            alive = drain_priority_input(connection);
         if (alive && (events & EPOLLIN))
             alive = drain_input(connection);
         if (alive && (events & EPOLLOUT))
@@ -301,6 +435,10 @@ static void process_connection(epoll_connection_t *connection) {
 
 static void *worker_main(void *argument) {
     thread_pool_t *pool = argument;
+    sigset_t blocked_signals;
+    sigemptyset(&blocked_signals);
+    sigaddset(&blocked_signals, SIGPIPE);
+    pthread_sigmask(SIG_BLOCK, &blocked_signals, NULL);
     for (;;) {
         pthread_mutex_lock(&pool->mutex);
         while (!pool->head && !pool->stopping)
@@ -411,6 +549,7 @@ epoll_server_t *epoll_server_create(const epoll_server_config_t *config,
         return NULL;
     server->epoll_fd = server->listen_fd = server->wake_fd = -1;
     server->max_events = config->max_events ? config->max_events : 256;
+    server->use_writev = config->use_writev;
     server->user_data = user_data;
     if (callbacks)
         server->callbacks = *callbacks;
@@ -452,7 +591,8 @@ static void accept_connections(epoll_server_t *server) {
             return;
         }
         epoll_connection_t *connection = new_connection(server, fd);
-        struct epoll_event event = {.events = EPOLLIN | EPOLLRDHUP | EPOLLET};
+        struct epoll_event event = {
+            .events = EPOLLIN | EPOLLPRI | EPOLLERR | EPOLLHUP | EPOLLRDHUP | EPOLLET};
         event.data.ptr = connection;
         if (!connection || epoll_ctl(server->epoll_fd, EPOLL_CTL_ADD, fd, &event)) {
             if (connection) {
@@ -552,7 +692,8 @@ static void apply_command(epoll_server_t *server, command_t *command) {
         pthread_mutex_unlock(&connection->mutex);
         if (usable && changed) {
             struct epoll_event event = {
-                .events = EPOLLIN | EPOLLRDHUP | EPOLLET | (has_output ? EPOLLOUT : 0)};
+                .events = EPOLLIN | EPOLLPRI | EPOLLERR | EPOLLHUP | EPOLLRDHUP | EPOLLET |
+                          (has_output ? EPOLLOUT : 0)};
             event.data.ptr = connection;
             if (epoll_ctl(server->epoll_fd, EPOLL_CTL_MOD, connection->fd, &event))
                 epoll_connection_close(connection);

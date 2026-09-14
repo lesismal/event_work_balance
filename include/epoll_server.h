@@ -2,6 +2,7 @@
 #define EPOLL_SERVER_H
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -17,6 +18,7 @@ typedef struct {
     int backlog;
     size_t worker_count;
     size_t max_events;
+    bool use_writev; /* Batch queued buffers with writev when true. */
 } epoll_server_config_t;
 
 typedef struct {
