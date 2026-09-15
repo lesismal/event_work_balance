@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 
 	epoll "github.com/lesismal/auto-balance-epoll/go"
 )
@@ -56,7 +55,7 @@ func (c *Context) WriteResponse(response Response) error {
 	if err != nil {
 		return err
 	}
-	if err = c.Conn.Send(data); err != nil {
+	if err = c.Conn.SendOwned(data); err != nil {
 		return err
 	}
 	c.wrote = true
@@ -69,7 +68,6 @@ func (c *Context) WriteResponse(response Response) error {
 type ServerHandler struct {
 	handler Handler
 	config  Config
-	states  sync.Map
 }
 
 func NewHandler(handler Handler) *ServerHandler {
@@ -86,16 +84,16 @@ func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 }
 
 func (h *ServerHandler) OnOpen(c *epoll.Connection) {
-	h.states.Store(c, NewParser(h.config))
+	c.SetAttachment(NewParser(h.config))
 }
 
 func (h *ServerHandler) OnData(c *epoll.Connection, data []byte) {
-	value, ok := h.states.Load(c)
-	if !ok {
-		value = NewParser(h.config)
-		h.states.Store(c, value)
+	parser, _ := c.Attachment().(*Parser)
+	if parser == nil {
+		parser = NewParser(h.config)
+		c.SetAttachment(parser)
 	}
-	requests, err := value.(*Parser).Feed(data)
+	requests, err := parser.Feed(data)
 	for _, request := range requests {
 		context := &Context{Conn: c, Request: request}
 		h.handler.ServeHTTP(context, request)
@@ -122,7 +120,7 @@ func (h *ServerHandler) OnData(c *epoll.Connection, data []byte) {
 }
 
 func (h *ServerHandler) OnPriorityData(*epoll.Connection, []byte) {}
-func (h *ServerHandler) OnClose(c *epoll.Connection, _ error)     { h.states.Delete(c) }
+func (h *ServerHandler) OnClose(c *epoll.Connection, _ error)     { c.SetAttachment(nil) }
 
 func marshalResponse(request *stdhttp.Request, response Response, closeConnection bool) ([]byte, error) {
 	if response.StatusCode < 100 || response.StatusCode > 999 {

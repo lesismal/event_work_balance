@@ -11,6 +11,7 @@ import (
 	stdhttp "net/http"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 var (
@@ -18,6 +19,12 @@ var (
 	ErrBodyTooLarge   = errors.New("http: request body too large")
 	ErrMalformed      = errors.New("http: malformed request")
 )
+
+var requestReaderPool = sync.Pool{New: func() any {
+	return bufio.NewReaderSize(bytes.NewReader(nil), 1024)
+}}
+
+const maxRetainedBuffer = 64 << 10
 
 type Config struct {
 	MaxHeaderBytes int
@@ -90,7 +97,7 @@ func (p *Parser) FeedOne(data []byte) (*stdhttp.Request, bool, error) {
 	if frame.chunked {
 		// net/http owns the chunk decoder; only chunked requests need this
 		// second parse. Content-Length requests reuse the header parse below.
-		req, err = stdhttp.ReadRequest(bufio.NewReader(bytes.NewReader(p.buffer[:frame.end])))
+		req, err = readRequest(p.buffer[:frame.end], true)
 		if err != nil {
 			p.buffer = nil
 			return nil, false, fmt.Errorf("%w: %v", ErrMalformed, err)
@@ -123,7 +130,11 @@ func (p *Parser) TakeBuffered() []byte {
 
 func (p *Parser) consume(n int) {
 	if n == len(p.buffer) {
-		p.buffer = p.buffer[:0]
+		if cap(p.buffer) > maxRetainedBuffer {
+			p.buffer = nil
+		} else {
+			p.buffer = p.buffer[:0]
+		}
 	} else {
 		copy(p.buffer, p.buffer[n:])
 		p.buffer = p.buffer[:len(p.buffer)-n]
@@ -148,7 +159,7 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 	if headerEnd > p.config.MaxHeaderBytes {
 		return frameInfo{}, false, ErrHeaderTooLarge
 	}
-	req, err := stdhttp.ReadRequest(bufio.NewReader(bytes.NewReader(p.buffer[:headerEnd])))
+	req, err := readRequest(p.buffer[:headerEnd], false)
 	if err != nil {
 		return frameInfo{}, false, fmt.Errorf("%w: %v", ErrMalformed, err)
 	}
@@ -177,6 +188,25 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 		return frameInfo{}, false, nil
 	}
 	return frameInfo{end: int(end64), headerEnd: headerEnd, request: req}, true, nil
+}
+
+func readRequest(data []byte, keepBody bool) (*stdhttp.Request, error) {
+	if keepBody {
+		return stdhttp.ReadRequest(bufio.NewReaderSize(bytes.NewReader(data), 1024))
+	}
+	var source bytes.Reader
+	source.Reset(data)
+	reader := requestReaderPool.Get().(*bufio.Reader)
+	reader.Reset(&source)
+	req, err := stdhttp.ReadRequest(reader)
+	if req != nil && !keepBody {
+		// Detach the request from the pooled reader. FeedOne installs the real
+		// Content-Length body after the complete frame has arrived.
+		req.Body = stdhttp.NoBody
+	}
+	reader.Reset(bytes.NewReader(nil))
+	requestReaderPool.Put(reader)
+	return req, err
 }
 
 func chunkedEnd(data []byte, offset, maxTrailer int, maxBody int64) (int, bool, error) {

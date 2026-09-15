@@ -1,6 +1,7 @@
 package http
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"strings"
@@ -29,6 +30,19 @@ func TestParserFragmentedAndPipelinedRequests(t *testing.T) {
 	}
 	if requests[1].URL.Path != "/two" {
 		t.Fatalf("second request path = %q", requests[1].URL.Path)
+	}
+}
+
+func TestParserReleasesOversizedBuffer(t *testing.T) {
+	body := bytes.Repeat([]byte{'x'}, maxRetainedBuffer+1)
+	raw := append([]byte("POST / HTTP/1.1\r\nContent-Length: 65537\r\n\r\n"), body...)
+	parser := NewParser(DefaultConfig())
+	requests, err := parser.Feed(raw)
+	if err != nil || len(requests) != 1 {
+		t.Fatalf("Feed returned %d requests, %v", len(requests), err)
+	}
+	if cap(parser.buffer) > maxRetainedBuffer {
+		t.Fatalf("retained buffer capacity = %d", cap(parser.buffer))
 	}
 }
 

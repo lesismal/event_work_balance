@@ -100,6 +100,8 @@ type sendItem struct {
 	offset int
 }
 
+type connectionAttachment struct{ value any }
+
 // Connection is safe to use from callback and application goroutines.
 type Connection struct {
 	fd             atomic.Int32
@@ -108,15 +110,35 @@ type Connection struct {
 	mu             sync.Mutex
 	pendingEvents  uint32
 	sends          []sendItem
+	sendHead       int
 	scheduled      bool
 	closing        bool
 	closed         bool
 	writeInterest  bool
 	flushing       bool
 	closeAfterSend bool
+	attachment     atomic.Pointer[connectionAttachment]
 }
 
 func (c *Connection) FD() int { return int(c.fd.Load()) }
+
+// Attachment returns application state associated with the connection.
+func (c *Connection) Attachment() any {
+	if value := c.attachment.Load(); value != nil {
+		return value.value
+	}
+	return nil
+}
+
+// SetAttachment associates application state with the connection. Passing nil
+// clears it. Protocol handlers use this to avoid a global connection-state map.
+func (c *Connection) SetAttachment(value any) {
+	if value == nil {
+		c.attachment.Store(nil)
+		return
+	}
+	c.attachment.Store(&connectionAttachment{value: value})
+}
 
 func (c *Connection) Close() {
 	c.closeWithError(nil)
@@ -131,7 +153,7 @@ func (c *Connection) CloseAfterSend() {
 		return
 	}
 	c.closeAfterSend = true
-	closeNow := len(c.sends) == 0 && !c.flushing
+	closeNow := c.sendHead == len(c.sends) && !c.flushing
 	c.mu.Unlock()
 	if closeNow {
 		c.closeWithError(nil)
@@ -150,6 +172,16 @@ func (c *Connection) closeWithError(err error) {
 
 // Send copies data before returning. It first attempts a direct nonblocking write.
 func (c *Connection) Send(data []byte) error {
+	return c.send(data, true)
+}
+
+// SendOwned sends data without copying it. Ownership transfers to the
+// connection immediately; the caller must not access data after the call.
+func (c *Connection) SendOwned(data []byte) error {
+	return c.send(data, false)
+}
+
+func (c *Connection) send(data []byte, copyData bool) error {
 	if len(data) == 0 {
 		return nil
 	}
@@ -158,7 +190,7 @@ func (c *Connection) Send(data []byte) error {
 		c.mu.Unlock()
 		return syscall.EPIPE
 	}
-	queueWasEmpty := len(c.sends) == 0
+	queueWasEmpty := c.sendHead == len(c.sends)
 	sent := 0
 	if queueWasEmpty && !c.flushing {
 		for {
@@ -181,8 +213,15 @@ func (c *Connection) Send(data []byte) error {
 			return nil
 		}
 	}
-	copyOfData := append([]byte(nil), data[sent:]...)
-	c.sends = append(c.sends, sendItem{data: copyOfData})
+	queued := data[sent:]
+	if copyData {
+		queued = append([]byte(nil), queued...)
+	}
+	if queueWasEmpty {
+		c.sends = c.sends[:0]
+		c.sendHead = 0
+	}
+	c.sends = append(c.sends, sendItem{data: queued})
 	refresh := queueWasEmpty && !c.flushing
 	c.mu.Unlock()
 	if refresh {
@@ -421,7 +460,7 @@ func (s *Server) drainCommands() {
 }
 func (s *Server) refreshConnection(c *Connection) {
 	c.mu.Lock()
-	hasOutput := len(c.sends) != 0
+	hasOutput := c.sendHead != len(c.sends)
 	usable := !c.closing && !c.closed
 	changed := c.writeInterest != hasOutput
 	c.writeInterest = hasOutput
@@ -561,7 +600,13 @@ func (c *Connection) flushOutput() error {
 	c.mu.Unlock()
 	for {
 		c.mu.Lock()
-		if len(c.sends) == 0 {
+		if c.sendHead == len(c.sends) {
+			if cap(c.sends) > maxWritevItems*2 {
+				c.sends = nil
+			} else {
+				c.sends = c.sends[:0]
+			}
+			c.sendHead = 0
 			c.flushing = false
 			closeAfterSend := c.closeAfterSend
 			c.mu.Unlock()
@@ -575,32 +620,33 @@ func (c *Connection) flushOutput() error {
 		var n int
 		var err error
 		if c.server.useWritev {
-			count := len(c.sends)
+			count := len(c.sends) - c.sendHead
 			if count > maxWritevItems {
 				count = maxWritevItems
 			}
 			var batch [maxWritevItems][]byte
 			buffers := batch[:count]
 			for i := 0; i < count; i++ {
-				buffers[i] = c.sends[i].data[c.sends[i].offset:]
+				item := &c.sends[c.sendHead+i]
+				buffers[i] = item.data[item.offset:]
 			}
 			n, err = writev(c.FD(), buffers)
 		} else {
-			item := c.sends[0]
+			item := c.sends[c.sendHead]
 			n, err = syscall.Write(c.FD(), item.data[item.offset:])
 		}
 		if n > 0 {
 			left := n
-			for len(c.sends) > 0 {
-				item := c.sends[0]
+			for c.sendHead < len(c.sends) {
+				item := &c.sends[c.sendHead]
 				remaining := len(item.data) - item.offset
 				if left < remaining {
 					item.offset += left
 					break
 				}
 				left -= remaining
-				c.sends[0] = sendItem{}
-				c.sends = c.sends[1:]
+				c.sends[c.sendHead] = sendItem{}
+				c.sendHead++
 			}
 			c.mu.Unlock()
 			continue

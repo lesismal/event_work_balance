@@ -32,6 +32,8 @@ func DefaultConfig() Config {
 
 type Handler interface {
 	OnOpen(*Connection, *stdhttp.Request)
+	// OnMessage payload is valid only for the duration of the callback. Copy it
+	// before returning if it must be retained.
 	OnMessage(*Connection, Opcode, []byte)
 	OnClose(*Connection, uint16, string, error)
 }
@@ -106,28 +108,29 @@ func (c *Connection) Close(code uint16, reason string) error {
 }
 
 func (c *Connection) writeFrame(opcode Opcode, payload []byte) error {
+	if c.closeSent.Load() {
+		return errors.New("websocket: close already sent")
+	}
 	frame, err := MarshalFrame(opcode, payload)
 	if err != nil {
 		return err
 	}
-	if c.closeSent.Load() {
-		return errors.New("websocket: close already sent")
-	}
-	return c.conn.Send(frame)
+	return c.conn.SendOwned(frame)
 }
 
 func (c *Connection) sendClose(payload []byte) error {
-	frame, err := MarshalFrame(Close, payload)
-	if err != nil {
-		return err
-	}
 	if !c.closeSent.CompareAndSwap(false, true) {
 		return nil
+	}
+	frame, err := MarshalFrame(Close, payload)
+	if err != nil {
+		c.closeSent.Store(false)
+		return err
 	}
 	c.mu.Lock()
 	c.closeCode, c.closeReason = closePayload(payload)
 	c.mu.Unlock()
-	if err = c.conn.Send(frame); err != nil {
+	if err = c.conn.SendOwned(frame); err != nil {
 		return err
 	}
 	c.conn.CloseAfterSend()
@@ -144,7 +147,6 @@ type connectionState struct {
 type ServerHandler struct {
 	config  Config
 	handler Handler
-	states  sync.Map
 }
 
 func NewHandler(handler Handler) *ServerHandler {
@@ -163,16 +165,15 @@ func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 }
 
 func (h *ServerHandler) OnOpen(c *epoll.Connection) {
-	h.states.Store(c, &connectionState{httpParser: epollhttp.NewParser(h.config.HTTP)})
+	c.SetAttachment(&connectionState{httpParser: epollhttp.NewParser(h.config.HTTP)})
 }
 
 func (h *ServerHandler) OnData(c *epoll.Connection, data []byte) {
-	value, ok := h.states.Load(c)
-	if !ok {
+	state, _ := c.Attachment().(*connectionState)
+	if state == nil {
 		h.OnOpen(c)
-		value, _ = h.states.Load(c)
+		state, _ = c.Attachment().(*connectionState)
 	}
-	state := value.(*connectionState)
 	if state.upgraded {
 		h.handleFrames(state, data)
 		return
@@ -191,7 +192,7 @@ func (h *ServerHandler) OnData(c *epoll.Connection, data []byte) {
 		return
 	}
 	key := request.Header.Get("Sec-WebSocket-Key")
-	if err = c.Send(handshakeResponse(key, subprotocol)); err != nil {
+	if err = c.SendOwned(handshakeResponse(key, subprotocol)); err != nil {
 		c.Close()
 		return
 	}
@@ -199,6 +200,7 @@ func (h *ServerHandler) OnData(c *epoll.Connection, data []byte) {
 	state.wsParser = NewParser(h.config.MaxMessageBytes)
 	state.upgraded = true
 	remainder := state.httpParser.TakeBuffered()
+	state.httpParser = nil
 	h.handler.OnOpen(state.websocket, request)
 	if len(remainder) != 0 {
 		h.handleFrames(state, remainder)
@@ -206,8 +208,16 @@ func (h *ServerHandler) OnData(c *epoll.Connection, data []byte) {
 }
 
 func (h *ServerHandler) handleFrames(state *connectionState, data []byte) {
-	events, err := state.wsParser.Feed(data)
-	for _, event := range events {
+	for {
+		event, complete, err := state.wsParser.FeedOneBorrowed(data)
+		data = nil
+		if err != nil {
+			h.closeParserError(state, err)
+			return
+		}
+		if !complete {
+			return
+		}
 		switch event.Opcode {
 		case Text, Binary:
 			h.handler.OnMessage(state.websocket, event.Opcode, event.Payload)
@@ -221,17 +231,18 @@ func (h *ServerHandler) handleFrames(state *connectionState, data []byte) {
 			return
 		}
 	}
-	if err != nil {
-		code := uint16(CloseProtocolError)
-		if errors.Is(err, ErrMessageTooBig) {
-			code = CloseMessageTooBig
-		} else if errors.Is(err, ErrInvalidPayload) {
-			code = CloseInvalidPayload
-		}
-		payload := make([]byte, 2)
-		binary.BigEndian.PutUint16(payload, code)
-		_ = state.websocket.sendClose(payload)
+}
+
+func (h *ServerHandler) closeParserError(state *connectionState, err error) {
+	code := uint16(CloseProtocolError)
+	if errors.Is(err, ErrMessageTooBig) {
+		code = CloseMessageTooBig
+	} else if errors.Is(err, ErrInvalidPayload) {
+		code = CloseInvalidPayload
 	}
+	var payload [2]byte
+	binary.BigEndian.PutUint16(payload[:], code)
+	_ = state.websocket.sendClose(payload[:])
 }
 
 func (h *ServerHandler) validateHandshake(request *stdhttp.Request) (string, error) {
@@ -280,11 +291,11 @@ func (h *ServerHandler) reject(c *epoll.Connection, request *stdhttp.Request, st
 func (h *ServerHandler) OnPriorityData(*epoll.Connection, []byte) {}
 
 func (h *ServerHandler) OnClose(c *epoll.Connection, err error) {
-	value, ok := h.states.LoadAndDelete(c)
-	if !ok {
+	state, _ := c.Attachment().(*connectionState)
+	c.SetAttachment(nil)
+	if state == nil {
 		return
 	}
-	state := value.(*connectionState)
 	if state.upgraded {
 		state.websocket.mu.Lock()
 		code := state.websocket.closeCode

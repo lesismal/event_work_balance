@@ -65,6 +65,7 @@ type portableEvent struct {
 	closeErr error
 	closing  bool
 }
+type connectionAttachment struct{ value any }
 type Connection struct {
 	server                             *Server
 	conn                               net.Conn
@@ -73,10 +74,24 @@ type Connection struct {
 	events                             []portableEvent
 	scheduled, closing, closeDelivered bool
 	writeMu                            sync.Mutex
+	attachment                         atomic.Pointer[connectionAttachment]
 }
 
 func (c *Connection) FD() int { return int(c.fd.Load()) }
 func (c *Connection) Close()  { c.closeWithError(nil) }
+func (c *Connection) Attachment() any {
+	if value := c.attachment.Load(); value != nil {
+		return value.value
+	}
+	return nil
+}
+func (c *Connection) SetAttachment(value any) {
+	if value == nil {
+		c.attachment.Store(nil)
+	} else {
+		c.attachment.Store(&connectionAttachment{value: value})
+	}
+}
 func (c *Connection) closeWithError(err error) {
 	c.mu.Lock()
 	if c.closing {
@@ -119,6 +134,9 @@ func (c *Connection) Send(data []byte) error {
 	}
 	return nil
 }
+
+// SendOwned is equivalent to Send on the synchronous portable backend.
+func (c *Connection) SendOwned(data []byte) error { return c.Send(data) }
 func (c *Connection) enqueueData(data []byte) bool {
 	c.mu.Lock()
 	if c.closing {

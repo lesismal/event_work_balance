@@ -36,6 +36,8 @@ var (
 	ErrInvalidPayload = errors.New("websocket: invalid payload")
 )
 
+const maxRetainedFrameBuffer = 64 << 10
+
 type Event struct {
 	Opcode  Opcode
 	Payload []byte
@@ -46,6 +48,7 @@ type Parser struct {
 	buffer          []byte
 	fragmentOpcode  Opcode
 	fragment        []byte
+	pendingConsume  int
 }
 
 func NewParser(maxMessageBytes int64) *Parser {
@@ -58,26 +61,54 @@ func NewParser(maxMessageBytes int64) *Parser {
 // Feed parses masked client frames and returns complete messages and control
 // frames. Fragmented data messages are reassembled before being returned.
 func (p *Parser) Feed(data []byte) ([]Event, error) {
-	p.buffer = append(p.buffer, data...)
 	var events []Event
 	for {
-		event, emit, complete, err := p.next()
+		event, complete, err := p.FeedOne(data)
+		data = nil
+		if err != nil || !complete {
+			return events, err
+		}
+		events = append(events, event)
+	}
+}
+
+// FeedOne returns at most one complete event without allocating an event
+// slice. Call it again with nil to drain additional frames already buffered.
+func (p *Parser) FeedOne(data []byte) (Event, bool, error) {
+	return p.feedOne(data, false)
+}
+
+// FeedOneBorrowed is the allocation-free variant used by ServerHandler for
+// unfragmented frames. Event.Payload remains valid only until the next parser
+// call and must not be retained by the callback.
+func (p *Parser) FeedOneBorrowed(data []byte) (Event, bool, error) {
+	return p.feedOne(data, true)
+}
+
+func (p *Parser) feedOne(data []byte, borrowPayload bool) (Event, bool, error) {
+	if p.pendingConsume != 0 {
+		p.consume(p.pendingConsume)
+		p.pendingConsume = 0
+	}
+	p.buffer = append(p.buffer, data...)
+	for {
+		event, emit, complete, err := p.next(borrowPayload)
 		if err != nil {
 			p.buffer = nil
 			p.fragment = nil
 			p.fragmentOpcode = 0
-			return events, err
+			return Event{}, false, err
 		}
 		if !complete {
-			return events, nil
+			return Event{}, false, nil
 		}
 		if emit {
-			events = append(events, event)
+			return event, true, nil
 		}
 	}
 }
 
-func (p *Parser) next() (Event, bool, bool, error) {
+func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 	if len(p.buffer) < 2 {
 		return Event{}, false, false, nil
 	}
@@ -141,11 +172,19 @@ func (p *Parser) next() (Event, bool, bool, error) {
 	if payloadLen > uint64(len(p.buffer)-offset) {
 		return Event{}, false, false, nil
 	}
-	payload := make([]byte, int(payloadLen))
-	for i := range payload {
-		payload[i] = p.buffer[offset+i] ^ mask[i&3]
+	frameEnd := offset + int(payloadLen)
+	var payload []byte
+	if borrowPayload {
+		payload = p.buffer[offset:frameEnd]
+		for i := range payload {
+			payload[i] ^= mask[i&3]
+		}
+	} else {
+		payload = make([]byte, int(payloadLen))
+		for i := range payload {
+			payload[i] = p.buffer[offset+i] ^ mask[i&3]
+		}
 	}
-	p.consume(offset + len(payload))
 
 	if control {
 		if opcode == Close {
@@ -156,6 +195,7 @@ func (p *Parser) next() (Event, bool, bool, error) {
 				return Event{}, false, false, ErrInvalidPayload
 			}
 		}
+		p.finishFrame(frameEnd, borrowPayload)
 		return Event{Opcode: opcode, Payload: payload}, true, true, nil
 	}
 	if opcode == Text || opcode == Binary {
@@ -163,13 +203,16 @@ func (p *Parser) next() (Event, bool, bool, error) {
 			if opcode == Text && !utf8.Valid(payload) {
 				return Event{}, false, false, ErrInvalidPayload
 			}
+			p.finishFrame(frameEnd, borrowPayload)
 			return Event{Opcode: opcode, Payload: payload}, true, true, nil
 		}
 		p.fragmentOpcode = opcode
 		p.fragment = append(p.fragment[:0], payload...)
+		p.consume(frameEnd)
 		return Event{}, false, true, nil
 	}
 	p.fragment = append(p.fragment, payload...)
+	p.consume(frameEnd)
 	if !fin {
 		return Event{}, false, true, nil
 	}
@@ -182,9 +225,21 @@ func (p *Parser) next() (Event, bool, bool, error) {
 	return event, true, true, nil
 }
 
+func (p *Parser) finishFrame(frameEnd int, borrowed bool) {
+	if borrowed {
+		p.pendingConsume = frameEnd
+	} else {
+		p.consume(frameEnd)
+	}
+}
+
 func (p *Parser) consume(n int) {
 	if n == len(p.buffer) {
-		p.buffer = p.buffer[:0]
+		if cap(p.buffer) > maxRetainedFrameBuffer {
+			p.buffer = nil
+		} else {
+			p.buffer = p.buffer[:0]
+		}
 		return
 	}
 	copy(p.buffer, p.buffer[n:])

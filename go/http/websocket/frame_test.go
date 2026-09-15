@@ -16,15 +16,31 @@ func clientFrame(opcode Opcode, fin bool, payload []byte) []byte {
 	header := []byte{first, 0x80}
 	if len(payload) < 126 {
 		header[1] |= byte(len(payload))
-	} else {
+	} else if len(payload) <= 65535 {
 		header[1] |= 126
 		header = append(header, byte(len(payload)>>8), byte(len(payload)))
+	} else {
+		header[1] |= 127
+		header = append(header, make([]byte, 8)...)
+		binary.BigEndian.PutUint64(header[2:10], uint64(len(payload)))
 	}
 	frame := append(header, mask[:]...)
 	for i, value := range payload {
 		frame = append(frame, value^mask[i&3])
 	}
 	return frame
+}
+
+func TestParserReleasesOversizedBuffer(t *testing.T) {
+	parser := NewParser(1 << 20)
+	frame := clientFrame(Binary, true, bytes.Repeat([]byte{'x'}, maxRetainedFrameBuffer+1))
+	if _, complete, err := parser.FeedOneBorrowed(frame); err != nil || !complete {
+		t.Fatalf("FeedOneBorrowed complete=%v, err=%v", complete, err)
+	}
+	_, _, _ = parser.FeedOneBorrowed(nil)
+	if cap(parser.buffer) > maxRetainedFrameBuffer {
+		t.Fatalf("retained buffer capacity = %d", cap(parser.buffer))
+	}
 }
 
 func TestParserFragmentedMessageAndPing(t *testing.T) {
@@ -91,5 +107,18 @@ func TestMarshalFrameLengths(t *testing.T) {
 		if got != uint64(size) {
 			t.Fatalf("encoded length = %d, want %d", got, size)
 		}
+	}
+}
+
+func TestFeedOneBorrowedPipelinedFrames(t *testing.T) {
+	parser := NewParser(1024)
+	data := append(clientFrame(Text, true, []byte("first")), clientFrame(Binary, true, []byte("second"))...)
+	first, complete, err := parser.FeedOneBorrowed(data)
+	if err != nil || !complete || string(first.Payload) != "first" {
+		t.Fatalf("first event = %#v, complete=%v, err=%v", first, complete, err)
+	}
+	second, complete, err := parser.FeedOneBorrowed(nil)
+	if err != nil || !complete || string(second.Payload) != "second" {
+		t.Fatalf("second event = %#v, complete=%v, err=%v", second, complete, err)
 	}
 }
