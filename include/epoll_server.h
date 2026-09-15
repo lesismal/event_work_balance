@@ -27,6 +27,10 @@ typedef struct {
                     const unsigned char *data,
                     size_t size,
                     void *user_data);
+    void (*on_priority_data)(epoll_connection_t *connection,
+                             const unsigned char *data,
+                             size_t size,
+                             void *user_data);
     void (*on_close)(epoll_connection_t *connection, void *user_data);
 } epoll_server_callbacks_t;
 

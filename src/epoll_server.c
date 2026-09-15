@@ -382,10 +382,10 @@ static bool drain_priority_input(epoll_connection_t *connection) {
     for (;;) {
         ssize_t count = recv(connection->fd, &byte, sizeof(byte), MSG_OOB);
         if (count > 0) {
-            if (connection->server->callbacks.on_data)
-                connection->server->callbacks.on_data(connection, &byte,
-                                                       (size_t)count,
-                                                       connection->server->user_data);
+            if (connection->server->callbacks.on_priority_data)
+                connection->server->callbacks.on_priority_data(
+                    connection, &byte, (size_t)count,
+                    connection->server->user_data);
             continue;
         }
         if (count == 0)

@@ -3,7 +3,7 @@ CFLAGS ?= -O2 -g -std=c11 -Wall -Wextra -Wpedantic
 CPPFLAGS += -Iinclude
 LDLIBS ?= -pthread
 
-.PHONY: all clean test
+.PHONY: all clean test go go-test
 
 all: echo_server
 
@@ -18,6 +18,12 @@ examples/echo_server.o: examples/echo_server.c include/epoll_server.h
 
 test: echo_server
 	./tests/integration.sh
+
+go:
+	cd go && go build ./...
+
+go-test:
+	cd go && go test ./...
 
 clean:
 	$(RM) echo_server src/*.o examples/*.o

@@ -40,7 +40,20 @@ printf 'hello\n' | nc 127.0.0.1 9000
 make test
 ```
 
-公共接口位于 [`include/epoll_server.h`](include/epoll_server.h)。`on_data` 在当前执行该 connection 的逻辑 worker 上调用，可解析协议并调用 `epoll_connection_send`；发送函数会复制传入数据，因此回调返回后原缓冲区可立即复用。
+## Go 实现
+
+同架构的 Go 版本位于 [`go/`](go/README.zh-CN.md)，包含公共 API、echo server
+示例，以及覆盖普通 `write` 和 `writev` 两种路径的并发背压测试：
+
+```sh
+make go
+make go-test
+```
+
+公共接口位于 [`include/epoll_server.h`](include/epoll_server.h)。普通数据调用
+`on_data`，由 `EPOLLPRI` 触发并通过 `MSG_OOB` 读取的带外数据单独调用
+`on_priority_data`。两者都在当前执行该 connection 的逻辑 worker 上调用，可解析协议并调用
+`epoll_connection_send`；发送函数会复制传入数据，因此回调返回后原缓冲区可立即复用。
 
 ## 架构文档
 

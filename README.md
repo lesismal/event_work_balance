@@ -40,7 +40,23 @@ Run the concurrent integration test:
 make test
 ```
 
-The public API is in [`include/epoll_server.h`](include/epoll_server.h). `on_data` runs on the logical worker currently executing that connection; it may parse the protocol and call `epoll_connection_send`. The send function copies its input, so the caller may immediately reuse the original buffer.
+## Go implementation
+
+The matching Go implementation lives in [`go/`](go/README.zh-CN.md). It includes
+the public API, an echo-server example, and concurrent backpressure tests for
+both the regular `write` and batched `writev` paths:
+
+```sh
+make go
+make go-test
+```
+
+The public API is in [`include/epoll_server.h`](include/epoll_server.h). Regular
+input invokes `on_data`; out-of-band input raised by `EPOLLPRI` and read with
+`MSG_OOB` invokes `on_priority_data`. Both run on the logical worker currently
+executing that connection; they may parse the protocol and call
+`epoll_connection_send`. The send function copies its input, so the caller may
+immediately reuse the original buffer.
 
 ## Architecture document
 

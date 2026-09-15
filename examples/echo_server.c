@@ -31,7 +31,10 @@ int main(int argc, char **argv) {
         .max_events = 256,
         .use_writev = argc > 2 && strtoul(argv[2], NULL, 10) != 0,
     };
-    epoll_server_callbacks_t callbacks = {.on_data = echo_data};
+    epoll_server_callbacks_t callbacks = {
+        .on_data = echo_data,
+        .on_priority_data = echo_data,
+    };
     running_server = epoll_server_create(&config, &callbacks, NULL);
     if (!running_server) {
         perror("epoll_server_create");
