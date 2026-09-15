@@ -44,7 +44,9 @@ make test
 
 The matching Go implementation lives in [`go/`](go/README.zh-CN.md). It includes
 the public API, an echo-server example, and concurrent backpressure tests for
-both the regular `write` and batched `writev` paths:
+both the regular `write` and batched `writev` paths. Linux uses the native epoll
+backend; macOS and Windows use a portable backend that preserves connection-level
+FIFO scheduling:
 
 ```sh
 make go
