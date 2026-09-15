@@ -32,6 +32,20 @@ func TestParserFragmentedAndPipelinedRequests(t *testing.T) {
 	}
 }
 
+func TestFeedOnePreservesProtocolUpgradeBytes(t *testing.T) {
+	parser := NewParser(DefaultConfig())
+	request, complete, err := parser.FeedOne([]byte("GET /chat HTTP/1.1\r\nHost: test\r\n\r\n\x81\x80"))
+	if err != nil || !complete {
+		t.Fatalf("FeedOne complete/error = %v/%v", complete, err)
+	}
+	if request.URL.Path != "/chat" {
+		t.Fatalf("path = %q", request.URL.Path)
+	}
+	if got := parser.TakeBuffered(); string(got) != "\x81\x80" {
+		t.Fatalf("buffered = %x", got)
+	}
+}
+
 func TestParserChunkedRequestWithTrailer(t *testing.T) {
 	parser := NewParser(DefaultConfig())
 	raw := "POST /chunks HTTP/1.1\r\nHost: example.test\r\nTransfer-Encoding: chunked\r\nTrailer: X-Checksum\r\n\r\n" +

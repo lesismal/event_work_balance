@@ -62,3 +62,24 @@ server, err := epoll.Bind(config, handler)
 cd go
 go run ./examples/http_server
 ```
+
+## WebSocket 子 package
+
+`http/websocket` package 实现 RFC 6455 Upgrade 握手、增量帧解析、
+分片消息重组、客户端掩码校验、Ping/Pong、Close 握手、子协议协商和消息大小限制：
+
+```go
+handler := websocket.NewHandler(websocket.HandlerFuncs{
+    Message: func(c *websocket.Connection, opcode websocket.Opcode, data []byte) {
+        _ = c.WriteMessage(opcode, data)
+    },
+})
+server, err := epoll.Bind(config, handler)
+```
+
+运行 WebSocket echo 示例：
+
+```sh
+cd go
+go run ./examples/websocket_server
+```

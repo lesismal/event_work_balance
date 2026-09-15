@@ -47,38 +47,62 @@ func NewParser(config Config) *Parser {
 
 // Feed may return zero, one, or several pipelined requests.
 func (p *Parser) Feed(data []byte) ([]*stdhttp.Request, error) {
-	p.buffer = append(p.buffer, data...)
 	var requests []*stdhttp.Request
-	for len(p.buffer) != 0 {
-		frameLen, complete, err := p.frameLength()
+	for {
+		req, complete, err := p.FeedOne(data)
+		data = nil
 		if err != nil {
-			p.buffer = nil
 			return requests, err
 		}
 		if !complete {
 			return requests, nil
 		}
-		frame := p.buffer[:frameLen]
-		req, err := stdhttp.ReadRequest(bufio.NewReader(bytes.NewReader(frame)))
-		if err != nil {
-			p.buffer = nil
-			return requests, fmt.Errorf("%w: %v", ErrMalformed, err)
-		}
-		body, err := io.ReadAll(io.LimitReader(req.Body, p.config.MaxBodyBytes+1))
-		_ = req.Body.Close()
-		if err != nil {
-			p.buffer = nil
-			return requests, fmt.Errorf("%w: %v", ErrMalformed, err)
-		}
-		if int64(len(body)) > p.config.MaxBodyBytes {
-			p.buffer = nil
-			return requests, ErrBodyTooLarge
-		}
-		req.Body = io.NopCloser(bytes.NewReader(body))
-		p.buffer = p.buffer[frameLen:]
 		requests = append(requests, req)
+		if len(p.buffer) == 0 {
+			return requests, nil
+		}
 	}
-	return requests, nil
+}
+
+// FeedOne parses at most one request. Any bytes following that request remain
+// buffered and can be retrieved with TakeBuffered. This is useful for protocol
+// upgrades whose first frame may arrive in the same TCP read as the request.
+func (p *Parser) FeedOne(data []byte) (*stdhttp.Request, bool, error) {
+	p.buffer = append(p.buffer, data...)
+	frameLen, complete, err := p.frameLength()
+	if err != nil {
+		p.buffer = nil
+		return nil, false, err
+	}
+	if !complete {
+		return nil, false, nil
+	}
+	frame := p.buffer[:frameLen]
+	req, err := stdhttp.ReadRequest(bufio.NewReader(bytes.NewReader(frame)))
+	if err != nil {
+		p.buffer = nil
+		return nil, false, fmt.Errorf("%w: %v", ErrMalformed, err)
+	}
+	body, err := io.ReadAll(io.LimitReader(req.Body, p.config.MaxBodyBytes+1))
+	_ = req.Body.Close()
+	if err != nil {
+		p.buffer = nil
+		return nil, false, fmt.Errorf("%w: %v", ErrMalformed, err)
+	}
+	if int64(len(body)) > p.config.MaxBodyBytes {
+		p.buffer = nil
+		return nil, false, ErrBodyTooLarge
+	}
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	p.buffer = p.buffer[frameLen:]
+	return req, true, nil
+}
+
+// TakeBuffered returns and clears bytes read beyond the last parsed request.
+func (p *Parser) TakeBuffered() []byte {
+	data := p.buffer
+	p.buffer = nil
+	return data
 }
 
 func (p *Parser) frameLength() (int, bool, error) {
