@@ -40,3 +40,25 @@ cd go
 go run ./examples/echo_server 9000 true
 go test ./...
 ```
+
+## HTTP 子 package
+
+`http` package 在原始连接之上提供 HTTP/1.0、HTTP/1.1 的增量解析和响应处理，
+支持 TCP 分包/粘包、流水线请求、`Content-Length`、chunked body、trailer、
+keep-alive 以及请求大小限制：
+
+```go
+handler := epollhttp.NewHandler(epollhttp.HandlerFunc(
+    func(c *epollhttp.Context, request *http.Request) {
+        _ = c.Respond(http.StatusOK, "text/plain; charset=utf-8", []byte("hello\n"))
+    },
+))
+server, err := epoll.Bind(config, handler)
+```
+
+完整示例：
+
+```sh
+cd go
+go run ./examples/http_server
+```

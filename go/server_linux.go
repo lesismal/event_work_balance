@@ -100,23 +100,40 @@ type sendItem struct {
 
 // Connection is safe to use from callback and application goroutines.
 type Connection struct {
-	fd            atomic.Int32
-	token         uint64
-	server        *Server
-	mu            sync.Mutex
-	events        []uint32
-	sends         []*sendItem
-	scheduled     bool
-	closing       bool
-	closed        bool
-	writeInterest bool
-	flushing      bool
+	fd             atomic.Int32
+	token          uint64
+	server         *Server
+	mu             sync.Mutex
+	events         []uint32
+	sends          []*sendItem
+	scheduled      bool
+	closing        bool
+	closed         bool
+	writeInterest  bool
+	flushing       bool
+	closeAfterSend bool
 }
 
 func (c *Connection) FD() int { return int(c.fd.Load()) }
 
 func (c *Connection) Close() {
 	c.closeWithError(nil)
+}
+
+// CloseAfterSend closes the connection after all data already accepted by Send
+// has been handed to the kernel.
+func (c *Connection) CloseAfterSend() {
+	c.mu.Lock()
+	if c.closing || c.closed || c.closeAfterSend {
+		c.mu.Unlock()
+		return
+	}
+	c.closeAfterSend = true
+	closeNow := len(c.sends) == 0 && !c.flushing
+	c.mu.Unlock()
+	if closeNow {
+		c.closeWithError(nil)
+	}
 }
 
 func (c *Connection) closeWithError(err error) {
@@ -135,7 +152,7 @@ func (c *Connection) Send(data []byte) error {
 		return nil
 	}
 	c.mu.Lock()
-	if c.closing || c.closed {
+	if c.closing || c.closed || c.closeAfterSend {
 		c.mu.Unlock()
 		return syscall.EPIPE
 	}
@@ -537,7 +554,12 @@ func (c *Connection) flushOutput() error {
 		c.mu.Lock()
 		if len(c.sends) == 0 {
 			c.flushing = false
+			closeAfterSend := c.closeAfterSend
 			c.mu.Unlock()
+			if closeAfterSend {
+				c.closeWithError(nil)
+				return nil
+			}
 			c.server.request(command{kind: commandRefresh, connection: c})
 			return nil
 		}
