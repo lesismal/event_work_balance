@@ -43,7 +43,8 @@ make test
 ## Go 实现
 
 同架构的 Go 版本位于 [`go/`](go/README.zh-CN.md)，包含公共 API、echo server
-示例，以及覆盖普通 `write` 和 `writev` 两种路径的并发背压测试：
+示例，以及覆盖普通 `write` 和 `writev` 两种路径的并发背压测试。Linux 使用原生
+epoll 后端，macOS 和 Windows 使用保持 connection 级 FIFO 调度语义的兼容后端：
 
 ```sh
 make go

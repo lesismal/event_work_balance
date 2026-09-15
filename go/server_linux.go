@@ -31,16 +31,18 @@ const (
 
 // Config controls listener and worker-pool sizing.
 type Config struct {
-	BindAddress string
-	Port        uint16
-	Backlog     int
-	WorkerCount int
-	MaxEvents   int
-	UseWritev   bool
+	BindAddress    string
+	Port           uint16
+	Backlog        int
+	WorkerCount    int
+	MaxEvents      int
+	ReadBufferSize int
+	UseWritev      bool
 }
 
 func DefaultConfig() Config {
-	return Config{BindAddress: "0.0.0.0", Port: 9000, Backlog: 128, WorkerCount: 4, MaxEvents: 256, UseWritev: true}
+	workerCount, maxEvents := defaultPoolSizing()
+	return Config{BindAddress: "0.0.0.0", Port: 9000, Backlog: 128, WorkerCount: workerCount, MaxEvents: maxEvents, ReadBufferSize: 16 * 1024, UseWritev: true}
 }
 
 // Handler callbacks run on a logical worker, except OnOpen and OnClose which
@@ -184,6 +186,7 @@ type Server struct {
 	commands                  []command
 	connections               map[uint64]*Connection // event-loop ownership
 	taskPool                  *taskpool.TaskPool
+	readBufferPool            sync.Pool
 	closeOnce                 sync.Once
 }
 
@@ -193,6 +196,9 @@ func Bind(config Config, handler Handler) (*Server, error) {
 	}
 	if config.MaxEvents <= 0 {
 		config.MaxEvents = 256
+	}
+	if config.ReadBufferSize <= 0 {
+		config.ReadBufferSize = 16 * 1024
 	}
 	if config.Backlog <= 0 {
 		config.Backlog = 128
@@ -223,6 +229,7 @@ func Bind(config Config, handler Handler) (*Server, error) {
 		useWritev: config.UseWritev, handler: handler, connections: make(map[uint64]*Connection)}
 	s.nextToken.Store(firstConnToken)
 	s.taskPool = taskpool.New(config.WorkerCount, config.MaxEvents)
+	s.readBufferPool.New = func() any { return make([]byte, config.ReadBufferSize) }
 	if err = s.addFD(listenFD, listenerToken, uint32(syscall.EPOLLIN)|epollET); err == nil {
 		err = s.addFD(wakeFD, wakeToken, uint32(syscall.EPOLLIN)|epollET)
 	}
@@ -482,7 +489,8 @@ func (c *Connection) process() {
 	}
 }
 func (c *Connection) drainInput() error {
-	buf := make([]byte, 16*1024)
+	buf := c.server.readBufferPool.Get().([]byte)
+	defer c.server.readBufferPool.Put(buf)
 	for {
 		n, err := syscall.Read(c.FD(), buf)
 		if n > 0 {
