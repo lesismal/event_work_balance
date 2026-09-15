@@ -30,8 +30,16 @@ func DefaultConfig() Config {
 
 // Parser incrementally turns arbitrary TCP chunks into complete HTTP requests.
 type Parser struct {
-	config Config
-	buffer []byte
+	config     Config
+	buffer     []byte
+	headerScan int
+}
+
+type frameInfo struct {
+	end       int
+	headerEnd int
+	chunked   bool
+	request   *stdhttp.Request
 }
 
 func NewParser(config Config) *Parser {
@@ -69,32 +77,39 @@ func (p *Parser) Feed(data []byte) ([]*stdhttp.Request, error) {
 // upgrades whose first frame may arrive in the same TCP read as the request.
 func (p *Parser) FeedOne(data []byte) (*stdhttp.Request, bool, error) {
 	p.buffer = append(p.buffer, data...)
-	frameLen, complete, err := p.frameLength()
+	frame, complete, err := p.frameLength()
 	if err != nil {
 		p.buffer = nil
+		p.headerScan = 0
 		return nil, false, err
 	}
 	if !complete {
 		return nil, false, nil
 	}
-	frame := p.buffer[:frameLen]
-	req, err := stdhttp.ReadRequest(bufio.NewReader(bytes.NewReader(frame)))
-	if err != nil {
-		p.buffer = nil
-		return nil, false, fmt.Errorf("%w: %v", ErrMalformed, err)
+	req := frame.request
+	if frame.chunked {
+		// net/http owns the chunk decoder; only chunked requests need this
+		// second parse. Content-Length requests reuse the header parse below.
+		req, err = stdhttp.ReadRequest(bufio.NewReader(bytes.NewReader(p.buffer[:frame.end])))
+		if err != nil {
+			p.buffer = nil
+			return nil, false, fmt.Errorf("%w: %v", ErrMalformed, err)
+		}
+		body, readErr := io.ReadAll(io.LimitReader(req.Body, p.config.MaxBodyBytes+1))
+		_ = req.Body.Close()
+		if readErr != nil || int64(len(body)) > p.config.MaxBodyBytes {
+			p.buffer = nil
+			if int64(len(body)) > p.config.MaxBodyBytes {
+				return nil, false, ErrBodyTooLarge
+			}
+			return nil, false, fmt.Errorf("%w: %v", ErrMalformed, readErr)
+		}
+		req.Body = io.NopCloser(bytes.NewReader(body))
+	} else if req.ContentLength > 0 {
+		body := append([]byte(nil), p.buffer[frame.headerEnd:frame.end]...)
+		req.Body = io.NopCloser(bytes.NewReader(body))
 	}
-	body, err := io.ReadAll(io.LimitReader(req.Body, p.config.MaxBodyBytes+1))
-	_ = req.Body.Close()
-	if err != nil {
-		p.buffer = nil
-		return nil, false, fmt.Errorf("%w: %v", ErrMalformed, err)
-	}
-	if int64(len(body)) > p.config.MaxBodyBytes {
-		p.buffer = nil
-		return nil, false, ErrBodyTooLarge
-	}
-	req.Body = io.NopCloser(bytes.NewReader(body))
-	p.buffer = p.buffer[frameLen:]
+	p.consume(frame.end)
 	return req, true, nil
 }
 
@@ -102,50 +117,66 @@ func (p *Parser) FeedOne(data []byte) (*stdhttp.Request, bool, error) {
 func (p *Parser) TakeBuffered() []byte {
 	data := p.buffer
 	p.buffer = nil
+	p.headerScan = 0
 	return data
 }
 
-func (p *Parser) frameLength() (int, bool, error) {
-	headerAt := bytes.Index(p.buffer, []byte("\r\n\r\n"))
+func (p *Parser) consume(n int) {
+	if n == len(p.buffer) {
+		p.buffer = p.buffer[:0]
+	} else {
+		copy(p.buffer, p.buffer[n:])
+		p.buffer = p.buffer[:len(p.buffer)-n]
+	}
+	p.headerScan = 0
+}
+
+func (p *Parser) frameLength() (frameInfo, bool, error) {
+	headerAt := bytes.Index(p.buffer[p.headerScan:], []byte("\r\n\r\n"))
 	if headerAt < 0 {
 		if len(p.buffer) > p.config.MaxHeaderBytes {
-			return 0, false, ErrHeaderTooLarge
+			return frameInfo{}, false, ErrHeaderTooLarge
 		}
-		return 0, false, nil
+		p.headerScan = len(p.buffer) - 3
+		if p.headerScan < 0 {
+			p.headerScan = 0
+		}
+		return frameInfo{}, false, nil
 	}
+	headerAt += p.headerScan
 	headerEnd := headerAt + 4
 	if headerEnd > p.config.MaxHeaderBytes {
-		return 0, false, ErrHeaderTooLarge
+		return frameInfo{}, false, ErrHeaderTooLarge
 	}
 	req, err := stdhttp.ReadRequest(bufio.NewReader(bytes.NewReader(p.buffer[:headerEnd])))
 	if err != nil {
-		return 0, false, fmt.Errorf("%w: %v", ErrMalformed, err)
+		return frameInfo{}, false, fmt.Errorf("%w: %v", ErrMalformed, err)
 	}
 	_ = req.Body.Close()
 	if len(req.TransferEncoding) != 0 {
 		if len(req.TransferEncoding) != 1 || !strings.EqualFold(req.TransferEncoding[0], "chunked") {
-			return 0, false, fmt.Errorf("%w: unsupported transfer encoding", ErrMalformed)
+			return frameInfo{}, false, fmt.Errorf("%w: unsupported transfer encoding", ErrMalformed)
 		}
 		end, complete, err := chunkedEnd(p.buffer, headerEnd, p.config.MaxHeaderBytes, p.config.MaxBodyBytes)
 		if err != nil || !complete {
-			return end, complete, err
+			return frameInfo{end: end, headerEnd: headerEnd, chunked: true, request: req}, complete, err
 		}
 		if int64(end-headerEnd) > p.config.MaxBodyBytes+int64(p.config.MaxHeaderBytes) {
-			return 0, false, ErrBodyTooLarge
+			return frameInfo{}, false, ErrBodyTooLarge
 		}
-		return end, true, nil
+		return frameInfo{end: end, headerEnd: headerEnd, chunked: true, request: req}, true, nil
 	}
 	if req.ContentLength < 0 {
-		return headerEnd, true, nil
+		return frameInfo{end: headerEnd, headerEnd: headerEnd, request: req}, true, nil
 	}
 	if req.ContentLength > p.config.MaxBodyBytes {
-		return 0, false, ErrBodyTooLarge
+		return frameInfo{}, false, ErrBodyTooLarge
 	}
 	end64 := int64(headerEnd) + req.ContentLength
 	if end64 > int64(len(p.buffer)) {
-		return 0, false, nil
+		return frameInfo{}, false, nil
 	}
-	return int(end64), true, nil
+	return frameInfo{end: int(end64), headerEnd: headerEnd, request: req}, true, nil
 }
 
 func chunkedEnd(data []byte, offset, maxTrailer int, maxBody int64) (int, bool, error) {

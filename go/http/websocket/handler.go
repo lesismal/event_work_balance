@@ -10,6 +10,7 @@ import (
 	stdhttp "net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 
 	epoll "github.com/lesismal/auto-balance-epoll/go"
@@ -63,7 +64,7 @@ type Connection struct {
 	conn        *epoll.Connection
 	subprotocol string
 	mu          sync.Mutex
-	closeSent   bool
+	closeSent   atomic.Bool
 	closeCode   uint16
 	closeReason string
 }
@@ -109,10 +110,7 @@ func (c *Connection) writeFrame(opcode Opcode, payload []byte) error {
 	if err != nil {
 		return err
 	}
-	c.mu.Lock()
-	closed := c.closeSent
-	c.mu.Unlock()
-	if closed {
+	if c.closeSent.Load() {
 		return errors.New("websocket: close already sent")
 	}
 	return c.conn.Send(frame)
@@ -123,12 +121,10 @@ func (c *Connection) sendClose(payload []byte) error {
 	if err != nil {
 		return err
 	}
-	c.mu.Lock()
-	if c.closeSent {
-		c.mu.Unlock()
+	if !c.closeSent.CompareAndSwap(false, true) {
 		return nil
 	}
-	c.closeSent = true
+	c.mu.Lock()
 	c.closeCode, c.closeReason = closePayload(payload)
 	c.mu.Unlock()
 	if err = c.conn.Send(frame); err != nil {
@@ -304,14 +300,17 @@ func (h *ServerHandler) OnClose(c *epoll.Connection, err error) {
 func handshakeResponse(key, subprotocol string) []byte {
 	sum := sha1.Sum([]byte(key + websocketGUID))
 	accept := base64.StdEncoding.EncodeToString(sum[:])
-	response := "HTTP/1.1 101 Switching Protocols\r\n" +
-		"Upgrade: websocket\r\n" +
-		"Connection: Upgrade\r\n" +
-		"Sec-WebSocket-Accept: " + accept + "\r\n"
+	response := make([]byte, 0, 129+len(subprotocol))
+	response = append(response, "HTTP/1.1 101 Switching Protocols\r\n"...)
+	response = append(response, "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "...)
+	response = append(response, accept...)
+	response = append(response, '\r', '\n')
 	if subprotocol != "" {
-		response += "Sec-WebSocket-Protocol: " + subprotocol + "\r\n"
+		response = append(response, "Sec-WebSocket-Protocol: "...)
+		response = append(response, subprotocol...)
+		response = append(response, '\r', '\n')
 	}
-	return []byte(response + "\r\n")
+	return append(response, '\r', '\n')
 }
 
 func headerHasToken(header stdhttp.Header, name, token string) bool {

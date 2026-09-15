@@ -61,7 +61,7 @@ func (p *Parser) Feed(data []byte) ([]Event, error) {
 	p.buffer = append(p.buffer, data...)
 	var events []Event
 	for {
-		event, complete, err := p.next()
+		event, emit, complete, err := p.next()
 		if err != nil {
 			p.buffer = nil
 			p.fragment = nil
@@ -71,115 +71,124 @@ func (p *Parser) Feed(data []byte) ([]Event, error) {
 		if !complete {
 			return events, nil
 		}
-		if event != nil {
-			events = append(events, *event)
+		if emit {
+			events = append(events, event)
 		}
 	}
 }
 
-func (p *Parser) next() (*Event, bool, error) {
+func (p *Parser) next() (Event, bool, bool, error) {
 	if len(p.buffer) < 2 {
-		return nil, false, nil
+		return Event{}, false, false, nil
 	}
 	first, second := p.buffer[0], p.buffer[1]
 	fin := first&0x80 != 0
 	opcode := Opcode(first & 0x0f)
 	if first&0x70 != 0 || second&0x80 == 0 {
-		return nil, false, ErrProtocol
+		return Event{}, false, false, ErrProtocol
 	}
 	control := opcode >= 0x8
 	if control && (!fin || second&0x7f > 125) {
-		return nil, false, ErrProtocol
+		return Event{}, false, false, ErrProtocol
 	}
 	switch opcode {
 	case Continuation:
 		if p.fragmentOpcode == 0 {
-			return nil, false, ErrProtocol
+			return Event{}, false, false, ErrProtocol
 		}
 	case Text, Binary:
 		if p.fragmentOpcode != 0 {
-			return nil, false, ErrProtocol
+			return Event{}, false, false, ErrProtocol
 		}
 	case Close, Ping, Pong:
 	default:
-		return nil, false, ErrProtocol
+		return Event{}, false, false, ErrProtocol
 	}
 
 	offset := 2
 	payloadLen := uint64(second & 0x7f)
 	if payloadLen == 126 {
 		if len(p.buffer) < offset+2 {
-			return nil, false, nil
+			return Event{}, false, false, nil
 		}
 		payloadLen = uint64(binary.BigEndian.Uint16(p.buffer[offset : offset+2]))
 		offset += 2
 		if payloadLen < 126 {
-			return nil, false, ErrProtocol
+			return Event{}, false, false, ErrProtocol
 		}
 	} else if payloadLen == 127 {
 		if len(p.buffer) < offset+8 {
-			return nil, false, nil
+			return Event{}, false, false, nil
 		}
 		payloadLen = binary.BigEndian.Uint64(p.buffer[offset : offset+8])
 		offset += 8
 		if payloadLen < 65536 || payloadLen>>63 != 0 {
-			return nil, false, ErrProtocol
+			return Event{}, false, false, ErrProtocol
 		}
 	}
 	if control && payloadLen > 125 {
-		return nil, false, ErrProtocol
+		return Event{}, false, false, ErrProtocol
 	}
 	current := int64(len(p.fragment))
 	if !control && (payloadLen > uint64(p.maxMessageBytes) || current > p.maxMessageBytes-int64(payloadLen)) {
-		return nil, false, ErrMessageTooBig
+		return Event{}, false, false, ErrMessageTooBig
 	}
 	if len(p.buffer) < offset+4 {
-		return nil, false, nil
+		return Event{}, false, false, nil
 	}
 	mask := p.buffer[offset : offset+4]
 	offset += 4
 	if payloadLen > uint64(len(p.buffer)-offset) {
-		return nil, false, nil
+		return Event{}, false, false, nil
 	}
 	payload := make([]byte, int(payloadLen))
 	for i := range payload {
 		payload[i] = p.buffer[offset+i] ^ mask[i&3]
 	}
-	p.buffer = p.buffer[offset+len(payload):]
+	p.consume(offset + len(payload))
 
 	if control {
 		if opcode == Close {
 			if len(payload) == 1 || (len(payload) >= 2 && !validCloseCode(binary.BigEndian.Uint16(payload[:2]))) {
-				return nil, false, ErrProtocol
+				return Event{}, false, false, ErrProtocol
 			}
 			if len(payload) > 2 && !utf8.Valid(payload[2:]) {
-				return nil, false, ErrInvalidPayload
+				return Event{}, false, false, ErrInvalidPayload
 			}
 		}
-		return &Event{Opcode: opcode, Payload: payload}, true, nil
+		return Event{Opcode: opcode, Payload: payload}, true, true, nil
 	}
 	if opcode == Text || opcode == Binary {
 		if fin {
 			if opcode == Text && !utf8.Valid(payload) {
-				return nil, false, ErrInvalidPayload
+				return Event{}, false, false, ErrInvalidPayload
 			}
-			return &Event{Opcode: opcode, Payload: payload}, true, nil
+			return Event{Opcode: opcode, Payload: payload}, true, true, nil
 		}
 		p.fragmentOpcode = opcode
 		p.fragment = append(p.fragment[:0], payload...)
-		return nil, true, nil
+		return Event{}, false, true, nil
 	}
 	p.fragment = append(p.fragment, payload...)
 	if !fin {
-		return nil, true, nil
+		return Event{}, false, true, nil
 	}
-	event := &Event{Opcode: p.fragmentOpcode, Payload: p.fragment}
+	event := Event{Opcode: p.fragmentOpcode, Payload: p.fragment}
 	if event.Opcode == Text && !utf8.Valid(event.Payload) {
-		return nil, false, ErrInvalidPayload
+		return Event{}, false, false, ErrInvalidPayload
 	}
 	p.fragmentOpcode = 0
 	p.fragment = nil
-	return event, true, nil
+	return event, true, true, nil
+}
+
+func (p *Parser) consume(n int) {
+	if n == len(p.buffer) {
+		p.buffer = p.buffer[:0]
+		return
+	}
+	copy(p.buffer, p.buffer[n:])
+	p.buffer = p.buffer[:len(p.buffer)-n]
 }
 
 func validCloseCode(code uint16) bool {

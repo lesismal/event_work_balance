@@ -106,8 +106,8 @@ type Connection struct {
 	token          uint64
 	server         *Server
 	mu             sync.Mutex
-	events         []uint32
-	sends          []*sendItem
+	pendingEvents  uint32
+	sends          []sendItem
 	scheduled      bool
 	closing        bool
 	closed         bool
@@ -182,7 +182,7 @@ func (c *Connection) Send(data []byte) error {
 		}
 	}
 	copyOfData := append([]byte(nil), data[sent:]...)
-	c.sends = append(c.sends, &sendItem{data: copyOfData})
+	c.sends = append(c.sends, sendItem{data: copyOfData})
 	refresh := queueWasEmpty && !c.flushing
 	c.mu.Unlock()
 	if refresh {
@@ -201,6 +201,7 @@ type Server struct {
 	nextToken                 atomic.Uint64
 	commandMu                 sync.Mutex
 	commands                  []command
+	wakePending               atomic.Bool
 	connections               map[uint64]*Connection // event-loop ownership
 	taskPool                  *taskpool.TaskPool
 	readBufferPool            sync.Pool
@@ -326,6 +327,9 @@ func (s *Server) request(cmd command) {
 	s.notify()
 }
 func (s *Server) notify() {
+	if !s.wakePending.CompareAndSwap(false, true) {
+		return
+	}
 	var b [8]byte
 	binary.LittleEndian.PutUint64(b[:], 1)
 	_, _ = syscall.Write(s.wakeFD, b[:])
@@ -370,20 +374,16 @@ func (s *Server) enqueueEvent(token uint64, events uint32) {
 		c.mu.Unlock()
 		return
 	}
-	if events&syscall.EPOLLIN != 0 {
-		for _, prior := range c.events {
-			if prior&syscall.EPOLLIN != 0 {
-				events &^= syscall.EPOLLIN
-				break
-			}
-		}
-	}
 	events &= allEvents
 	if events == 0 {
 		c.mu.Unlock()
 		return
 	}
-	c.events = append(c.events, events)
+	// epoll readiness is level information from the connection's point of
+	// view. Coalescing duplicate notifications avoids a slice scan and keeps a
+	// hot connection from allocating an unbounded event queue while its worker
+	// is draining the socket.
+	c.pendingEvents |= events
 	submit := !c.scheduled
 	c.scheduled = true
 	c.mu.Unlock()
@@ -406,6 +406,7 @@ func (s *Server) drainCommands() {
 			break
 		}
 	}
+	s.wakePending.Store(false)
 	s.commandMu.Lock()
 	commands := s.commands
 	s.commands = nil
@@ -470,13 +471,13 @@ func (c *Connection) process() {
 	}()
 	for {
 		c.mu.Lock()
-		if len(c.events) == 0 {
+		if c.pendingEvents == 0 {
 			c.scheduled = false
 			c.mu.Unlock()
 			return
 		}
-		events := c.events[0]
-		c.events = c.events[1:]
+		events := c.pendingEvents
+		c.pendingEvents = 0
 		closed := c.closed || c.closing
 		c.mu.Unlock()
 		alive := !closed
@@ -578,7 +579,8 @@ func (c *Connection) flushOutput() error {
 			if count > maxWritevItems {
 				count = maxWritevItems
 			}
-			buffers := make([][]byte, count)
+			var batch [maxWritevItems][]byte
+			buffers := batch[:count]
 			for i := 0; i < count; i++ {
 				buffers[i] = c.sends[i].data[c.sends[i].offset:]
 			}
@@ -597,7 +599,7 @@ func (c *Connection) flushOutput() error {
 					break
 				}
 				left -= remaining
-				c.sends[0] = nil
+				c.sends[0] = sendItem{}
 				c.sends = c.sends[1:]
 			}
 			c.mu.Unlock()

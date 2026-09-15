@@ -3,13 +3,13 @@
 package http
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	stdhttp "net/http"
 	"net/textproto"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 
 	epoll "github.com/lesismal/auto-balance-epoll/go"
@@ -128,11 +128,6 @@ func marshalResponse(request *stdhttp.Request, response Response, closeConnectio
 	if response.StatusCode < 100 || response.StatusCode > 999 {
 		return nil, fmt.Errorf("http: invalid status code %d", response.StatusCode)
 	}
-	header := response.Header.Clone()
-	if header == nil {
-		header = make(stdhttp.Header)
-	}
-	header.Del("Transfer-Encoding")
 	bodyAllowed := response.StatusCode != stdhttp.StatusNoContent &&
 		response.StatusCode != stdhttp.StatusNotModified &&
 		(response.StatusCode < 100 || response.StatusCode >= 200)
@@ -140,25 +135,51 @@ func marshalResponse(request *stdhttp.Request, response Response, closeConnectio
 	if !bodyAllowed {
 		contentLength = 0
 	}
-	header.Set("Content-Length", strconv.Itoa(contentLength))
-	if closeConnection {
-		header.Set("Connection", "close")
-	}
 	proto := "HTTP/1.1"
+	connectionValue := ""
+	if closeConnection {
+		connectionValue = "close"
+	}
 	if request.ProtoMajor == 1 && request.ProtoMinor == 0 {
 		proto = "HTTP/1.0"
 		if !closeConnection {
-			header.Set("Connection", "keep-alive")
+			connectionValue = "keep-alive"
 		}
 	}
 	statusText := stdhttp.StatusText(response.StatusCode)
 	if statusText == "" {
 		statusText = "Status"
 	}
-	var out bytes.Buffer
-	fmt.Fprintf(&out, "%s %d %s\r\n", proto, response.StatusCode, statusText)
-	keys := make([]string, 0, len(header))
-	for key := range header {
+	// Build directly into the returned byte slice. Avoid cloning the header map
+	// and fmt/bytes.Buffer overhead on every response.
+	capacity := len(response.Body) + 96
+	for key, values := range response.Header {
+		capacity += len(key) + 4
+		for _, value := range values {
+			capacity += len(value) + 2
+		}
+	}
+	out := make([]byte, 0, capacity)
+	out = append(out, proto...)
+	out = append(out, ' ')
+	out = strconv.AppendInt(out, int64(response.StatusCode), 10)
+	out = append(out, ' ')
+	out = append(out, statusText...)
+	out = append(out, '\r', '\n')
+	out = append(out, "Content-Length: "...)
+	out = strconv.AppendInt(out, int64(contentLength), 10)
+	out = append(out, '\r', '\n')
+	if connectionValue != "" {
+		out = append(out, "Connection: "...)
+		out = append(out, connectionValue...)
+		out = append(out, '\r', '\n')
+	}
+	keys := make([]string, 0, len(response.Header))
+	for key := range response.Header {
+		if strings.EqualFold(key, "Content-Length") || strings.EqualFold(key, "Transfer-Encoding") ||
+			(connectionValue != "" && strings.EqualFold(key, "Connection")) {
+			continue
+		}
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
@@ -166,18 +187,21 @@ func marshalResponse(request *stdhttp.Request, response Response, closeConnectio
 		if key == "" || textproto.CanonicalMIMEHeaderKey(key) == "" {
 			return nil, errors.New("http: invalid response header name")
 		}
-		for _, value := range header[key] {
+		for _, value := range response.Header[key] {
 			if !validHeaderValue(value) {
 				return nil, errors.New("http: invalid response header value")
 			}
-			fmt.Fprintf(&out, "%s: %s\r\n", key, value)
+			out = append(out, key...)
+			out = append(out, ':', ' ')
+			out = append(out, value...)
+			out = append(out, '\r', '\n')
 		}
 	}
-	out.WriteString("\r\n")
+	out = append(out, '\r', '\n')
 	if request.Method != stdhttp.MethodHead && bodyAllowed {
-		out.Write(response.Body)
+		out = append(out, response.Body...)
 	}
-	return out.Bytes(), nil
+	return out, nil
 }
 
 func validHeaderValue(value string) bool {
