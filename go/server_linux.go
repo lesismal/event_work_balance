@@ -194,7 +194,7 @@ func (c *Connection) send(data []byte, copyData bool) error {
 	sent := 0
 	if queueWasEmpty && !c.flushing {
 		for {
-			n, err := syscall.SendmsgN(c.FD(), data, nil, nil, syscall.MSG_NOSIGNAL)
+			n, err := syscall.Write(c.FD(), data)
 			if err == syscall.EINTR {
 				continue
 			}
@@ -216,6 +216,61 @@ func (c *Connection) send(data []byte, copyData bool) error {
 	queued := data[sent:]
 	if copyData {
 		queued = append([]byte(nil), queued...)
+	}
+	if queueWasEmpty {
+		c.sends = c.sends[:0]
+		c.sendHead = 0
+	}
+	c.sends = append(c.sends, sendItem{data: queued})
+	refresh := queueWasEmpty && !c.flushing
+	c.mu.Unlock()
+	if refresh {
+		c.server.request(command{kind: commandRefresh, connection: c})
+	}
+	return nil
+}
+
+// SendParts writes a two-part message without first joining the parts. If the
+// socket is backpressured, only the unsent suffix is copied before returning.
+func (c *Connection) SendParts(first, second []byte) error {
+	total := len(first) + len(second)
+	if total == 0 {
+		return nil
+	}
+	c.mu.Lock()
+	if c.closing || c.closed || c.closeAfterSend {
+		c.mu.Unlock()
+		return syscall.EPIPE
+	}
+	queueWasEmpty := c.sendHead == len(c.sends)
+	sent := 0
+	if queueWasEmpty && !c.flushing {
+		for {
+			n, err := writev2(c.FD(), first, second)
+			if err == syscall.EINTR {
+				continue
+			}
+			if err != nil && err != syscall.EAGAIN && err != syscall.EWOULDBLOCK {
+				c.mu.Unlock()
+				c.closeWithError(err)
+				return err
+			}
+			if err == nil {
+				sent = n
+			}
+			break
+		}
+		if sent == total {
+			c.mu.Unlock()
+			return nil
+		}
+	}
+	queued := make([]byte, total-sent)
+	if sent < len(first) {
+		n := copy(queued, first[sent:])
+		copy(queued[n:], second)
+	} else {
+		copy(queued, second[sent-len(first):])
 	}
 	if queueWasEmpty {
 		c.sends = c.sends[:0]
@@ -435,8 +490,12 @@ func (s *Server) enqueueEvent(token uint64, events uint32) {
 }
 
 func (s *Server) submit(c *Connection) bool {
-	return s.taskPool.Go(c.process)
+	return s.taskPool.GoTask(c)
 }
+
+// RunTask implements taskpool.Task without allocating a method value for each
+// readiness notification.
+func (c *Connection) RunTask() { c.process() }
 
 func (s *Server) drainCommands() {
 	var b [8]byte
@@ -478,12 +537,15 @@ func (s *Server) refreshConnection(c *Connection) {
 func (s *Server) closeConnection(c *Connection, closeErr error, callback bool) {
 	c.mu.Lock()
 	doClose := !c.closed
-	c.closed = true
-	c.closing = true
-	c.mu.Unlock()
 	if !doClose {
+		c.mu.Unlock()
 		return
 	}
+	c.closed = true
+	c.closing = true
+	c.sends = nil
+	c.sendHead = 0
+	c.mu.Unlock()
 	fd := int(c.fd.Swap(-1))
 	if fd >= 0 {
 		_ = syscall.EpollCtl(s.epollFD, syscall.EPOLL_CTL_DEL, fd, nil)
@@ -619,8 +681,9 @@ func (c *Connection) flushOutput() error {
 		}
 		var n int
 		var err error
-		if c.server.useWritev {
-			count := len(c.sends) - c.sendHead
+		pending := len(c.sends) - c.sendHead
+		if c.server.useWritev && pending > 1 {
+			count := pending
 			if count > maxWritevItems {
 				count = maxWritevItems
 			}
@@ -715,6 +778,30 @@ func writev(fd int, buffers [][]byte) (int, error) {
 		return 0, nil
 	}
 	r0, _, errno := syscall.Syscall(syscall.SYS_WRITEV, uintptr(fd), uintptr(unsafe.Pointer(&iov[0])), uintptr(len(iov)))
+	if errno != 0 {
+		return int(r0), errno
+	}
+	return int(r0), nil
+}
+
+func writev2(fd int, first, second []byte) (int, error) {
+	if len(first) == 0 {
+		return syscall.Write(fd, second)
+	}
+	if len(second) == 0 {
+		return syscall.Write(fd, first)
+	}
+	var iov [2]syscall.Iovec
+	count := 0
+	if len(first) != 0 {
+		iov[count] = syscall.Iovec{Base: &first[0], Len: uint64(len(first))}
+		count++
+	}
+	if len(second) != 0 {
+		iov[count] = syscall.Iovec{Base: &second[0], Len: uint64(len(second))}
+		count++
+	}
+	r0, _, errno := syscall.Syscall(syscall.SYS_WRITEV, uintptr(fd), uintptr(unsafe.Pointer(&iov[0])), uintptr(count))
 	if errno != 0 {
 		return int(r0), errno
 	}

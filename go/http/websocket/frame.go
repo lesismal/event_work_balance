@@ -176,14 +176,10 @@ func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 	var payload []byte
 	if borrowPayload {
 		payload = p.buffer[offset:frameEnd]
-		for i := range payload {
-			payload[i] ^= mask[i&3]
-		}
+		applyMask(payload, payload, mask)
 	} else {
 		payload = make([]byte, int(payloadLen))
-		for i := range payload {
-			payload[i] = p.buffer[offset+i] ^ mask[i&3]
-		}
+		applyMask(payload, p.buffer[offset:frameEnd], mask)
 	}
 
 	if control {
@@ -223,6 +219,18 @@ func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 	p.fragmentOpcode = 0
 	p.fragment = nil
 	return event, true, true, nil
+}
+
+func applyMask(dst, src, mask []byte) {
+	mask32 := binary.LittleEndian.Uint32(mask)
+	mask64 := uint64(mask32) | uint64(mask32)<<32
+	i := 0
+	for ; i+8 <= len(src); i += 8 {
+		binary.LittleEndian.PutUint64(dst[i:i+8], binary.LittleEndian.Uint64(src[i:i+8])^mask64)
+	}
+	for ; i < len(src); i++ {
+		dst[i] = src[i] ^ mask[i&3]
+	}
 }
 
 func (p *Parser) finishFrame(frameEnd int, borrowed bool) {
@@ -284,4 +292,28 @@ func MarshalFrame(opcode Opcode, payload []byte) ([]byte, error) {
 	}
 	copy(frame[offset:], payload)
 	return frame, nil
+}
+
+func frameHeader(opcode Opcode, payloadLen int) ([10]byte, int, error) {
+	var header [10]byte
+	if opcode != Text && opcode != Binary && opcode != Close && opcode != Ping && opcode != Pong {
+		return header, 0, ErrProtocol
+	}
+	if opcode >= 0x8 && payloadLen > 125 {
+		return header, 0, ErrProtocol
+	}
+	header[0] = 0x80 | byte(opcode)
+	switch {
+	case payloadLen < 126:
+		header[1] = byte(payloadLen)
+		return header, 2, nil
+	case payloadLen <= 65535:
+		header[1] = 126
+		binary.BigEndian.PutUint16(header[2:4], uint16(payloadLen))
+		return header, 4, nil
+	default:
+		header[1] = 127
+		binary.BigEndian.PutUint64(header[2:10], uint64(payloadLen))
+		return header, 10, nil
+	}
 }

@@ -41,6 +41,19 @@ func BenchmarkParserSmallTextBorrowed(b *testing.B) {
 	}
 }
 
+func BenchmarkParser1KiBBorrowed(b *testing.B) {
+	parser := NewParser(1 << 20)
+	frame := clientFrame(Binary, true, make([]byte, 1024))
+	b.ReportAllocs()
+	b.SetBytes(1024)
+	for i := 0; i < b.N; i++ {
+		_, complete, err := parser.FeedOneBorrowed(frame)
+		if err != nil || !complete {
+			b.Fatalf("FeedOneBorrowed returned complete=%v, %v", complete, err)
+		}
+	}
+}
+
 func BenchmarkMarshalFrame(b *testing.B) {
 	payload := make([]byte, 1024)
 	b.ReportAllocs()

@@ -1,21 +1,27 @@
-// Package taskpool provides a bounded, elastic goroutine pool.
+// Package taskpool provides a bounded goroutine pool.
 package taskpool
 
 import (
 	"runtime/debug"
 	"sync"
-	"sync/atomic"
 )
 
-// TaskPool follows nbio/taskpool's elastic execution model: submissions fork
-// workers while capacity is available, overflow is buffered, and a worker
-// drains queued work before retiring. A dispatcher is kept as the final
-// execution slot so queued work cannot be stranded between worker exits.
+// Task avoids allocating a closure or method value when a reusable object is
+// submitted repeatedly.
+type Task interface {
+	RunTask()
+}
+
+type taskFunc func()
+
+func (f taskFunc) RunTask() { f() }
+
+// TaskPool keeps a fixed set of workers alive. Network readiness events are
+// frequent and short-lived; retiring a worker whenever its queue is briefly
+// empty causes goroutine creation and stack growth to dominate the workload.
 type TaskPool struct {
-	maxWorkers int64
-	active     atomic.Int64
-	tasks      chan func()
-	dispatcher chan struct{}
+	tasks chan Task
+	stop  chan struct{}
 
 	mu       sync.Mutex
 	stopped  bool
@@ -35,12 +41,13 @@ func New(maxConcurrent, queueSize int) *TaskPool {
 		panic("taskpool: queueSize must not be negative")
 	}
 	tp := &TaskPool{
-		maxWorkers: int64(maxConcurrent - 1),
-		tasks:      make(chan func(), queueSize),
-		dispatcher: make(chan struct{}),
+		tasks: make(chan Task, queueSize),
+		stop:  make(chan struct{}),
 	}
-	tp.workerWG.Add(1)
-	go tp.dispatch()
+	tp.workerWG.Add(maxConcurrent)
+	for i := 0; i < maxConcurrent; i++ {
+		go tp.worker()
+	}
 	return tp
 }
 
@@ -56,25 +63,29 @@ func (tp *TaskPool) Go(f func()) bool {
 	if f == nil {
 		return true
 	}
+	return tp.GoTask(taskFunc(f))
+}
+
+// GoTask schedules a reusable task without creating a closure.
+func (tp *TaskPool) GoTask(task Task) bool {
+	if task == nil {
+		return true
+	}
 	tp.mu.Lock()
 	if tp.stopped {
 		tp.mu.Unlock()
 		return false
 	}
 	tp.taskWG.Add(1)
-	if tp.fork(f) {
-		tp.mu.Unlock()
-		return true
-	}
 	tp.mu.Unlock()
 	// The task wait-group was incremented under the stop lock, so Stop cannot
 	// miss this accepted task even if queue backpressure blocks this send.
-	tp.tasks <- f
+	tp.tasks <- task
 	return true
 }
 
 // Call runs f synchronously with the pool's panic isolation.
-func (tp *TaskPool) Call(f func()) { tp.call(f) }
+func (tp *TaskPool) Call(f func()) { tp.call(taskFunc(f)) }
 
 // Stop rejects new work, drains accepted tasks, and joins pool goroutines.
 func (tp *TaskPool) Stop() {
@@ -83,59 +94,29 @@ func (tp *TaskPool) Stop() {
 		tp.stopped = true
 		tp.mu.Unlock()
 		tp.taskWG.Wait()
-		close(tp.dispatcher)
+		close(tp.stop)
 		tp.workerWG.Wait()
 	})
 }
 
-func (tp *TaskPool) fork(first func()) bool {
-	for {
-		active := tp.active.Load()
-		if active >= tp.maxWorkers {
-			return false
-		}
-		if tp.active.CompareAndSwap(active, active+1) {
-			tp.workerWG.Add(1)
-			go tp.run(first)
-			return true
-		}
-	}
-}
-
-func (tp *TaskPool) run(task func()) {
-	defer tp.workerWG.Done()
-	defer tp.active.Add(-1)
-	for {
-		tp.execute(task)
-		select {
-		case task = <-tp.tasks:
-			continue
-		default:
-			return
-		}
-	}
-}
-
-func (tp *TaskPool) dispatch() {
+func (tp *TaskPool) worker() {
 	defer tp.workerWG.Done()
 	for {
 		select {
 		case task := <-tp.tasks:
-			if !tp.fork(task) {
-				tp.execute(task)
-			}
-		case <-tp.dispatcher:
+			tp.execute(task)
+		case <-tp.stop:
 			return
 		}
 	}
 }
 
-func (tp *TaskPool) execute(f func()) {
+func (tp *TaskPool) execute(task Task) {
 	defer tp.taskWG.Done()
-	tp.call(f)
+	tp.call(task)
 }
 
-func (tp *TaskPool) call(f func()) {
+func (tp *TaskPool) call(task Task) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			tp.mu.Lock()
@@ -146,5 +127,5 @@ func (tp *TaskPool) call(f func()) {
 			}
 		}
 	}()
-	f()
+	task.RunTask()
 }

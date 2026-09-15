@@ -111,18 +111,18 @@ func (c *Connection) writeFrame(opcode Opcode, payload []byte) error {
 	if c.closeSent.Load() {
 		return errors.New("websocket: close already sent")
 	}
-	frame, err := MarshalFrame(opcode, payload)
+	header, headerLen, err := frameHeader(opcode, len(payload))
 	if err != nil {
 		return err
 	}
-	return c.conn.SendOwned(frame)
+	return c.conn.SendParts(header[:headerLen], payload)
 }
 
 func (c *Connection) sendClose(payload []byte) error {
 	if !c.closeSent.CompareAndSwap(false, true) {
 		return nil
 	}
-	frame, err := MarshalFrame(Close, payload)
+	header, headerLen, err := frameHeader(Close, len(payload))
 	if err != nil {
 		c.closeSent.Store(false)
 		return err
@@ -130,7 +130,7 @@ func (c *Connection) sendClose(payload []byte) error {
 	c.mu.Lock()
 	c.closeCode, c.closeReason = closePayload(payload)
 	c.mu.Unlock()
-	if err = c.conn.SendOwned(frame); err != nil {
+	if err = c.conn.SendParts(header[:headerLen], payload); err != nil {
 		return err
 	}
 	c.conn.CloseAfterSend()

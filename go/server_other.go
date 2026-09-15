@@ -104,7 +104,7 @@ func (c *Connection) closeWithError(err error) {
 	c.scheduled = true
 	c.mu.Unlock()
 	_ = c.conn.Close()
-	if submit && !c.server.taskPool.Go(c.process) {
+	if submit && !c.server.taskPool.GoTask(c) {
 		c.server.finishConnection(c, err)
 	}
 }
@@ -137,6 +137,13 @@ func (c *Connection) Send(data []byte) error {
 
 // SendOwned is equivalent to Send on the synchronous portable backend.
 func (c *Connection) SendOwned(data []byte) error { return c.Send(data) }
+
+func (c *Connection) SendParts(first, second []byte) error {
+	data := make([]byte, len(first)+len(second))
+	n := copy(data, first)
+	copy(data[n:], second)
+	return c.Send(data)
+}
 func (c *Connection) enqueueData(data []byte) bool {
 	c.mu.Lock()
 	if c.closing {
@@ -147,7 +154,7 @@ func (c *Connection) enqueueData(data []byte) bool {
 	submit := !c.scheduled
 	c.scheduled = true
 	c.mu.Unlock()
-	if submit && !c.server.taskPool.Go(c.process) {
+	if submit && !c.server.taskPool.GoTask(c) {
 		c.closeWithError(errors.New("task pool stopped"))
 		return false
 	}
@@ -177,6 +184,8 @@ func (c *Connection) process() {
 		c.server.handler.OnData(c, event.data)
 	}
 }
+
+func (c *Connection) RunTask() { c.process() }
 
 type Server struct {
 	listener       net.Listener
