@@ -51,6 +51,7 @@ type fragmentedMessage struct {
 type Parser struct {
 	maxMessageBytes int64
 	buffer          []byte
+	borrowedTail    []byte
 	fragment        *fragmentedMessage
 	pendingConsume  int
 	borrowedBuffer  bool
@@ -79,6 +80,7 @@ func (p *Parser) Reset() {
 	}
 	p.pendingConsume = 0
 	p.borrowedBuffer = false
+	p.borrowedTail = nil
 }
 
 // Feed parses masked client frames and returns complete messages and control
@@ -115,6 +117,11 @@ func (p *Parser) ReleaseBorrowed() {
 		p.consume(p.pendingConsume)
 		p.pendingConsume = 0
 	}
+	p.borrowedTail = nil
+	if p.borrowedBuffer {
+		p.buffer = nil
+		p.borrowedBuffer = false
+	}
 }
 
 func (p *Parser) feedOne(data []byte, borrowPayload bool) (Event, bool, error) {
@@ -122,9 +129,16 @@ func (p *Parser) feedOne(data []byte, borrowPayload bool) (Event, bool, error) {
 		p.consume(p.pendingConsume)
 		p.pendingConsume = 0
 	}
+	if len(p.buffer) == 0 && len(p.borrowedTail) != 0 {
+		p.buffer = p.borrowedTail
+		p.borrowedTail = nil
+		p.borrowedBuffer = true
+	}
 	if borrowPayload && len(p.buffer) == 0 && len(data) != 0 {
 		p.buffer = data
 		p.borrowedBuffer = true
+	} else if borrowPayload && !p.borrowedBuffer && len(p.buffer) != 0 && len(data) != 0 {
+		p.buffer, p.borrowedTail = appendCurrentFrame(p.buffer, data)
 	} else {
 		p.buffer = append(p.buffer, data...)
 	}
@@ -133,12 +147,20 @@ func (p *Parser) feedOne(data []byte, borrowPayload bool) (Event, bool, error) {
 		if err != nil {
 			p.buffer = nil
 			p.borrowedBuffer = false
+			p.borrowedTail = nil
 			p.fragment = nil
 			return Event{}, false, err
 		}
 		if !complete {
 			if p.borrowedBuffer && len(p.buffer) != 0 {
-				p.buffer = append([]byte(nil), p.buffer...)
+				capacity := len(p.buffer)
+				if frameEnd, known := frameSize(p.buffer); known && frameEnd > capacity &&
+					uint64(frameEnd) <= uint64(p.maxMessageBytes)+14 {
+					capacity = frameEnd
+				}
+				owned := make([]byte, len(p.buffer), capacity)
+				copy(owned, p.buffer)
+				p.buffer = owned
 				p.borrowedBuffer = false
 			}
 			return Event{}, false, nil
@@ -147,6 +169,56 @@ func (p *Parser) feedOne(data []byte, borrowPayload bool) (Event, bool, error) {
 			return event, true, nil
 		}
 	}
+}
+
+func appendCurrentFrame(buffer, data []byte) ([]byte, []byte) {
+	for {
+		frameEnd, known := frameSize(buffer)
+		if known {
+			need := frameEnd - len(buffer)
+			if need <= 0 || need >= len(data) {
+				return append(buffer, data...), nil
+			}
+			return append(buffer, data[:need]...), data[need:]
+		}
+		need := frameHeaderSize(buffer) - len(buffer)
+		if need <= 0 || need >= len(data) {
+			return append(buffer, data...), nil
+		}
+		buffer = append(buffer, data[:need]...)
+		data = data[need:]
+	}
+}
+
+func frameHeaderSize(data []byte) int {
+	if len(data) < 2 {
+		return 2
+	}
+	switch data[1] & 0x7f {
+	case 126:
+		return 8
+	case 127:
+		return 14
+	default:
+		return 6
+	}
+}
+
+func frameSize(data []byte) (int, bool) {
+	headerSize := frameHeaderSize(data)
+	if len(data) < headerSize {
+		return 0, false
+	}
+	payloadLen := uint64(data[1] & 0x7f)
+	if payloadLen == 126 {
+		payloadLen = uint64(binary.BigEndian.Uint16(data[2:4]))
+	} else if payloadLen == 127 {
+		payloadLen = binary.BigEndian.Uint64(data[2:10])
+	}
+	if payloadLen > uint64(^uint(0)>>1)-uint64(headerSize) {
+		return 0, false
+	}
+	return headerSize + int(payloadLen), true
 }
 
 func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {

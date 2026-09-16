@@ -25,6 +25,9 @@ func TestDefaultConfigPoolSizing(t *testing.T) {
 	if !config.UseWritev {
 		t.Fatal("UseWritev = false, want adaptive writev enabled by default")
 	}
+	if config.WriteBufferHighWatermark != 4*1024 {
+		t.Fatalf("WriteBufferHighWatermark = %d, want 4096", config.WriteBufferHighWatermark)
+	}
 	if config.TaskPoolMode != taskpool.ModeCond {
 		t.Fatalf("TaskPoolMode = %v, want cond", config.TaskPoolMode)
 	}

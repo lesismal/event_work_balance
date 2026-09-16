@@ -126,3 +126,32 @@ func TestFeedOneBorrowedPipelinedFrames(t *testing.T) {
 		t.Fatalf("borrowed input retained with capacity %d", cap(parser.buffer))
 	}
 }
+
+func TestFeedOneBorrowedCompletesOwnedFrameWithoutRetainingTail(t *testing.T) {
+	parser := NewParser(4096)
+	payload := make([]byte, 1024)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	first := clientFrame(Binary, true, payload)
+	second := clientFrame(Binary, true, []byte("next"))
+	cut := 900
+	if _, complete, err := parser.FeedOneBorrowed(first[:cut]); err != nil || complete {
+		t.Fatalf("partial frame complete=%v, err=%v", complete, err)
+	}
+	if cap(parser.buffer) != len(first) {
+		t.Fatalf("partial buffer capacity=%d, want frame size %d", cap(parser.buffer), len(first))
+	}
+	event, complete, err := parser.FeedOneBorrowed(append(first[cut:], second...))
+	if err != nil || !complete || event.Opcode != Binary || len(event.Payload) != len(payload) {
+		t.Fatalf("completed first frame: opcode=%d len=%d complete=%v err=%v", event.Opcode, len(event.Payload), complete, err)
+	}
+	event, complete, err = parser.FeedOneBorrowed(nil)
+	if err != nil || !complete || string(event.Payload) != "next" {
+		t.Fatalf("borrowed tail: payload=%q complete=%v err=%v", event.Payload, complete, err)
+	}
+	parser.ReleaseBorrowed()
+	if parser.borrowedTail != nil || parser.borrowedBuffer || len(parser.buffer) != 0 {
+		t.Fatalf("borrowed input retained after release")
+	}
+}

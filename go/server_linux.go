@@ -37,14 +37,18 @@ type Config struct {
 	WorkerCount    int
 	MaxEvents      int
 	ReadBufferSize int
-	UseWritev      bool
-	TaskPoolMode   taskpool.Mode
-	SharedTaskPool bool
+	// WriteBufferHighWatermark pauses socket reads while at least this many
+	// bytes are waiting to be written. This bounds userspace buffering while
+	// TCP backpressure catches up. Set below zero to disable write backpressure.
+	WriteBufferHighWatermark int
+	UseWritev                bool
+	TaskPoolMode             taskpool.Mode
+	SharedTaskPool           bool
 }
 
 func DefaultConfig() Config {
 	workerCount, maxEvents := defaultPoolSizing()
-	return Config{BindAddress: "0.0.0.0", Port: 9000, Backlog: 128, WorkerCount: workerCount, MaxEvents: maxEvents, ReadBufferSize: 16 * 1024, UseWritev: true, TaskPoolMode: taskpool.ModeCond, SharedTaskPool: true}
+	return Config{BindAddress: "0.0.0.0", Port: 9000, Backlog: 128, WorkerCount: workerCount, MaxEvents: maxEvents, ReadBufferSize: 16 * 1024, WriteBufferHighWatermark: 4 * 1024, UseWritev: true, TaskPoolMode: taskpool.ModeCond, SharedTaskPool: true}
 }
 
 // Handler callbacks run on a logical worker, except OnOpen and OnClose which
@@ -119,8 +123,10 @@ type Connection struct {
 	closing        bool
 	closed         bool
 	writeInterest  bool
+	readPaused     bool
 	flushing       bool
 	closeAfterSend bool
+	pendingBytes   int
 	attachment     atomic.Pointer[connectionAttachment]
 }
 
@@ -226,7 +232,9 @@ func (c *Connection) send(data []byte, copyData bool) error {
 		c.sendHead = 0
 	}
 	c.sends = append(c.sends, sendItem{data: queued})
-	refresh := queueWasEmpty && !c.flushing
+	c.pendingBytes += len(queued)
+	crossedHighWatermark := c.server.writeHighWatermark > 0 && !c.readPaused && c.pendingBytes >= c.server.writeHighWatermark
+	refresh := (queueWasEmpty || crossedHighWatermark) && !c.flushing
 	c.mu.Unlock()
 	if refresh {
 		c.server.request(command{kind: commandRefresh, connection: c})
@@ -281,7 +289,9 @@ func (c *Connection) SendParts(first, second []byte) error {
 		c.sendHead = 0
 	}
 	c.sends = append(c.sends, sendItem{data: queued})
-	refresh := queueWasEmpty && !c.flushing
+	c.pendingBytes += len(queued)
+	crossedHighWatermark := c.server.writeHighWatermark > 0 && !c.readPaused && c.pendingBytes >= c.server.writeHighWatermark
+	refresh := (queueWasEmpty || crossedHighWatermark) && !c.flushing
 	c.mu.Unlock()
 	if refresh {
 		c.server.request(command{kind: commandRefresh, connection: c})
@@ -294,6 +304,8 @@ type Server struct {
 	epollFD, listenFD, wakeFD int
 	maxEvents                 int
 	useWritev                 bool
+	writeHighWatermark        int
+	writeLowWatermark         int
 	handler                   Handler
 	stopping                  atomic.Bool
 	nextToken                 atomic.Uint64
@@ -322,6 +334,9 @@ func Bind(config Config, handler Handler) (*Server, error) {
 	if config.ReadBufferSize <= 0 {
 		config.ReadBufferSize = 16 * 1024
 	}
+	if config.WriteBufferHighWatermark == 0 {
+		config.WriteBufferHighWatermark = 4 * 1024
+	}
 	if config.Backlog <= 0 {
 		config.Backlog = 128
 	}
@@ -348,7 +363,9 @@ func Bind(config Config, handler Handler) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{epollFD: epfd, listenFD: listenFD, wakeFD: wakeFD, maxEvents: config.MaxEvents,
-		useWritev: config.UseWritev, handler: handler, connections: make(map[uint64]*Connection)}
+		useWritev: config.UseWritev, writeHighWatermark: config.WriteBufferHighWatermark,
+		writeLowWatermark: config.WriteBufferHighWatermark / 2, handler: handler,
+		connections: make(map[uint64]*Connection)}
 	s.nextToken.Store(firstConnToken)
 	s.taskPool, s.releaseTaskPool = acquireTaskPool(config)
 	s.readBufferPool.New = func() any { return &readBuffer{data: make([]byte, config.ReadBufferSize)} }
@@ -573,11 +590,19 @@ func (s *Server) refreshConnection(c *Connection) {
 	c.mu.Lock()
 	hasOutput := c.sendHead != len(c.sends)
 	usable := !c.closing && !c.closed
-	changed := c.writeInterest != hasOutput
+	pauseReads := s.writeHighWatermark > 0 && c.pendingBytes >= s.writeHighWatermark
+	if c.readPaused && c.pendingBytes > s.writeLowWatermark {
+		pauseReads = true
+	}
+	changed := c.writeInterest != hasOutput || c.readPaused != pauseReads
 	c.writeInterest = hasOutput
+	c.readPaused = pauseReads
 	c.mu.Unlock()
 	if usable && changed {
 		events := uint32(baseEvents)
+		if pauseReads {
+			events &^= syscall.EPOLLIN
+		}
 		if hasOutput {
 			events |= syscall.EPOLLOUT
 		}
@@ -597,6 +622,7 @@ func (s *Server) closeConnection(c *Connection, closeErr error, callback bool) {
 	c.closing = true
 	c.sends = nil
 	c.sendHead = 0
+	c.pendingBytes = 0
 	c.mu.Unlock()
 	fd := int(c.fd.Swap(-1))
 	if fd >= 0 {
@@ -667,6 +693,12 @@ func (c *Connection) drainInput() error {
 		n, err := syscall.Read(c.FD(), buf)
 		if n > 0 {
 			c.server.handler.OnData(c, buf[:n])
+			c.mu.Lock()
+			pauseReads := c.server.writeHighWatermark > 0 && c.pendingBytes >= c.server.writeHighWatermark
+			c.mu.Unlock()
+			if pauseReads {
+				return nil
+			}
 			continue
 		}
 		if n == 0 && err == nil {
@@ -752,6 +784,10 @@ func (c *Connection) flushOutput() error {
 			n, err = syscall.Write(c.FD(), item.data[item.offset:])
 		}
 		if n > 0 {
+			c.pendingBytes -= n
+			if c.pendingBytes < 0 {
+				c.pendingBytes = 0
+			}
 			left := n
 			for c.sendHead < len(c.sends) {
 				item := &c.sends[c.sendHead]
@@ -821,16 +857,21 @@ func eventfd() (int, error) {
 	return int(r0), nil
 }
 func writev(fd int, buffers [][]byte) (int, error) {
-	iov := make([]syscall.Iovec, 0, len(buffers))
+	var iov [maxWritevItems]syscall.Iovec
+	count := 0
 	for _, b := range buffers {
 		if len(b) > 0 {
-			iov = append(iov, syscall.Iovec{Base: &b[0], Len: uint64(len(b))})
+			if count == len(iov) {
+				break
+			}
+			iov[count] = syscall.Iovec{Base: &b[0], Len: uint64(len(b))}
+			count++
 		}
 	}
-	if len(iov) == 0 {
+	if count == 0 {
 		return 0, nil
 	}
-	r0, _, errno := syscall.Syscall(syscall.SYS_WRITEV, uintptr(fd), uintptr(unsafe.Pointer(&iov[0])), uintptr(len(iov)))
+	r0, _, errno := syscall.Syscall(syscall.SYS_WRITEV, uintptr(fd), uintptr(unsafe.Pointer(&iov[0])), uintptr(count))
 	if errno != 0 {
 		return int(r0), errno
 	}

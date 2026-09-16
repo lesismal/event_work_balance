@@ -18,6 +18,7 @@ type Config struct {
 	Port                            uint16
 	Backlog, WorkerCount, MaxEvents int
 	ReadBufferSize                  int
+	WriteBufferHighWatermark        int
 	UseWritev                       bool
 	TaskPoolMode                    taskpool.Mode
 	SharedTaskPool                  bool
@@ -25,7 +26,7 @@ type Config struct {
 
 func DefaultConfig() Config {
 	workerCount, maxEvents := defaultPoolSizing()
-	return Config{BindAddress: "0.0.0.0", Port: 9000, Backlog: 128, WorkerCount: workerCount, MaxEvents: maxEvents, ReadBufferSize: 16 * 1024, UseWritev: true, TaskPoolMode: taskpool.ModeCond, SharedTaskPool: true}
+	return Config{BindAddress: "0.0.0.0", Port: 9000, Backlog: 128, WorkerCount: workerCount, MaxEvents: maxEvents, ReadBufferSize: 16 * 1024, WriteBufferHighWatermark: 4 * 1024, UseWritev: true, TaskPoolMode: taskpool.ModeCond, SharedTaskPool: true}
 }
 
 type Handler interface {
