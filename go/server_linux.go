@@ -126,7 +126,7 @@ type Connection struct {
 	readPaused     bool
 	flushing       bool
 	closeAfterSend bool
-	pendingBytes   int
+	pendingBytes   atomic.Int64
 	attachment     atomic.Pointer[connectionAttachment]
 }
 
@@ -232,8 +232,8 @@ func (c *Connection) send(data []byte, copyData bool) error {
 		c.sendHead = 0
 	}
 	c.sends = append(c.sends, sendItem{data: queued})
-	c.pendingBytes += len(queued)
-	crossedHighWatermark := c.server.writeHighWatermark > 0 && !c.readPaused && c.pendingBytes >= c.server.writeHighWatermark
+	pendingBytes := c.pendingBytes.Add(int64(len(queued)))
+	crossedHighWatermark := c.server.writeHighWatermark > 0 && !c.readPaused && pendingBytes >= int64(c.server.writeHighWatermark)
 	refresh := (queueWasEmpty || crossedHighWatermark) && !c.flushing
 	c.mu.Unlock()
 	if refresh {
@@ -289,8 +289,8 @@ func (c *Connection) SendParts(first, second []byte) error {
 		c.sendHead = 0
 	}
 	c.sends = append(c.sends, sendItem{data: queued})
-	c.pendingBytes += len(queued)
-	crossedHighWatermark := c.server.writeHighWatermark > 0 && !c.readPaused && c.pendingBytes >= c.server.writeHighWatermark
+	pendingBytes := c.pendingBytes.Add(int64(len(queued)))
+	crossedHighWatermark := c.server.writeHighWatermark > 0 && !c.readPaused && pendingBytes >= int64(c.server.writeHighWatermark)
 	refresh := (queueWasEmpty || crossedHighWatermark) && !c.flushing
 	c.mu.Unlock()
 	if refresh {
@@ -590,8 +590,9 @@ func (s *Server) refreshConnection(c *Connection) {
 	c.mu.Lock()
 	hasOutput := c.sendHead != len(c.sends)
 	usable := !c.closing && !c.closed
-	pauseReads := s.writeHighWatermark > 0 && c.pendingBytes >= s.writeHighWatermark
-	if c.readPaused && c.pendingBytes > s.writeLowWatermark {
+	pendingBytes := c.pendingBytes.Load()
+	pauseReads := s.writeHighWatermark > 0 && pendingBytes >= int64(s.writeHighWatermark)
+	if c.readPaused && pendingBytes > int64(s.writeLowWatermark) {
 		pauseReads = true
 	}
 	changed := c.writeInterest != hasOutput || c.readPaused != pauseReads
@@ -622,7 +623,7 @@ func (s *Server) closeConnection(c *Connection, closeErr error, callback bool) {
 	c.closing = true
 	c.sends = nil
 	c.sendHead = 0
-	c.pendingBytes = 0
+	c.pendingBytes.Store(0)
 	c.mu.Unlock()
 	fd := int(c.fd.Swap(-1))
 	if fd >= 0 {
@@ -693,9 +694,7 @@ func (c *Connection) drainInput() error {
 		n, err := syscall.Read(c.FD(), buf)
 		if n > 0 {
 			c.server.handler.OnData(c, buf[:n])
-			c.mu.Lock()
-			pauseReads := c.server.writeHighWatermark > 0 && c.pendingBytes >= c.server.writeHighWatermark
-			c.mu.Unlock()
+			pauseReads := c.server.writeHighWatermark > 0 && c.pendingBytes.Load() >= int64(c.server.writeHighWatermark)
 			if pauseReads {
 				return nil
 			}
@@ -784,9 +783,8 @@ func (c *Connection) flushOutput() error {
 			n, err = syscall.Write(c.FD(), item.data[item.offset:])
 		}
 		if n > 0 {
-			c.pendingBytes -= n
-			if c.pendingBytes < 0 {
-				c.pendingBytes = 0
+			if pending := c.pendingBytes.Add(-int64(n)); pending < 0 {
+				c.pendingBytes.Store(0)
 			}
 			left := n
 			for c.sendHead < len(c.sends) {

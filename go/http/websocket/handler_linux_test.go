@@ -82,6 +82,18 @@ func TestServerHandshakeEchoPingAndClose(t *testing.T) {
 	}
 }
 
+func BenchmarkMinimalServerHandshake(b *testing.B) {
+	handler := NewHandler(HandlerFuncs{Message: func(*Connection, Opcode, []byte) {}})
+	b.ReportAllocs()
+	b.SetBytes(int64(len(benchmarkHandshakeRequest)))
+	for i := 0; i < b.N; i++ {
+		key, _, remainder, complete, err := handler.validateMinimalHandshake(benchmarkHandshakeRequest)
+		if err != nil || !complete || len(key) != 24 || len(remainder) != 0 {
+			b.Fatalf("minimal handshake: key=%q remainder=%d complete=%v err=%v", key, len(remainder), complete, err)
+		}
+	}
+}
+
 func readServerFrame(reader *bufio.Reader) (Opcode, []byte, error) {
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(reader, header); err != nil {

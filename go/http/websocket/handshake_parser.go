@@ -25,17 +25,10 @@ func (p *handshakeParser) Feed(data []byte) (*stdhttp.Request, bool, error) {
 	// directly from the caller's buffer; all request fields copied below remain
 	// valid after OnData returns. Only fragmented handshakes need buffering.
 	if len(p.buffer) == 0 {
-		if at := bytes.Index(data, []byte("\r\n\r\n")); at >= 0 {
-			headerEnd := at + 4
-			if headerEnd > p.maxHeaderBytes {
-				return nil, false, errHandshakeHeaderTooLarge
-			}
-			request, err := parseHandshakeRequest(data[:headerEnd])
-			if err != nil {
-				return nil, false, err
-			}
-			p.buffer = data[headerEnd:]
-			return request, true, nil
+		request, remainder, complete, err := parseCompleteHandshake(data, p.maxHeaderBytes)
+		if complete || err != nil {
+			p.buffer = remainder
+			return request, complete, err
 		}
 	}
 	p.buffer = append(p.buffer, data...)
@@ -61,6 +54,25 @@ func (p *handshakeParser) Feed(data []byte) (*stdhttp.Request, bool, error) {
 	p.buffer = p.buffer[headerEnd:]
 	p.headerScan = 0
 	return request, true, nil
+}
+
+func parseCompleteHandshake(data []byte, maxHeaderBytes int) (*stdhttp.Request, []byte, bool, error) {
+	at := bytes.Index(data, []byte("\r\n\r\n"))
+	if at < 0 {
+		if len(data) > maxHeaderBytes {
+			return nil, nil, false, errHandshakeHeaderTooLarge
+		}
+		return nil, nil, false, nil
+	}
+	headerEnd := at + 4
+	if headerEnd > maxHeaderBytes {
+		return nil, nil, false, errHandshakeHeaderTooLarge
+	}
+	request, err := parseHandshakeRequest(data[:headerEnd])
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return request, data[headerEnd:], true, nil
 }
 
 func (p *handshakeParser) TakeBuffered() []byte {

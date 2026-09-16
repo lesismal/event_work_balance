@@ -3,6 +3,7 @@
 package websocket
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
@@ -65,10 +66,13 @@ func (h HandlerFuncs) OnClose(c *Connection, code uint16, reason string, err err
 type Connection struct {
 	conn        *epoll.Connection
 	subprotocol string
-	mu          sync.Mutex
 	closeSent   atomic.Bool
-	closeCode   uint16
-	closeReason string
+	closeState  atomic.Pointer[connectionCloseState]
+}
+
+type connectionCloseState struct {
+	code   uint16
+	reason string
 }
 
 func (c *Connection) Subprotocol() string { return c.subprotocol }
@@ -127,9 +131,8 @@ func (c *Connection) sendClose(payload []byte) error {
 		c.closeSent.Store(false)
 		return err
 	}
-	c.mu.Lock()
-	c.closeCode, c.closeReason = closePayload(payload)
-	c.mu.Unlock()
+	code, reason := closePayload(payload)
+	c.closeState.Store(&connectionCloseState{code: code, reason: reason})
 	if err = c.conn.SendParts(header[:headerLen], payload); err != nil {
 		return err
 	}
@@ -147,6 +150,7 @@ type connectionState struct {
 type ServerHandler struct {
 	config           Config
 	handler          Handler
+	needsRequest     bool
 	handshakeParsers sync.Pool
 }
 
@@ -168,7 +172,18 @@ func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 	if handler == nil {
 		handler = HandlerFuncs{}
 	}
-	h := &ServerHandler{config: config, handler: handler}
+	needsRequest := config.CheckOrigin != nil
+	if !needsRequest {
+		switch typed := handler.(type) {
+		case HandlerFuncs:
+			needsRequest = typed.Open != nil
+		case *HandlerFuncs:
+			needsRequest = typed == nil || typed.Open != nil
+		default:
+			needsRequest = true
+		}
+	}
+	h := &ServerHandler{config: config, handler: handler, needsRequest: needsRequest}
 	h.handshakeParsers.New = func() any {
 		return &handshakeParser{maxHeaderBytes: config.HTTP.MaxHeaderBytes}
 	}
@@ -176,8 +191,7 @@ func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 }
 
 func (h *ServerHandler) OnOpen(c *epoll.Connection) {
-	state := &connectionState{handshake: h.handshakeParsers.Get().(*handshakeParser)}
-	c.SetAttachment(state)
+	c.SetAttachment(&connectionState{})
 }
 
 func (h *ServerHandler) OnData(c *epoll.Connection, data []byte) {
@@ -190,7 +204,30 @@ func (h *ServerHandler) OnData(c *epoll.Connection, data []byte) {
 		h.handleFrames(state, data)
 		return
 	}
-	request, complete, err := state.handshake.Feed(data)
+	if !h.needsRequest && state.handshake == nil {
+		key, subprotocol, remainder, complete, err := h.validateMinimalHandshake(data)
+		if err != nil {
+			h.reject(c, nil, stdhttp.StatusBadRequest)
+			return
+		}
+		if complete {
+			h.upgrade(c, state, nil, key, subprotocol, remainder)
+			return
+		}
+	}
+	var request *stdhttp.Request
+	var remainder []byte
+	var complete bool
+	var err error
+	if state.handshake == nil {
+		request, remainder, complete, err = parseCompleteHandshake(data, h.config.HTTP.MaxHeaderBytes)
+		if !complete && err == nil {
+			state.handshake = h.handshakeParsers.Get().(*handshakeParser)
+			request, complete, err = state.handshake.Feed(data)
+		}
+	} else {
+		request, complete, err = state.handshake.Feed(data)
+	}
 	if err != nil {
 		h.reject(c, request, stdhttp.StatusBadRequest)
 		return
@@ -203,17 +240,25 @@ func (h *ServerHandler) OnData(c *epoll.Connection, data []byte) {
 		h.reject(c, request, stdhttp.StatusBadRequest)
 		return
 	}
-	key := request.Header.Get("Sec-Websocket-Key")
-	if err = sendHandshakeResponse(c, key, subprotocol); err != nil {
+	key := []byte(request.Header.Get("Sec-Websocket-Key"))
+	h.upgrade(c, state, request, key, subprotocol, remainder)
+}
+
+func (h *ServerHandler) upgrade(c *epoll.Connection, state *connectionState, request *stdhttp.Request, key []byte, subprotocol string, remainder []byte) {
+	if err := sendHandshakeResponse(c, key, subprotocol); err != nil {
 		c.Close()
 		return
 	}
 	state.websocket = Connection{conn: c, subprotocol: subprotocol}
 	state.wsParser.maxMessageBytes = h.config.MaxMessageBytes
 	state.upgraded = true
-	remainder := state.handshake.TakeBuffered()
+	if state.handshake != nil && remainder == nil {
+		remainder = state.handshake.TakeBuffered()
+	}
 	h.releaseHandshakeParser(state)
-	h.handler.OnOpen(&state.websocket, request)
+	if request != nil {
+		h.handler.OnOpen(&state.websocket, request)
+	}
 	if len(remainder) != 0 {
 		h.handleFrames(state, remainder)
 	}
@@ -296,6 +341,143 @@ func (h *ServerHandler) validateHandshake(request *stdhttp.Request) (string, err
 	return "", nil
 }
 
+func (h *ServerHandler) validateMinimalHandshake(data []byte) ([]byte, string, []byte, bool, error) {
+	headerAt := bytes.Index(data, []byte("\r\n\r\n"))
+	if headerAt < 0 {
+		if len(data) > h.config.HTTP.MaxHeaderBytes {
+			return nil, "", nil, false, errHandshakeHeaderTooLarge
+		}
+		return nil, "", nil, false, nil
+	}
+	headerEnd := headerAt + 4
+	if headerEnd > h.config.HTTP.MaxHeaderBytes {
+		return nil, "", nil, false, errHandshakeHeaderTooLarge
+	}
+	lineEnd := bytes.Index(data[:headerAt], []byte("\r\n"))
+	if lineEnd <= len("GET  HTTP/1.1") || !bytes.HasPrefix(data[:lineEnd], []byte("GET ")) ||
+		!bytes.HasSuffix(data[:lineEnd], []byte(" HTTP/1.1")) {
+		return nil, "", nil, false, errMalformedHandshake
+	}
+	requestURI := data[len("GET ") : lineEnd-len(" HTTP/1.1")]
+	if !validMinimalRequestURI(requestURI) {
+		return nil, "", nil, false, errMalformedHandshake
+	}
+
+	var key []byte
+	var subprotocol string
+	hostSeen, connectionUpgrade, upgradeWebsocket, version13 := false, false, false, false
+	for offset := lineEnd + 2; offset < headerAt; {
+		relativeEnd := bytes.Index(data[offset:headerAt+2], []byte("\r\n"))
+		if relativeEnd <= 0 {
+			return nil, "", nil, false, errMalformedHandshake
+		}
+		line := data[offset : offset+relativeEnd]
+		offset += relativeEnd + 2
+		colon := bytes.IndexByte(line, ':')
+		if colon <= 0 || line[0] == ' ' || line[0] == '\t' || !validTokenBytes(line[:colon]) {
+			return nil, "", nil, false, errMalformedHandshake
+		}
+		name, value := line[:colon], trimOWS(line[colon+1:])
+		if !validHeaderValue(value) {
+			return nil, "", nil, false, errMalformedHandshake
+		}
+		switch {
+		case bytes.EqualFold(name, []byte("Host")):
+			if hostSeen || len(value) == 0 {
+				return nil, "", nil, false, errMalformedHandshake
+			}
+			hostSeen = true
+		case bytes.EqualFold(name, []byte("Connection")):
+			connectionUpgrade = connectionUpgrade || byteHeaderHasToken(value, []byte("upgrade"))
+		case bytes.EqualFold(name, []byte("Upgrade")):
+			upgradeWebsocket = bytes.EqualFold(value, []byte("websocket"))
+		case bytes.EqualFold(name, []byte("Sec-WebSocket-Version")):
+			version13 = bytes.Equal(value, []byte("13"))
+		case bytes.EqualFold(name, []byte("Sec-WebSocket-Key")):
+			if key == nil {
+				key = value
+			}
+		case bytes.EqualFold(name, []byte("Sec-WebSocket-Protocol")):
+			selected, valid := h.selectMinimalSubprotocol(value)
+			if !valid {
+				return nil, "", nil, false, ErrProtocol
+			}
+			if subprotocol == "" {
+				subprotocol = selected
+			}
+		case bytes.EqualFold(name, []byte("Content-Length")), bytes.EqualFold(name, []byte("Transfer-Encoding")):
+			if len(value) != 0 {
+				return nil, "", nil, false, errMalformedHandshake
+			}
+		}
+	}
+	var decodedKey [16]byte
+	n, decodeErr := base64.StdEncoding.Decode(decodedKey[:], key)
+	if !hostSeen || !connectionUpgrade || !upgradeWebsocket || !version13 ||
+		decodeErr != nil || len(key) != 24 || n != len(decodedKey) {
+		return nil, "", nil, false, ErrProtocol
+	}
+	return key, subprotocol, data[headerEnd:], true, nil
+}
+
+func (h *ServerHandler) selectMinimalSubprotocol(value []byte) (string, bool) {
+	for len(value) != 0 {
+		candidate, rest := nextByteHeaderToken(value)
+		value = rest
+		if len(candidate) == 0 {
+			continue
+		}
+		if !validTokenBytes(candidate) {
+			return "", false
+		}
+		for _, supported := range h.config.Subprotocols {
+			if validToken(supported) && bytes.Equal(candidate, []byte(supported)) {
+				return supported, true
+			}
+		}
+	}
+	return "", true
+}
+
+func byteHeaderHasToken(value, token []byte) bool {
+	for len(value) != 0 {
+		candidate, rest := nextByteHeaderToken(value)
+		if bytes.EqualFold(candidate, token) {
+			return true
+		}
+		value = rest
+	}
+	return false
+}
+
+func nextByteHeaderToken(value []byte) (token, rest []byte) {
+	if comma := bytes.IndexByte(value, ','); comma >= 0 {
+		token, rest = value[:comma], value[comma+1:]
+	} else {
+		token = value
+	}
+	return trimOWS(token), rest
+}
+
+func validMinimalRequestURI(uri []byte) bool {
+	if len(uri) == 0 || uri[0] != '/' {
+		return false
+	}
+	for i, c := range uri {
+		if c <= ' ' || c == 0x7f || c == '#' {
+			return false
+		}
+		if c == '%' && (i+2 >= len(uri) || !isHex(uri[i+1]) || !isHex(uri[i+2])) {
+			return false
+		}
+	}
+	return true
+}
+
+func isHex(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
 func (h *ServerHandler) reject(c *epoll.Connection, request *stdhttp.Request, status int) {
 	if request == nil {
 		request = &stdhttp.Request{ProtoMajor: 1, ProtoMinor: 1, Header: make(stdhttp.Header)}
@@ -319,12 +501,12 @@ func (h *ServerHandler) OnClose(c *epoll.Connection, err error) {
 	}
 	h.releaseHandshakeParser(state)
 	if state.upgraded {
-		state.websocket.mu.Lock()
-		code := state.websocket.closeCode
-		reason := state.websocket.closeReason
-		state.websocket.mu.Unlock()
-		if code == 0 {
-			code = 1006
+		closeState := state.websocket.closeState.Load()
+		code := uint16(1006)
+		reason := ""
+		if closeState != nil {
+			code = closeState.code
+			reason = closeState.reason
 		}
 		h.handler.OnClose(&state.websocket, code, reason, err)
 	}
@@ -341,7 +523,7 @@ func (h *ServerHandler) releaseHandshakeParser(state *connectionState) {
 
 var handshakeResponsePrefix = []byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ")
 
-func sendHandshakeResponse(c *epoll.Connection, key, subprotocol string) error {
+func sendHandshakeResponse(c *epoll.Connection, key []byte, subprotocol string) error {
 	var accept [28]byte
 	websocketAccept(accept[:], key)
 	if subprotocol == "" {
@@ -359,7 +541,7 @@ func sendHandshakeResponse(c *epoll.Connection, key, subprotocol string) error {
 	return c.SendOwned(response)
 }
 
-func websocketAccept(dst []byte, key string) {
+func websocketAccept(dst, key []byte) {
 	var challenge [24 + len(websocketGUID)]byte
 	n := copy(challenge[:], key)
 	copy(challenge[n:], websocketGUID)
