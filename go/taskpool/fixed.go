@@ -34,6 +34,15 @@ func (p *fixedPool) submit(task Task) bool {
 	return true
 }
 
+func (p *fixedPool) submitBatch(tasks []Task) int {
+	for i, task := range tasks {
+		if !p.submit(task) {
+			return i
+		}
+	}
+	return len(tasks)
+}
+
 func (p *fixedPool) stop() {
 	p.stopOnce.Do(func() {
 		p.mu.Lock()

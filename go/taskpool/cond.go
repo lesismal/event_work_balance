@@ -11,10 +11,15 @@ type condPool struct {
 	head     int
 	tail     int
 	count    int
-	stopped  bool
-	stopOnce sync.Once
-	pending  sync.WaitGroup
-	workers  sync.WaitGroup
+	// waiters and fullWaiters count goroutines parked on notEmpty/notFull.
+	// Signaling only when a counter is nonzero keeps the uncontended
+	// enqueue/dequeue paths free of runtime notify-list traffic.
+	waiters     int
+	fullWaiters int
+	stopped     bool
+	stopOnce    sync.Once
+	pending     sync.WaitGroup
+	workers     sync.WaitGroup
 }
 
 func newCondPool(executor *executor, workerCount, queueSize int) *condPool {
@@ -31,15 +36,7 @@ func newCondPool(executor *executor, workerCount, queueSize int) *condPool {
 	return p
 }
 
-func (p *condPool) submit(task Task) bool {
-	p.mu.Lock()
-	for !p.stopped && p.count == len(p.queue) {
-		p.notFull.Wait()
-	}
-	if p.stopped {
-		p.mu.Unlock()
-		return false
-	}
+func (p *condPool) enqueueLocked(task Task) {
 	p.pending.Add(1)
 	p.queue[p.tail] = task
 	p.tail++
@@ -47,9 +44,55 @@ func (p *condPool) submit(task Task) bool {
 		p.tail = 0
 	}
 	p.count++
-	p.notEmpty.Signal()
+}
+
+func (p *condPool) submit(task Task) bool {
+	p.mu.Lock()
+	for !p.stopped && p.count == len(p.queue) {
+		p.fullWaiters++
+		p.notFull.Wait()
+		p.fullWaiters--
+	}
+	if p.stopped {
+		p.mu.Unlock()
+		return false
+	}
+	p.enqueueLocked(task)
+	if p.waiters > 0 {
+		p.notEmpty.Signal()
+	}
 	p.mu.Unlock()
 	return true
+}
+
+// submitBatch enqueues tasks under a single lock acquisition, waking at most
+// one parked worker per enqueued task. It returns how many tasks were
+// accepted; a shorter count means the pool stopped mid-batch and the suffix
+// was rejected.
+func (p *condPool) submitBatch(tasks []Task) int {
+	submitted := 0
+	signaled := 0
+	p.mu.Lock()
+	for _, task := range tasks {
+		for !p.stopped && p.count == len(p.queue) {
+			p.fullWaiters++
+			p.notFull.Wait()
+			p.fullWaiters--
+		}
+		if p.stopped {
+			break
+		}
+		p.enqueueLocked(task)
+		submitted++
+		// waiters only decreases once a worker reacquires the lock, so it
+		// bounds how many distinct workers a Signal can still reach.
+		if signaled < p.waiters {
+			p.notEmpty.Signal()
+			signaled++
+		}
+	}
+	p.mu.Unlock()
+	return submitted
 }
 
 func (p *condPool) stop() {
@@ -72,7 +115,9 @@ func (p *condPool) worker() {
 	for {
 		p.mu.Lock()
 		for p.count == 0 && !p.stopped {
+			p.waiters++
 			p.notEmpty.Wait()
+			p.waiters--
 		}
 		if p.count == 0 && p.stopped {
 			p.mu.Unlock()
@@ -85,7 +130,9 @@ func (p *condPool) worker() {
 			p.head = 0
 		}
 		p.count--
-		p.notFull.Signal()
+		if p.fullWaiters > 0 {
+			p.notFull.Signal()
+		}
 		p.mu.Unlock()
 		p.executor.call(task)
 		p.pending.Done()

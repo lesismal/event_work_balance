@@ -47,6 +47,15 @@ func (p *elasticPool) submit(task Task) bool {
 	return true
 }
 
+func (p *elasticPool) submitBatch(tasks []Task) int {
+	for i, task := range tasks {
+		if !p.submit(task) {
+			return i
+		}
+	}
+	return len(tasks)
+}
+
 func (p *elasticPool) stop() {
 	p.stopOnce.Do(func() {
 		p.mu.Lock()

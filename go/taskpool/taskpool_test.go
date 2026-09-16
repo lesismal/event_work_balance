@@ -83,6 +83,34 @@ func TestEachTaskRunsOnce(t *testing.T) {
 	}
 }
 
+func TestGoTasksRunsBatchesOnce(t *testing.T) {
+	for _, mode := range []Mode{ModeFixed, ModeElastic, ModeCond} {
+		t.Run(mode.String(), func(t *testing.T) {
+			// A queue smaller than the batch forces submitBatch through its
+			// queue-full wait path.
+			tp := NewWithMode(mode, 4, 2)
+			var counts [100]atomic.Int64
+			tasks := make([]Task, len(counts))
+			for i := range tasks {
+				index := i
+				tasks[i] = taskFunc(func() { counts[index].Add(1) })
+			}
+			if got := tp.GoTasks(tasks); got != len(tasks) {
+				t.Fatalf("GoTasks accepted %d tasks, want %d", got, len(tasks))
+			}
+			tp.Stop()
+			for i := range counts {
+				if got := counts[i].Load(); got != 1 {
+					t.Fatalf("task %d ran %d times", i, got)
+				}
+			}
+			if got := tp.GoTasks(tasks); got != 0 {
+				t.Fatalf("GoTasks accepted %d tasks after Stop, want 0", got)
+			}
+		})
+	}
+}
+
 func TestAllModesExecuteAndStop(t *testing.T) {
 	for _, mode := range []Mode{ModeFixed, ModeElastic, ModeCond} {
 		t.Run(mode.String(), func(t *testing.T) {

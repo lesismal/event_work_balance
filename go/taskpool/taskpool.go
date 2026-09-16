@@ -38,6 +38,7 @@ func (f taskFunc) RunTask() { f() }
 
 type backend interface {
 	submit(Task) bool
+	submitBatch([]Task) int
 	stop()
 }
 
@@ -113,6 +114,16 @@ func (tp *TaskPool) GoTask(task Task) bool {
 		return true
 	}
 	return tp.backend.submit(task)
+}
+
+// GoTasks submits tasks in order and returns how many were accepted. Tasks
+// must be non-nil. A short count means the pool stopped; the suffix
+// tasks[n:] was not accepted.
+func (tp *TaskPool) GoTasks(tasks []Task) int {
+	if len(tasks) == 0 {
+		return 0
+	}
+	return tp.backend.submitBatch(tasks)
 }
 
 func (tp *TaskPool) Call(f func()) { tp.executor.call(taskFunc(f)) }

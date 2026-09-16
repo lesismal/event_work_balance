@@ -23,6 +23,10 @@ const (
 	wakeToken      = uint64(1)
 	firstConnToken = uint64(2)
 	maxWritevItems = 64
+	// maxWaitBatch caps the epoll_wait output buffer. MaxEvents keeps sizing
+	// the task queue; beyond this many events per wait the loop just calls
+	// epoll_wait again, so a larger buffer only costs memory per server.
+	maxWaitBatch = 1024
 	epollET        = uint32(1 << 31)
 	baseEvents     = uint32(syscall.EPOLLIN|syscall.EPOLLPRI|syscall.EPOLLERR|
 		syscall.EPOLLHUP|syscall.EPOLLRDHUP) | epollET
@@ -395,7 +399,13 @@ func (s *Server) LocalAddr() (*net.TCPAddr, error) {
 }
 
 func (s *Server) Run() error {
-	events := make([]syscall.EpollEvent, s.maxEvents)
+	batch := s.maxEvents
+	if batch > maxWaitBatch {
+		batch = maxWaitBatch
+	}
+	events := make([]syscall.EpollEvent, batch)
+	var ready []*Connection
+	var tasks []taskpool.Task
 	for !s.stopping.Load() {
 		n, err := syscall.EpollWait(s.epollFD, events, -1)
 		if err == syscall.EINTR {
@@ -412,12 +422,38 @@ func (s *Server) Run() error {
 			case wakeToken:
 				s.drainCommands()
 			default:
-				s.enqueueEvent(token, events[i].Events)
+				if c := s.noteEvent(token, events[i].Events); c != nil {
+					ready = append(ready, c)
+				}
 			}
+		}
+		if len(ready) > 0 {
+			tasks = s.submitReady(ready, tasks[:0])
+			clear(ready)
+			ready = ready[:0]
 		}
 	}
 	s.drainCommands()
 	return nil
+}
+
+// submitReady hands one epoll round's newly runnable connections to the task
+// pool in a single batch instead of one lock-and-wake cycle per connection.
+func (s *Server) submitReady(ready []*Connection, tasks []taskpool.Task) []taskpool.Task {
+	for _, c := range ready {
+		tasks = append(tasks, c)
+	}
+	s.taskWG.Add(len(tasks))
+	accepted := s.taskPool.GoTasks(tasks)
+	for _, c := range ready[accepted:] {
+		s.taskWG.Done()
+		c.mu.Lock()
+		c.scheduled = false
+		c.mu.Unlock()
+		c.Close()
+	}
+	clear(tasks)
+	return tasks
 }
 
 func (s *Server) Stop() { s.stopping.Store(true); s.notify() }
@@ -509,20 +545,22 @@ func accept4(listenFD int) (int, error) {
 	return int(r0), nil
 }
 
-func (s *Server) enqueueEvent(token uint64, events uint32) {
+// noteEvent folds readiness into the connection and reports whether it needs
+// to be scheduled. Actual submission happens once per epoll round in Run.
+func (s *Server) noteEvent(token uint64, events uint32) *Connection {
 	c := s.connections[token]
 	if c == nil {
-		return
+		return nil
 	}
 	c.mu.Lock()
 	if c.closing || c.closed {
 		c.mu.Unlock()
-		return
+		return nil
 	}
 	events &= allEvents
 	if events == 0 {
 		c.mu.Unlock()
-		return
+		return nil
 	}
 	// epoll readiness is level information from the connection's point of
 	// view. Coalescing duplicate notifications avoids a slice scan and keeps a
@@ -532,21 +570,10 @@ func (s *Server) enqueueEvent(token uint64, events uint32) {
 	submit := !c.scheduled
 	c.scheduled = true
 	c.mu.Unlock()
-	if submit && !s.submit(c) {
-		c.mu.Lock()
-		c.scheduled = false
-		c.mu.Unlock()
-		c.Close()
+	if !submit {
+		return nil
 	}
-}
-
-func (s *Server) submit(c *Connection) bool {
-	s.taskWG.Add(1)
-	if !s.taskPool.GoTask(c) {
-		s.taskWG.Done()
-		return false
-	}
-	return true
+	return c
 }
 
 // RunTask implements taskpool.Task without allocating a method value for each
@@ -557,9 +584,11 @@ func (c *Connection) RunTask() {
 }
 
 func (s *Server) drainCommands() {
+	// A single read drains the eventfd: reading returns the whole counter and
+	// resets it to zero, so looping until EAGAIN only adds a wasted syscall.
 	var b [8]byte
 	for {
-		if _, err := syscall.Read(s.wakeFD, b[:]); err != nil {
+		if _, err := syscall.Read(s.wakeFD, b[:]); err != syscall.EINTR {
 			break
 		}
 	}
@@ -731,6 +760,12 @@ func (c *Connection) drainInput() error {
 			if pauseReads {
 				return nil
 			}
+			if n < len(buf) {
+				// A short read means the socket buffer is empty, so the next
+				// read would only return EAGAIN. Data arriving after this
+				// point raises a fresh edge, which resubmits the connection.
+				return nil
+			}
 			continue
 		}
 		if n == 0 && err == nil {
@@ -798,6 +833,7 @@ func (c *Connection) flushOutput() error {
 		}
 		var n int
 		var err error
+		attempted := 0
 		pending := len(c.sends) - c.sendHead
 		if c.server.useWritev && pending > 1 {
 			count := pending
@@ -809,10 +845,12 @@ func (c *Connection) flushOutput() error {
 			for i := 0; i < count; i++ {
 				item := &c.sends[c.sendHead+i]
 				buffers[i] = item.data[item.offset:]
+				attempted += len(buffers[i])
 			}
 			n, err = writev(c.FD(), buffers)
 		} else {
 			item := c.sends[c.sendHead]
+			attempted = len(item.data) - item.offset
 			n, err = syscall.Write(c.FD(), item.data[item.offset:])
 		}
 		if n > 0 {
@@ -830,6 +868,14 @@ func (c *Connection) flushOutput() error {
 				left -= remaining
 				c.sends[c.sendHead] = sendItem{}
 				c.sendHead++
+			}
+			if n < attempted {
+				// A short write means the socket send buffer is full, so
+				// retrying now would only earn an EAGAIN. Wait for EPOLLOUT.
+				c.flushing = false
+				c.mu.Unlock()
+				c.server.request(command{kind: commandRefresh, connection: c})
+				return nil
 			}
 			c.mu.Unlock()
 			continue
