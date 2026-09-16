@@ -60,6 +60,17 @@ func NewParser(config Config) *Parser {
 	return &Parser{config: config}
 }
 
+// Reset clears buffered state so the parser can be reused for another
+// connection with the same configuration.
+func (p *Parser) Reset() {
+	if cap(p.buffer) > maxRetainedBuffer {
+		p.buffer = nil
+	} else {
+		p.buffer = p.buffer[:0]
+	}
+	p.headerScan = 0
+}
+
 // Feed may return zero, one, or several pipelined requests.
 func (p *Parser) Feed(data []byte) ([]*stdhttp.Request, error) {
 	var requests []*stdhttp.Request

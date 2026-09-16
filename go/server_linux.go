@@ -38,11 +38,12 @@ type Config struct {
 	MaxEvents      int
 	ReadBufferSize int
 	UseWritev      bool
+	TaskPoolMode   taskpool.Mode
 }
 
 func DefaultConfig() Config {
 	workerCount, maxEvents := defaultPoolSizing()
-	return Config{BindAddress: "0.0.0.0", Port: 9000, Backlog: 128, WorkerCount: workerCount, MaxEvents: maxEvents, ReadBufferSize: 16 * 1024, UseWritev: true}
+	return Config{BindAddress: "0.0.0.0", Port: 9000, Backlog: 128, WorkerCount: workerCount, MaxEvents: maxEvents, ReadBufferSize: 16 * 1024, UseWritev: true, TaskPoolMode: taskpool.ModeCond}
 }
 
 // Handler callbacks run on a logical worker, except OnOpen and OnClose which
@@ -95,6 +96,7 @@ type command struct {
 	connection *Connection
 	err        error
 }
+type commandBatch struct{ items []command }
 type sendItem struct {
 	data   []byte
 	offset int
@@ -294,7 +296,8 @@ type Server struct {
 	stopping                  atomic.Bool
 	nextToken                 atomic.Uint64
 	commandMu                 sync.Mutex
-	commands                  []command
+	commands                  *commandBatch
+	commandPool               sync.Pool
 	wakePending               atomic.Bool
 	connections               map[uint64]*Connection // event-loop ownership
 	taskPool                  *taskpool.TaskPool
@@ -305,6 +308,9 @@ type Server struct {
 func Bind(config Config, handler Handler) (*Server, error) {
 	if config.WorkerCount <= 0 {
 		return nil, errors.New("worker count must be greater than zero")
+	}
+	if !config.TaskPoolMode.Valid() {
+		return nil, fmt.Errorf("invalid task pool mode %d", config.TaskPoolMode)
 	}
 	if config.MaxEvents <= 0 {
 		config.MaxEvents = 256
@@ -340,7 +346,7 @@ func Bind(config Config, handler Handler) (*Server, error) {
 	s := &Server{epollFD: epfd, listenFD: listenFD, wakeFD: wakeFD, maxEvents: config.MaxEvents,
 		useWritev: config.UseWritev, handler: handler, connections: make(map[uint64]*Connection)}
 	s.nextToken.Store(firstConnToken)
-	s.taskPool = taskpool.New(config.WorkerCount, config.MaxEvents)
+	s.taskPool = taskpool.NewWithMode(config.TaskPoolMode, config.WorkerCount, config.MaxEvents)
 	s.readBufferPool.New = func() any { return make([]byte, config.ReadBufferSize) }
 	if err = s.addFD(listenFD, listenerToken, uint32(syscall.EPOLLIN)|epollET); err == nil {
 		err = s.addFD(wakeFD, wakeToken, uint32(syscall.EPOLLIN)|epollET)
@@ -416,7 +422,14 @@ func (s *Server) Close() error {
 
 func (s *Server) request(cmd command) {
 	s.commandMu.Lock()
-	s.commands = append(s.commands, cmd)
+	if s.commands == nil {
+		if pooled := s.commandPool.Get(); pooled != nil {
+			s.commands = pooled.(*commandBatch)
+		} else {
+			s.commands = &commandBatch{}
+		}
+	}
+	s.commands.items = append(s.commands.items, cmd)
 	s.commandMu.Unlock()
 	s.notify()
 }
@@ -506,15 +519,25 @@ func (s *Server) drainCommands() {
 	}
 	s.wakePending.Store(false)
 	s.commandMu.Lock()
-	commands := s.commands
+	batch := s.commands
 	s.commands = nil
 	s.commandMu.Unlock()
-	for _, cmd := range commands {
+	if batch == nil {
+		return
+	}
+	for _, cmd := range batch.items {
 		if cmd.kind == commandClose {
 			s.closeConnection(cmd.connection, cmd.err, true)
 		} else {
 			s.refreshConnection(cmd.connection)
 		}
+	}
+	for i := range batch.items {
+		batch.items[i] = command{}
+	}
+	if cap(batch.items) <= s.maxEvents {
+		batch.items = batch.items[:0]
+		s.commandPool.Put(batch)
 	}
 }
 func (s *Server) refreshConnection(c *Connection) {

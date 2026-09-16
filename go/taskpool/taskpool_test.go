@@ -82,3 +82,24 @@ func TestEachTaskRunsOnce(t *testing.T) {
 		}
 	}
 }
+
+func TestAllModesExecuteAndStop(t *testing.T) {
+	for _, mode := range []Mode{ModeFixed, ModeElastic, ModeCond} {
+		t.Run(mode.String(), func(t *testing.T) {
+			tp := NewWithMode(mode, 4, 16)
+			var count atomic.Int64
+			for i := 0; i < 100; i++ {
+				if !tp.Go(func() { count.Add(1) }) {
+					t.Fatal("task rejected before Stop")
+				}
+			}
+			tp.Stop()
+			if got := count.Load(); got != 100 {
+				t.Fatalf("executed %d tasks, want 100", got)
+			}
+			if tp.Go(func() {}) {
+				t.Fatal("task accepted after Stop")
+			}
+		})
+	}
+}

@@ -120,7 +120,9 @@ func (h *ServerHandler) OnData(c *epoll.Connection, data []byte) {
 }
 
 func (h *ServerHandler) OnPriorityData(*epoll.Connection, []byte) {}
-func (h *ServerHandler) OnClose(c *epoll.Connection, _ error)     { c.SetAttachment(nil) }
+func (h *ServerHandler) OnClose(c *epoll.Connection, _ error) {
+	c.SetAttachment(nil)
+}
 
 func marshalResponse(request *stdhttp.Request, response Response, closeConnection bool) ([]byte, error) {
 	if response.StatusCode < 100 || response.StatusCode > 999 {

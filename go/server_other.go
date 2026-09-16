@@ -19,11 +19,12 @@ type Config struct {
 	Backlog, WorkerCount, MaxEvents int
 	ReadBufferSize                  int
 	UseWritev                       bool
+	TaskPoolMode                    taskpool.Mode
 }
 
 func DefaultConfig() Config {
 	workerCount, maxEvents := defaultPoolSizing()
-	return Config{BindAddress: "0.0.0.0", Port: 9000, Backlog: 128, WorkerCount: workerCount, MaxEvents: maxEvents, ReadBufferSize: 16 * 1024, UseWritev: true}
+	return Config{BindAddress: "0.0.0.0", Port: 9000, Backlog: 128, WorkerCount: workerCount, MaxEvents: maxEvents, ReadBufferSize: 16 * 1024, UseWritev: true, TaskPoolMode: taskpool.ModeCond}
 }
 
 type Handler interface {
@@ -203,6 +204,9 @@ func Bind(config Config, handler Handler) (*Server, error) {
 	if config.WorkerCount <= 0 {
 		return nil, errors.New("worker count must be greater than zero")
 	}
+	if !config.TaskPoolMode.Valid() {
+		return nil, fmt.Errorf("invalid task pool mode %d", config.TaskPoolMode)
+	}
 	if config.MaxEvents <= 0 {
 		config.MaxEvents = 256
 	}
@@ -219,7 +223,7 @@ func Bind(config Config, handler Handler) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{listener: listener, handler: handler, taskPool: taskpool.New(config.WorkerCount, config.MaxEvents), connections: make(map[*Connection]struct{})}
+	s := &Server{listener: listener, handler: handler, taskPool: taskpool.NewWithMode(config.TaskPoolMode, config.WorkerCount, config.MaxEvents), connections: make(map[*Connection]struct{})}
 	s.readBufferPool.New = func() any { return make([]byte, config.ReadBufferSize) }
 	return s, nil
 }

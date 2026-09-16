@@ -3,6 +3,8 @@ package epoll
 import (
 	"runtime"
 	"testing"
+
+	"github.com/lesismal/auto-balance-epoll/go/taskpool"
 )
 
 func TestDefaultConfigPoolSizing(t *testing.T) {
@@ -22,5 +24,8 @@ func TestDefaultConfigPoolSizing(t *testing.T) {
 	}
 	if !config.UseWritev {
 		t.Fatal("UseWritev = false, want adaptive writev enabled by default")
+	}
+	if config.TaskPoolMode != taskpool.ModeCond {
+		t.Fatalf("TaskPoolMode = %v, want cond", config.TaskPoolMode)
 	}
 }

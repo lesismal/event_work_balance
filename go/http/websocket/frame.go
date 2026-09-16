@@ -58,6 +58,21 @@ func NewParser(maxMessageBytes int64) *Parser {
 	return &Parser{maxMessageBytes: maxMessageBytes}
 }
 
+func (p *Parser) Reset() {
+	if cap(p.buffer) > maxRetainedFrameBuffer {
+		p.buffer = nil
+	} else {
+		p.buffer = p.buffer[:0]
+	}
+	p.fragmentOpcode = 0
+	if cap(p.fragment) > maxRetainedFrameBuffer {
+		p.fragment = nil
+	} else {
+		p.fragment = p.fragment[:0]
+	}
+	p.pendingConsume = 0
+}
+
 // Feed parses masked client frames and returns complete messages and control
 // frames. Fragmented data messages are reassembled before being returned.
 func (p *Parser) Feed(data []byte) ([]Event, error) {

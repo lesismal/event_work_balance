@@ -145,8 +145,9 @@ type connectionState struct {
 }
 
 type ServerHandler struct {
-	config  Config
-	handler Handler
+	config      Config
+	handler     Handler
+	httpParsers sync.Pool
 }
 
 func NewHandler(handler Handler) *ServerHandler {
@@ -161,11 +162,14 @@ func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 	if handler == nil {
 		handler = HandlerFuncs{}
 	}
-	return &ServerHandler{config: config, handler: handler}
+	h := &ServerHandler{config: config, handler: handler}
+	h.httpParsers.New = func() any { return epollhttp.NewParser(config.HTTP) }
+	return h
 }
 
 func (h *ServerHandler) OnOpen(c *epoll.Connection) {
-	c.SetAttachment(&connectionState{httpParser: epollhttp.NewParser(h.config.HTTP)})
+	state := &connectionState{httpParser: h.httpParsers.Get().(*epollhttp.Parser)}
+	c.SetAttachment(state)
 }
 
 func (h *ServerHandler) OnData(c *epoll.Connection, data []byte) {
@@ -200,6 +204,8 @@ func (h *ServerHandler) OnData(c *epoll.Connection, data []byte) {
 	state.wsParser = NewParser(h.config.MaxMessageBytes)
 	state.upgraded = true
 	remainder := state.httpParser.TakeBuffered()
+	state.httpParser.Reset()
+	h.httpParsers.Put(state.httpParser)
 	state.httpParser = nil
 	h.handler.OnOpen(state.websocket, request)
 	if len(remainder) != 0 {
