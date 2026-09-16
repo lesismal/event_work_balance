@@ -457,7 +457,7 @@ func (s *Server) modifyFD(c *Connection, events uint32) error {
 
 func (s *Server) acceptConnections() {
 	for {
-		fd, _, err := syscall.Accept4(s.listenFD, syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC)
+		fd, err := accept4(s.listenFD)
 		if err == syscall.EINTR {
 			continue
 		}
@@ -474,6 +474,22 @@ func (s *Server) acceptConnections() {
 		s.connections[token] = c
 		s.handler.OnOpen(c)
 	}
+}
+
+func accept4(listenFD int) (int, error) {
+	r0, _, errno := syscall.RawSyscall6(
+		syscall.SYS_ACCEPT4,
+		uintptr(listenFD),
+		0,
+		0,
+		uintptr(syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC),
+		0,
+		0,
+	)
+	if errno != 0 {
+		return -1, errno
+	}
+	return int(r0), nil
 }
 
 func (s *Server) enqueueEvent(token uint64, events uint32) {

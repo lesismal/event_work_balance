@@ -138,16 +138,15 @@ func (c *Connection) sendClose(payload []byte) error {
 }
 
 type connectionState struct {
-	httpParser *epollhttp.Parser
-	wsParser   *Parser
-	websocket  *Connection
-	upgraded   bool
+	handshake handshakeParser
+	wsParser  Parser
+	websocket Connection
+	upgraded  bool
 }
 
 type ServerHandler struct {
-	config      Config
-	handler     Handler
-	httpParsers sync.Pool
+	config  Config
+	handler Handler
 }
 
 func NewHandler(handler Handler) *ServerHandler {
@@ -159,16 +158,21 @@ func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 	if config.MaxMessageBytes <= 0 {
 		config.MaxMessageBytes = defaults.MaxMessageBytes
 	}
+	if config.HTTP.MaxHeaderBytes <= 0 {
+		config.HTTP.MaxHeaderBytes = defaults.HTTP.MaxHeaderBytes
+	}
+	if config.HTTP.MaxBodyBytes <= 0 {
+		config.HTTP.MaxBodyBytes = defaults.HTTP.MaxBodyBytes
+	}
 	if handler == nil {
 		handler = HandlerFuncs{}
 	}
-	h := &ServerHandler{config: config, handler: handler}
-	h.httpParsers.New = func() any { return epollhttp.NewParser(config.HTTP) }
-	return h
+	return &ServerHandler{config: config, handler: handler}
 }
 
 func (h *ServerHandler) OnOpen(c *epoll.Connection) {
-	state := &connectionState{httpParser: h.httpParsers.Get().(*epollhttp.Parser)}
+	state := &connectionState{}
+	state.handshake.maxHeaderBytes = h.config.HTTP.MaxHeaderBytes
 	c.SetAttachment(state)
 }
 
@@ -182,7 +186,7 @@ func (h *ServerHandler) OnData(c *epoll.Connection, data []byte) {
 		h.handleFrames(state, data)
 		return
 	}
-	request, complete, err := state.httpParser.FeedOne(data)
+	request, complete, err := state.handshake.Feed(data)
 	if err != nil {
 		h.reject(c, request, stdhttp.StatusBadRequest)
 		return
@@ -200,14 +204,11 @@ func (h *ServerHandler) OnData(c *epoll.Connection, data []byte) {
 		c.Close()
 		return
 	}
-	state.websocket = &Connection{conn: c, subprotocol: subprotocol}
-	state.wsParser = NewParser(h.config.MaxMessageBytes)
+	state.websocket = Connection{conn: c, subprotocol: subprotocol}
+	state.wsParser.maxMessageBytes = h.config.MaxMessageBytes
 	state.upgraded = true
-	remainder := state.httpParser.TakeBuffered()
-	state.httpParser.Reset()
-	h.httpParsers.Put(state.httpParser)
-	state.httpParser = nil
-	h.handler.OnOpen(state.websocket, request)
+	remainder := state.handshake.TakeBuffered()
+	h.handler.OnOpen(&state.websocket, request)
 	if len(remainder) != 0 {
 		h.handleFrames(state, remainder)
 	}
@@ -227,7 +228,7 @@ func (h *ServerHandler) handleFrames(state *connectionState, data []byte) {
 		}
 		switch event.Opcode {
 		case Text, Binary:
-			h.handler.OnMessage(state.websocket, event.Opcode, event.Payload)
+			h.handler.OnMessage(&state.websocket, event.Opcode, event.Payload)
 		case Ping:
 			if sendErr := state.websocket.Pong(event.Payload); sendErr != nil {
 				state.websocket.conn.Close()
@@ -261,21 +262,29 @@ func (h *ServerHandler) validateHandshake(request *stdhttp.Request) (string, err
 		request.Header.Get("Sec-WebSocket-Version") != "13" {
 		return "", ErrProtocol
 	}
-	key, err := base64.StdEncoding.DecodeString(request.Header.Get("Sec-WebSocket-Key"))
-	if err != nil || len(key) != 16 {
+	key := request.Header.Get("Sec-WebSocket-Key")
+	var decodedKey [16]byte
+	n, err := base64.StdEncoding.Decode(decodedKey[:], []byte(key))
+	if err != nil || len(key) != base64.StdEncoding.EncodedLen(len(decodedKey)) || n != len(decodedKey) {
 		return "", ErrProtocol
 	}
 	if h.config.CheckOrigin != nil && !h.config.CheckOrigin(request) {
 		return "", errors.New("websocket: origin rejected")
 	}
-	offered := splitHeaderTokens(request.Header.Values("Sec-WebSocket-Protocol"))
-	for _, candidate := range offered {
-		if !validToken(candidate) {
-			return "", ErrProtocol
-		}
-		for _, supported := range h.config.Subprotocols {
-			if candidate == supported && validToken(supported) {
-				return candidate, nil
+	for _, value := range request.Header.Values("Sec-WebSocket-Protocol") {
+		for len(value) != 0 {
+			candidate, rest := nextHeaderToken(value)
+			value = rest
+			if candidate == "" {
+				continue
+			}
+			if !validToken(candidate) {
+				return "", ErrProtocol
+			}
+			for _, supported := range h.config.Subprotocols {
+				if candidate == supported && validToken(supported) {
+					return candidate, nil
+				}
 			}
 		}
 	}
@@ -311,17 +320,21 @@ func (h *ServerHandler) OnClose(c *epoll.Connection, err error) {
 		if code == 0 {
 			code = 1006
 		}
-		h.handler.OnClose(state.websocket, code, reason, err)
+		h.handler.OnClose(&state.websocket, code, reason, err)
 	}
 }
 
 func handshakeResponse(key, subprotocol string) []byte {
-	sum := sha1.Sum([]byte(key + websocketGUID))
-	accept := base64.StdEncoding.EncodeToString(sum[:])
+	var challenge [24 + len(websocketGUID)]byte
+	n := copy(challenge[:], key)
+	copy(challenge[n:], websocketGUID)
+	sum := sha1.Sum(challenge[:n+len(websocketGUID)])
+	var accept [28]byte
+	base64.StdEncoding.Encode(accept[:], sum[:])
 	response := make([]byte, 0, 129+len(subprotocol))
 	response = append(response, "HTTP/1.1 101 Switching Protocols\r\n"...)
 	response = append(response, "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "...)
-	response = append(response, accept...)
+	response = append(response, accept[:]...)
 	response = append(response, '\r', '\n')
 	if subprotocol != "" {
 		response = append(response, "Sec-WebSocket-Protocol: "...)
@@ -333,8 +346,10 @@ func handshakeResponse(key, subprotocol string) []byte {
 
 func headerHasToken(header stdhttp.Header, name, token string) bool {
 	for _, value := range header.Values(name) {
-		for _, candidate := range strings.Split(value, ",") {
-			if strings.EqualFold(strings.TrimSpace(candidate), token) {
+		for len(value) != 0 {
+			candidate, rest := nextHeaderToken(value)
+			value = rest
+			if strings.EqualFold(candidate, token) {
 				return true
 			}
 		}
@@ -342,29 +357,13 @@ func headerHasToken(header stdhttp.Header, name, token string) bool {
 	return false
 }
 
-func splitHeaderTokens(values []string) []string {
-	var tokens []string
-	for _, value := range values {
-		for _, token := range strings.Split(value, ",") {
-			if token = strings.TrimSpace(token); token != "" {
-				tokens = append(tokens, token)
-			}
-		}
+func nextHeaderToken(value string) (token, rest string) {
+	if comma := strings.IndexByte(value, ','); comma >= 0 {
+		token, rest = value[:comma], value[comma+1:]
+	} else {
+		token = value
 	}
-	return tokens
-}
-
-func validToken(value string) bool {
-	if value == "" {
-		return false
-	}
-	const separators = "()<>@,;:\\\"/[]?={} \t"
-	for i := 0; i < len(value); i++ {
-		if value[i] < 0x21 || value[i] > 0x7e || strings.ContainsRune(separators, rune(value[i])) {
-			return false
-		}
-	}
-	return true
+	return strings.TrimSpace(token), rest
 }
 
 func closePayload(payload []byte) (uint16, string) {
