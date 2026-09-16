@@ -49,6 +49,7 @@ type Parser struct {
 	fragmentOpcode  Opcode
 	fragment        []byte
 	pendingConsume  int
+	borrowedBuffer  bool
 }
 
 func NewParser(maxMessageBytes int64) *Parser {
@@ -59,7 +60,7 @@ func NewParser(maxMessageBytes int64) *Parser {
 }
 
 func (p *Parser) Reset() {
-	if cap(p.buffer) > maxRetainedFrameBuffer {
+	if p.borrowedBuffer || cap(p.buffer) > maxRetainedFrameBuffer {
 		p.buffer = nil
 	} else {
 		p.buffer = p.buffer[:0]
@@ -71,6 +72,7 @@ func (p *Parser) Reset() {
 		p.fragment = p.fragment[:0]
 	}
 	p.pendingConsume = 0
+	p.borrowedBuffer = false
 }
 
 // Feed parses masked client frames and returns complete messages and control
@@ -100,21 +102,40 @@ func (p *Parser) FeedOneBorrowed(data []byte) (Event, bool, error) {
 	return p.feedOne(data, true)
 }
 
+// ReleaseBorrowed detaches any input buffer retained by FeedOneBorrowed. It is
+// cheap to call after each network-data callback.
+func (p *Parser) ReleaseBorrowed() {
+	if p.pendingConsume != 0 {
+		p.consume(p.pendingConsume)
+		p.pendingConsume = 0
+	}
+}
+
 func (p *Parser) feedOne(data []byte, borrowPayload bool) (Event, bool, error) {
 	if p.pendingConsume != 0 {
 		p.consume(p.pendingConsume)
 		p.pendingConsume = 0
 	}
-	p.buffer = append(p.buffer, data...)
+	if borrowPayload && len(p.buffer) == 0 && len(data) != 0 {
+		p.buffer = data
+		p.borrowedBuffer = true
+	} else {
+		p.buffer = append(p.buffer, data...)
+	}
 	for {
 		event, emit, complete, err := p.next(borrowPayload)
 		if err != nil {
 			p.buffer = nil
+			p.borrowedBuffer = false
 			p.fragment = nil
 			p.fragmentOpcode = 0
 			return Event{}, false, err
 		}
 		if !complete {
+			if p.borrowedBuffer && len(p.buffer) != 0 {
+				p.buffer = append([]byte(nil), p.buffer...)
+				p.borrowedBuffer = false
+			}
 			return Event{}, false, nil
 		}
 		if emit {
@@ -258,11 +279,12 @@ func (p *Parser) finishFrame(frameEnd int, borrowed bool) {
 
 func (p *Parser) consume(n int) {
 	if n == len(p.buffer) {
-		if cap(p.buffer) > maxRetainedFrameBuffer {
+		if p.borrowedBuffer || cap(p.buffer) > maxRetainedFrameBuffer {
 			p.buffer = nil
 		} else {
 			p.buffer = p.buffer[:0]
 		}
+		p.borrowedBuffer = false
 		return
 	}
 	copy(p.buffer, p.buffer[n:])

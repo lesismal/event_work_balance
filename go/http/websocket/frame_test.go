@@ -121,4 +121,8 @@ func TestFeedOneBorrowedPipelinedFrames(t *testing.T) {
 	if err != nil || !complete || string(second.Payload) != "second" {
 		t.Fatalf("second event = %#v, complete=%v, err=%v", second, complete, err)
 	}
+	parser.ReleaseBorrowed()
+	if parser.buffer != nil {
+		t.Fatalf("borrowed input retained with capacity %d", cap(parser.buffer))
+	}
 }

@@ -39,11 +39,12 @@ type Config struct {
 	ReadBufferSize int
 	UseWritev      bool
 	TaskPoolMode   taskpool.Mode
+	SharedTaskPool bool
 }
 
 func DefaultConfig() Config {
 	workerCount, maxEvents := defaultPoolSizing()
-	return Config{BindAddress: "0.0.0.0", Port: 9000, Backlog: 128, WorkerCount: workerCount, MaxEvents: maxEvents, ReadBufferSize: 16 * 1024, UseWritev: true, TaskPoolMode: taskpool.ModeCond}
+	return Config{BindAddress: "0.0.0.0", Port: 9000, Backlog: 128, WorkerCount: workerCount, MaxEvents: maxEvents, ReadBufferSize: 16 * 1024, UseWritev: true, TaskPoolMode: taskpool.ModeCond, SharedTaskPool: true}
 }
 
 // Handler callbacks run on a logical worker, except OnOpen and OnClose which
@@ -97,6 +98,7 @@ type command struct {
 	err        error
 }
 type commandBatch struct{ items []command }
+type readBuffer struct{ data []byte }
 type sendItem struct {
 	data   []byte
 	offset int
@@ -301,6 +303,8 @@ type Server struct {
 	wakePending               atomic.Bool
 	connections               map[uint64]*Connection // event-loop ownership
 	taskPool                  *taskpool.TaskPool
+	releaseTaskPool           func()
+	taskWG                    sync.WaitGroup
 	readBufferPool            sync.Pool
 	closeOnce                 sync.Once
 }
@@ -346,13 +350,13 @@ func Bind(config Config, handler Handler) (*Server, error) {
 	s := &Server{epollFD: epfd, listenFD: listenFD, wakeFD: wakeFD, maxEvents: config.MaxEvents,
 		useWritev: config.UseWritev, handler: handler, connections: make(map[uint64]*Connection)}
 	s.nextToken.Store(firstConnToken)
-	s.taskPool = taskpool.NewWithMode(config.TaskPoolMode, config.WorkerCount, config.MaxEvents)
-	s.readBufferPool.New = func() any { return make([]byte, config.ReadBufferSize) }
+	s.taskPool, s.releaseTaskPool = acquireTaskPool(config)
+	s.readBufferPool.New = func() any { return &readBuffer{data: make([]byte, config.ReadBufferSize)} }
 	if err = s.addFD(listenFD, listenerToken, uint32(syscall.EPOLLIN)|epollET); err == nil {
 		err = s.addFD(wakeFD, wakeToken, uint32(syscall.EPOLLIN)|epollET)
 	}
 	if err != nil {
-		s.taskPool.Stop()
+		s.releaseTaskPool()
 		syscall.Close(wakeFD)
 		syscall.Close(listenFD)
 		syscall.Close(epfd)
@@ -406,7 +410,8 @@ func (s *Server) Close() error {
 	var closeErr error
 	s.closeOnce.Do(func() {
 		s.Stop()
-		s.taskPool.Stop()
+		s.taskWG.Wait()
+		s.releaseTaskPool()
 		s.drainCommands()
 		for _, c := range s.connections {
 			s.closeConnection(c, nil, false)
@@ -503,12 +508,20 @@ func (s *Server) enqueueEvent(token uint64, events uint32) {
 }
 
 func (s *Server) submit(c *Connection) bool {
-	return s.taskPool.GoTask(c)
+	s.taskWG.Add(1)
+	if !s.taskPool.GoTask(c) {
+		s.taskWG.Done()
+		return false
+	}
+	return true
 }
 
 // RunTask implements taskpool.Task without allocating a method value for each
 // readiness notification.
-func (c *Connection) RunTask() { c.process() }
+func (c *Connection) RunTask() {
+	defer c.server.taskWG.Done()
+	c.process()
+}
 
 func (s *Server) drainCommands() {
 	var b [8]byte
@@ -631,8 +644,9 @@ func (c *Connection) process() {
 	}
 }
 func (c *Connection) drainInput() error {
-	buf := c.server.readBufferPool.Get().([]byte)
-	defer c.server.readBufferPool.Put(buf)
+	buffer := c.server.readBufferPool.Get().(*readBuffer)
+	buf := buffer.data
+	defer c.server.readBufferPool.Put(buffer)
 	for {
 		n, err := syscall.Read(c.FD(), buf)
 		if n > 0 {

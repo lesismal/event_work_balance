@@ -10,11 +10,11 @@ import (
 func TestDefaultConfigPoolSizing(t *testing.T) {
 	config := DefaultConfig()
 	wantWorkers := runtime.GOMAXPROCS(0)
-	wantEvents := wantWorkers * 256
-	if wantEvents < 4096 {
-		wantEvents = 4096
-	} else if wantEvents > 65536 {
-		wantEvents = 65536
+	wantEvents := wantWorkers * 64
+	if wantEvents < 1024 {
+		wantEvents = 1024
+	} else if wantEvents > 16384 {
+		wantEvents = 16384
 	}
 	if config.WorkerCount != wantWorkers {
 		t.Fatalf("WorkerCount = %d, want %d", config.WorkerCount, wantWorkers)
@@ -27,5 +27,8 @@ func TestDefaultConfigPoolSizing(t *testing.T) {
 	}
 	if config.TaskPoolMode != taskpool.ModeCond {
 		t.Fatalf("TaskPoolMode = %v, want cond", config.TaskPoolMode)
+	}
+	if !config.SharedTaskPool {
+		t.Fatal("SharedTaskPool = false, want shared workers by default")
 	}
 }

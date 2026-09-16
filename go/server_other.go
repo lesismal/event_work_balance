@@ -20,11 +20,12 @@ type Config struct {
 	ReadBufferSize                  int
 	UseWritev                       bool
 	TaskPoolMode                    taskpool.Mode
+	SharedTaskPool                  bool
 }
 
 func DefaultConfig() Config {
 	workerCount, maxEvents := defaultPoolSizing()
-	return Config{BindAddress: "0.0.0.0", Port: 9000, Backlog: 128, WorkerCount: workerCount, MaxEvents: maxEvents, ReadBufferSize: 16 * 1024, UseWritev: true, TaskPoolMode: taskpool.ModeCond}
+	return Config{BindAddress: "0.0.0.0", Port: 9000, Backlog: 128, WorkerCount: workerCount, MaxEvents: maxEvents, ReadBufferSize: 16 * 1024, UseWritev: true, TaskPoolMode: taskpool.ModeCond, SharedTaskPool: true}
 }
 
 type Handler interface {
@@ -66,6 +67,7 @@ type portableEvent struct {
 	closeErr error
 	closing  bool
 }
+type readBuffer struct{ data []byte }
 type connectionAttachment struct{ value any }
 type Connection struct {
 	server                             *Server
@@ -105,7 +107,7 @@ func (c *Connection) closeWithError(err error) {
 	c.scheduled = true
 	c.mu.Unlock()
 	_ = c.conn.Close()
-	if submit && !c.server.taskPool.GoTask(c) {
+	if submit && !c.server.submit(c) {
 		c.server.finishConnection(c, err)
 	}
 }
@@ -155,7 +157,7 @@ func (c *Connection) enqueueData(data []byte) bool {
 	submit := !c.scheduled
 	c.scheduled = true
 	c.mu.Unlock()
-	if submit && !c.server.taskPool.GoTask(c) {
+	if submit && !c.server.submit(c) {
 		c.closeWithError(errors.New("task pool stopped"))
 		return false
 	}
@@ -186,18 +188,23 @@ func (c *Connection) process() {
 	}
 }
 
-func (c *Connection) RunTask() { c.process() }
+func (c *Connection) RunTask() {
+	defer c.server.taskWG.Done()
+	c.process()
+}
 
 type Server struct {
-	listener       net.Listener
-	handler        Handler
-	taskPool       *taskpool.TaskPool
-	stopping       atomic.Bool
-	closeOnce      sync.Once
-	mu             sync.Mutex
-	connections    map[*Connection]struct{}
-	readers        sync.WaitGroup
-	readBufferPool sync.Pool
+	listener        net.Listener
+	handler         Handler
+	taskPool        *taskpool.TaskPool
+	releaseTaskPool func()
+	taskWG          sync.WaitGroup
+	stopping        atomic.Bool
+	closeOnce       sync.Once
+	mu              sync.Mutex
+	connections     map[*Connection]struct{}
+	readers         sync.WaitGroup
+	readBufferPool  sync.Pool
 }
 
 func Bind(config Config, handler Handler) (*Server, error) {
@@ -223,9 +230,19 @@ func Bind(config Config, handler Handler) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{listener: listener, handler: handler, taskPool: taskpool.NewWithMode(config.TaskPoolMode, config.WorkerCount, config.MaxEvents), connections: make(map[*Connection]struct{})}
-	s.readBufferPool.New = func() any { return make([]byte, config.ReadBufferSize) }
+	pool, releasePool := acquireTaskPool(config)
+	s := &Server{listener: listener, handler: handler, taskPool: pool, releaseTaskPool: releasePool, connections: make(map[*Connection]struct{})}
+	s.readBufferPool.New = func() any { return &readBuffer{data: make([]byte, config.ReadBufferSize)} }
 	return s, nil
+}
+
+func (s *Server) submit(c *Connection) bool {
+	s.taskWG.Add(1)
+	if !s.taskPool.GoTask(c) {
+		s.taskWG.Done()
+		return false
+	}
+	return true
 }
 func (s *Server) LocalAddr() (*net.TCPAddr, error) {
 	addr, ok := s.listener.Addr().(*net.TCPAddr)
@@ -255,8 +272,9 @@ func (s *Server) Run() error {
 }
 func (s *Server) readConnection(c *Connection) {
 	defer s.readers.Done()
-	buf := s.readBufferPool.Get().([]byte)
-	defer s.readBufferPool.Put(buf)
+	buffer := s.readBufferPool.Get().(*readBuffer)
+	buf := buffer.data
+	defer s.readBufferPool.Put(buffer)
 	for {
 		n, err := c.conn.Read(buf)
 		if n > 0 && !c.enqueueData(buf[:n]) {
@@ -304,7 +322,8 @@ func (s *Server) Close() error {
 			c.Close()
 		}
 		s.readers.Wait()
-		s.taskPool.Stop()
+		s.taskWG.Wait()
+		s.releaseTaskPool()
 	})
 	return nil
 }

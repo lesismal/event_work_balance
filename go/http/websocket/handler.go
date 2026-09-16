@@ -214,6 +214,7 @@ func (h *ServerHandler) OnData(c *epoll.Connection, data []byte) {
 }
 
 func (h *ServerHandler) handleFrames(state *connectionState, data []byte) {
+	defer state.wsParser.ReleaseBorrowed()
 	for {
 		event, complete, err := state.wsParser.FeedOneBorrowed(data)
 		data = nil

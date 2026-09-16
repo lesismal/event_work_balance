@@ -11,11 +11,14 @@
 - 读 buffer 由 Server 级 `sync.Pool` 复用，大小通过 `Config.ReadBufferSize`
   设置，默认 16 KiB。
 - `DefaultConfig` 根据 `runtime.GOMAXPROCS(0)` 计算池容量：`WorkerCount`
-  默认等于可运行的 Go 线程数；`MaxEvents` 默认为其 256 倍，并限制在
-  4096～65536。
+  默认等于可运行的 Go 线程数；`MaxEvents` 默认为其 64 倍，并限制在
+  1024～16384。
 - `Config.TaskPoolMode` 可选择 `taskpool.ModeCond`（默认，基于 `sync.Cond`
   的有界环形队列）、`taskpool.ModeFixed`（channel worker）或
   `taskpool.ModeElastic`（nbio 风格的弹性 fork/dispatcher）。
+- `SharedTaskPool` 默认开启；同一进程内配置相同的多个 Server 共享 worker
+  和任务队列，避免多监听端口重复创建大量 goroutine 与队列。需要完全隔离时
+  可显式设为 `false`。
 - `Send` 先直接发送，余量复制进发送队列。默认启用自适应 writev：单缓冲走
   write，`SendParts` 的两段数据和包含多个缓冲的发送队列走 writev；仅在背压
   时复制未发送部分。
