@@ -71,24 +71,28 @@ func (p *condPool) submit(task Task) bool {
 // was rejected.
 func (p *condPool) submitBatch(tasks []Task) int {
 	submitted := 0
-	signaled := 0
 	p.mu.Lock()
+	// wakeBudget bounds how many parked workers this batch still has to wake.
+	// A worker that has been signaled keeps taking tasks on its own, and a
+	// worker only parks when the queue is empty, so the tasks after the budget
+	// runs out are picked up without a signal. The budget is recomputed after
+	// every wait, because workers park again while a full queue blocks us.
+	wakeBudget := p.waiters
 	for _, task := range tasks {
 		for !p.stopped && p.count == len(p.queue) {
 			p.fullWaiters++
 			p.notFull.Wait()
 			p.fullWaiters--
+			wakeBudget = p.waiters
 		}
 		if p.stopped {
 			break
 		}
 		p.enqueueLocked(task)
 		submitted++
-		// waiters only decreases once a worker reacquires the lock, so it
-		// bounds how many distinct workers a Signal can still reach.
-		if signaled < p.waiters {
+		if wakeBudget > 0 {
 			p.notEmpty.Signal()
-			signaled++
+			wakeBudget--
 		}
 	}
 	p.mu.Unlock()

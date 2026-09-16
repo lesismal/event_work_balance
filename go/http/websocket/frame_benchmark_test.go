@@ -1,6 +1,9 @@
 package websocket
 
-import "testing"
+import (
+	"bytes"
+	"testing"
+)
 
 func BenchmarkParserSmallText(b *testing.B) {
 	parser := NewParser(1 << 20)
@@ -51,6 +54,41 @@ func BenchmarkParser1KiBBorrowed(b *testing.B) {
 		if err != nil || !complete {
 			b.Fatalf("FeedOneBorrowed returned complete=%v, %v", complete, err)
 		}
+	}
+}
+
+// BenchmarkParserBorrowedSplitFrames mirrors a socket read that does not end on
+// a frame boundary, which is the normal case whenever the read buffer size and
+// the payload size are unrelated. Every other round leaves a partial frame that
+// the parser must take ownership of before the read buffer goes back to its
+// pool, so this is the path that dominates a busy server's allocations.
+func BenchmarkParserBorrowedSplitFrames(b *testing.B) {
+	frame := clientFrame(Binary, true, make([]byte, 1024))
+	// Each read carries one and a half frames; two reads span three frames, so
+	// the stream repeats on a frame boundary.
+	readSize := len(frame) * 3 / 2
+	stream := bytes.Repeat(frame, 3)
+	parser := NewParser(1 << 20)
+	buf := make([]byte, readSize)
+	offset := 0
+	b.ReportAllocs()
+	b.SetBytes(int64(readSize))
+	for i := 0; i < b.N; i++ {
+		// Copy into a reusable buffer the way drainInput hands one to OnData.
+		copy(buf, stream[offset:offset+readSize])
+		offset = (offset + readSize) % len(stream)
+		data := buf
+		for {
+			_, complete, err := parser.FeedOneBorrowed(data)
+			data = nil
+			if err != nil {
+				b.Fatal(err)
+			}
+			if !complete {
+				break
+			}
+		}
+		parser.ReleaseBorrowed()
 	}
 }
 

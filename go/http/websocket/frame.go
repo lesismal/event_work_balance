@@ -51,6 +51,7 @@ type fragmentedMessage struct {
 type Parser struct {
 	maxMessageBytes int64
 	buffer          []byte
+	owned           []byte
 	borrowedTail    []byte
 	fragment        *fragmentedMessage
 	pendingConsume  int
@@ -77,6 +78,9 @@ func (p *Parser) Reset() {
 		} else {
 			p.fragment.data = p.fragment.data[:0]
 		}
+	}
+	if cap(p.owned) > maxRetainedFrameBuffer {
+		p.owned = nil
 	}
 	p.pendingConsume = 0
 	p.borrowedBuffer = false
@@ -139,13 +143,16 @@ func (p *Parser) feedOne(data []byte, borrowPayload bool) (Event, bool, error) {
 		p.borrowedBuffer = true
 	} else if borrowPayload && !p.borrowedBuffer && len(p.buffer) != 0 && len(data) != 0 {
 		p.buffer, p.borrowedTail = appendCurrentFrame(p.buffer, data)
+		p.keepOwned()
 	} else {
 		p.buffer = append(p.buffer, data...)
+		p.keepOwned()
 	}
 	for {
 		event, emit, complete, err := p.next(borrowPayload)
 		if err != nil {
 			p.buffer = nil
+			p.owned = nil
 			p.borrowedBuffer = false
 			p.borrowedTail = nil
 			p.fragment = nil
@@ -153,15 +160,7 @@ func (p *Parser) feedOne(data []byte, borrowPayload bool) (Event, bool, error) {
 		}
 		if !complete {
 			if p.borrowedBuffer && len(p.buffer) != 0 {
-				capacity := len(p.buffer)
-				if frameEnd, known := frameSize(p.buffer); known && frameEnd > capacity &&
-					uint64(frameEnd) <= uint64(p.maxMessageBytes)+14 {
-					capacity = frameEnd
-				}
-				owned := make([]byte, len(p.buffer), capacity)
-				copy(owned, p.buffer)
-				p.buffer = owned
-				p.borrowedBuffer = false
+				p.adopt()
 			}
 			return Event{}, false, nil
 		}
@@ -169,6 +168,41 @@ func (p *Parser) feedOne(data []byte, borrowPayload bool) (Event, bool, error) {
 			return event, true, nil
 		}
 	}
+}
+
+// keepOwned remembers the parser-owned array behind buffer so a later adopt can
+// reuse it. An emptied or borrowed buffer must not displace a larger array that
+// is still worth keeping, so the retained one only ever grows.
+func (p *Parser) keepOwned() {
+	if !p.borrowedBuffer && cap(p.buffer) >= cap(p.owned) {
+		p.owned = p.buffer
+	}
+}
+
+// adopt copies the borrowed tail into the parser's own array so the read
+// buffer can go back to its pool. At high message rates almost every read ends
+// mid-frame, so the array is retained and reused across reads rather than
+// allocated each time.
+func (p *Parser) adopt() {
+	capacity := len(p.buffer)
+	// Sizing to the whole frame avoids regrowing while the rest of it arrives,
+	// but only up to the retention limit: a peer that announces a huge frame
+	// must not make every connection reserve it from the first bytes onward.
+	if frameEnd, known := frameSize(p.buffer); known && frameEnd > capacity &&
+		uint64(frameEnd) <= uint64(p.maxMessageBytes)+14 {
+		if frameEnd > maxRetainedFrameBuffer {
+			frameEnd = maxRetainedFrameBuffer
+		}
+		if frameEnd > capacity {
+			capacity = frameEnd
+		}
+	}
+	if cap(p.owned) < capacity {
+		p.owned = make([]byte, 0, capacity)
+	}
+	p.owned = append(p.owned[:0], p.buffer...)
+	p.buffer = p.owned
+	p.borrowedBuffer = false
 }
 
 func appendCurrentFrame(buffer, data []byte) ([]byte, []byte) {
@@ -357,9 +391,13 @@ func (p *Parser) finishFrame(frameEnd int, borrowed bool) {
 
 func (p *Parser) consume(n int) {
 	if n == len(p.buffer) {
-		if p.borrowedBuffer || cap(p.buffer) > maxRetainedFrameBuffer {
+		switch {
+		case p.borrowedBuffer:
+			// The retained array is kept: the next partial frame reuses it.
 			p.buffer = nil
-		} else {
+		case cap(p.buffer) > maxRetainedFrameBuffer:
+			p.buffer, p.owned = nil, nil
+		default:
 			p.buffer = p.buffer[:0]
 		}
 		p.borrowedBuffer = false

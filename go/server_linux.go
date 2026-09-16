@@ -27,8 +27,11 @@ const (
 	// the task queue; beyond this many events per wait the loop just calls
 	// epoll_wait again, so a larger buffer only costs memory per server.
 	maxWaitBatch = 1024
-	epollET        = uint32(1 << 31)
-	baseEvents     = uint32(syscall.EPOLLIN|syscall.EPOLLPRI|syscall.EPOLLERR|
+	// maxRetainedSendBuffer bounds the per-connection outbound buffer kept for
+	// reuse once its queue drains.
+	maxRetainedSendBuffer = 64 << 10
+	epollET               = uint32(1 << 31)
+	baseEvents            = uint32(syscall.EPOLLIN|syscall.EPOLLPRI|syscall.EPOLLERR|
 		syscall.EPOLLHUP|syscall.EPOLLRDHUP) | epollET
 	allEvents = baseEvents | syscall.EPOLLOUT
 )
@@ -107,6 +110,7 @@ type command struct {
 }
 type commandBatch struct{ items []command }
 type readBuffer struct{ data []byte }
+type sendBuffer struct{ data []byte }
 type sendItem struct {
 	data   []byte
 	offset int
@@ -123,12 +127,14 @@ type Connection struct {
 	pendingEvents  uint32
 	sends          []sendItem
 	sendHead       int
+	scratch        *sendBuffer
+	scratchQueued  bool
 	scheduled      bool
 	closing        bool
 	closed         bool
-	writeInterest  bool
 	readPaused     bool
 	flushing       bool
+	corked         bool
 	closeAfterSend bool
 	pendingBytes   atomic.Int64
 	attachment     atomic.Pointer[connectionAttachment]
@@ -184,6 +190,112 @@ func (c *Connection) closeWithError(err error) {
 	}
 }
 
+// canWriteDirectlyLocked reports whether send may hand data straight to the
+// socket instead of queueing it. Callers hold c.mu.
+func (c *Connection) canWriteDirectlyLocked() bool {
+	return c.sendHead == len(c.sends) && !c.flushing && !c.corked
+}
+
+// rewindQueueLocked restarts an emptied item queue, keeping the outbound
+// buffer because a send is about to refill it. Callers hold c.mu.
+func (c *Connection) rewindQueueLocked() {
+	if cap(c.sends) > maxWritevItems*2 {
+		c.sends = nil
+	} else {
+		c.sends = c.sends[:0]
+	}
+	c.sendHead = 0
+	c.scratchQueued = false
+}
+
+// resetQueueLocked restarts an emptied queue and returns the outbound buffer.
+// Callers hold c.mu.
+func (c *Connection) resetQueueLocked() {
+	c.rewindQueueLocked()
+	c.releaseScratchLocked()
+}
+
+// acquireScratchLocked returns the connection's outbound buffer, borrowing one
+// from the server pool if it does not hold one. Callers hold c.mu.
+func (c *Connection) acquireScratchLocked() *sendBuffer {
+	if c.scratch == nil {
+		c.scratch = c.server.sendBufferPool.Get().(*sendBuffer)
+	}
+	return c.scratch
+}
+
+// releaseScratchLocked hands the outbound buffer back once no queued item can
+// reference it. The buffers live in a server-wide pool rather than on each
+// connection: a round needs one only until its replies reach the socket, so the
+// server keeps roughly one per busy worker instead of one per connection.
+// Callers hold c.mu.
+func (c *Connection) releaseScratchLocked() {
+	if c.scratch == nil {
+		return
+	}
+	if cap(c.scratch.data) <= maxRetainedSendBuffer {
+		c.scratch.data = c.scratch.data[:0]
+		c.server.sendBufferPool.Put(c.scratch)
+	}
+	c.scratch = nil
+}
+
+// queueLocked copies the parts into the send queue. Consecutive chunks merge
+// into one reusable buffer, so a round that answers several messages leaves a
+// single item for writev and allocates nothing once the buffer has grown.
+// Callers hold c.mu.
+func (c *Connection) queueLocked(first, second []byte) {
+	if c.scratchQueued && c.sends[len(c.sends)-1].offset == 0 {
+		buffer := c.scratch
+		buffer.data = append(append(buffer.data, first...), second...)
+		// Appending may have moved the buffer. The trailing item spans all of
+		// it and nothing has been written from it yet, so re-pointing the item
+		// is enough and no in-flight write can be disturbed.
+		c.sends[len(c.sends)-1].data = buffer.data
+		return
+	}
+	if c.sendHead != len(c.sends) {
+		// Items are still queued and one of them may reference the shared
+		// buffer, so this chunk gets its own.
+		queued := make([]byte, 0, len(first)+len(second))
+		c.sends = append(c.sends, sendItem{data: append(append(queued, first...), second...)})
+		c.scratchQueued = false
+		return
+	}
+	// The queue is empty, so nothing references the shared buffer any more.
+	c.rewindQueueLocked()
+	buffer := c.acquireScratchLocked()
+	buffer.data = append(append(buffer.data[:0], first...), second...)
+	c.sends = append(c.sends, sendItem{data: buffer.data})
+	c.scratchQueued = true
+}
+
+// queueOwnedLocked queues data the caller handed over, which cannot be merged
+// into the shared buffer. Callers hold c.mu.
+func (c *Connection) queueOwnedLocked(data []byte) {
+	if c.sendHead == len(c.sends) {
+		c.rewindQueueLocked()
+	}
+	c.sends = append(c.sends, sendItem{data: data})
+	c.scratchQueued = false
+}
+
+// pauseStateChangedLocked reports whether queued output has crossed a watermark
+// so that the epoll read interest no longer matches it. It mirrors the decision
+// refreshConnection makes, so that a refresh is only requested when the event
+// loop actually has an epoll_ctl to perform. Callers hold c.mu.
+func (c *Connection) pauseStateChangedLocked() bool {
+	if c.server.writeHighWatermark <= 0 {
+		return false
+	}
+	pendingBytes := c.pendingBytes.Load()
+	pauseReads := pendingBytes >= int64(c.server.writeHighWatermark)
+	if c.readPaused && pendingBytes > int64(c.server.writeLowWatermark) {
+		pauseReads = true
+	}
+	return pauseReads != c.readPaused
+}
+
 // Send copies data before returning. It first attempts a direct nonblocking write.
 func (c *Connection) Send(data []byte) error {
 	return c.send(data, true)
@@ -204,9 +316,8 @@ func (c *Connection) send(data []byte, copyData bool) error {
 		c.mu.Unlock()
 		return syscall.EPIPE
 	}
-	queueWasEmpty := c.sendHead == len(c.sends)
 	sent := 0
-	if queueWasEmpty && !c.flushing {
+	if c.canWriteDirectlyLocked() {
 		for {
 			n, err := syscall.Write(c.FD(), data)
 			if err == syscall.EINTR {
@@ -229,16 +340,15 @@ func (c *Connection) send(data []byte, copyData bool) error {
 	}
 	queued := data[sent:]
 	if copyData {
-		queued = append([]byte(nil), queued...)
+		c.queueLocked(queued, nil)
+	} else {
+		c.queueOwnedLocked(queued)
 	}
-	if queueWasEmpty {
-		c.sends = c.sends[:0]
-		c.sendHead = 0
-	}
-	c.sends = append(c.sends, sendItem{data: queued})
-	pendingBytes := c.pendingBytes.Add(int64(len(queued)))
-	crossedHighWatermark := c.server.writeHighWatermark > 0 && !c.readPaused && pendingBytes >= int64(c.server.writeHighWatermark)
-	refresh := (queueWasEmpty || crossedHighWatermark) && !c.flushing
+	c.pendingBytes.Add(int64(len(queued)))
+	// EPOLLOUT stays armed, so queueing alone needs no epoll change; only a
+	// watermark crossing does. While corked the flush at the end of the read
+	// round settles the read interest instead.
+	refresh := !c.corked && c.pauseStateChangedLocked()
 	c.mu.Unlock()
 	if refresh {
 		c.server.request(command{kind: commandRefresh, connection: c})
@@ -258,9 +368,8 @@ func (c *Connection) SendParts(first, second []byte) error {
 		c.mu.Unlock()
 		return syscall.EPIPE
 	}
-	queueWasEmpty := c.sendHead == len(c.sends)
 	sent := 0
-	if queueWasEmpty && !c.flushing {
+	if c.canWriteDirectlyLocked() {
 		for {
 			n, err := writev2(c.FD(), first, second)
 			if err == syscall.EINTR {
@@ -281,21 +390,13 @@ func (c *Connection) SendParts(first, second []byte) error {
 			return nil
 		}
 	}
-	queued := make([]byte, total-sent)
 	if sent < len(first) {
-		n := copy(queued, first[sent:])
-		copy(queued[n:], second)
+		c.queueLocked(first[sent:], second)
 	} else {
-		copy(queued, second[sent-len(first):])
+		c.queueLocked(second[sent-len(first):], nil)
 	}
-	if queueWasEmpty {
-		c.sends = c.sends[:0]
-		c.sendHead = 0
-	}
-	c.sends = append(c.sends, sendItem{data: queued})
-	pendingBytes := c.pendingBytes.Add(int64(len(queued)))
-	crossedHighWatermark := c.server.writeHighWatermark > 0 && !c.readPaused && pendingBytes >= int64(c.server.writeHighWatermark)
-	refresh := (queueWasEmpty || crossedHighWatermark) && !c.flushing
+	c.pendingBytes.Add(int64(total - sent))
+	refresh := !c.corked && c.pauseStateChangedLocked()
 	c.mu.Unlock()
 	if refresh {
 		c.server.request(command{kind: commandRefresh, connection: c})
@@ -322,6 +423,7 @@ type Server struct {
 	releaseTaskPool           func()
 	taskWG                    sync.WaitGroup
 	readBufferPool            sync.Pool
+	sendBufferPool            sync.Pool
 	closeOnce                 sync.Once
 }
 
@@ -373,6 +475,7 @@ func Bind(config Config, handler Handler) (*Server, error) {
 	s.nextToken.Store(firstConnToken)
 	s.taskPool, s.releaseTaskPool = acquireTaskPool(config)
 	s.readBufferPool.New = func() any { return &readBuffer{data: make([]byte, config.ReadBufferSize)} }
+	s.sendBufferPool.New = func() any { return &sendBuffer{} }
 	if err = s.addFD(listenFD, listenerToken, uint32(syscall.EPOLLIN)|epollET); err == nil {
 		err = s.addFD(wakeFD, wakeToken, uint32(syscall.EPOLLIN)|epollET)
 	}
@@ -520,7 +623,11 @@ func (s *Server) acceptConnections() {
 		token := s.nextToken.Add(1) - 1
 		c := &Connection{token: token, server: s}
 		c.fd.Store(int32(fd))
-		if err := s.addFD(fd, token, baseEvents); err != nil {
+		// EPOLLOUT is registered up front and never modified again. The
+		// descriptor is edge-triggered, so an always-armed write interest only
+		// fires when the socket goes from full back to writable, which spares
+		// the loop an epoll_ctl pair per backpressured message.
+		if err := s.addFD(fd, token, allEvents); err != nil {
 			syscall.Close(fd)
 			continue
 		}
@@ -617,24 +724,21 @@ func (s *Server) drainCommands() {
 }
 func (s *Server) refreshConnection(c *Connection) {
 	c.mu.Lock()
-	hasOutput := c.sendHead != len(c.sends)
 	usable := !c.closing && !c.closed
 	pendingBytes := c.pendingBytes.Load()
 	pauseReads := s.writeHighWatermark > 0 && pendingBytes >= int64(s.writeHighWatermark)
 	if c.readPaused && pendingBytes > int64(s.writeLowWatermark) {
 		pauseReads = true
 	}
-	changed := c.writeInterest != hasOutput || c.readPaused != pauseReads
-	c.writeInterest = hasOutput
+	changed := c.readPaused != pauseReads
 	c.readPaused = pauseReads
 	c.mu.Unlock()
 	if usable && changed {
-		events := uint32(baseEvents)
+		// Write interest is permanent, so registration only tracks whether
+		// reads are paused while the peer catches up.
+		events := uint32(allEvents)
 		if pauseReads {
 			events &^= syscall.EPOLLIN
-		}
-		if hasOutput {
-			events |= syscall.EPOLLOUT
 		}
 		if err := s.modifyFD(c, events); err != nil {
 			c.closeWithError(err)
@@ -652,6 +756,8 @@ func (s *Server) closeConnection(c *Connection, closeErr error, callback bool) {
 	c.closing = true
 	c.sends = nil
 	c.sendHead = 0
+	c.scratchQueued = false
+	c.releaseScratchLocked()
 	c.pendingBytes.Store(0)
 	c.mu.Unlock()
 	fd := int(c.fd.Swap(-1))
@@ -707,7 +813,7 @@ func (c *Connection) process() {
 		// space and delivers new input never reads while output is still
 		// queued behind it. This keeps userspace buffering bounded by what the
 		// peer is willing to accept instead of what it is willing to send.
-		if alive && events&syscall.EPOLLOUT != 0 {
+		if alive && events&syscall.EPOLLOUT != 0 && c.hasQueuedOutput() {
 			closeErr = c.flushOutput()
 			alive = closeErr == nil
 		}
@@ -748,7 +854,48 @@ func (c *Connection) hasQueuedOutput() bool {
 	c.mu.Unlock()
 	return queued
 }
+
+// drainInput reads until the socket is empty, handing each chunk to the
+// handler. Replies produced along the way are corked: rather than one write
+// syscall per message they accumulate in one contiguous buffer and reach the
+// socket in a single write when the round ends.
 func (c *Connection) drainInput() error {
+	c.mu.Lock()
+	c.corked = true
+	c.mu.Unlock()
+	err := c.readLoop()
+	if flushErr := c.uncork(); err == nil {
+		err = flushErr
+	}
+	return err
+}
+
+// uncork flushes whatever the handler queued while the round was corked. The
+// cork is dropped first so a send from another goroutine racing the flush
+// writes for itself instead of waiting for a round that has already ended.
+// Uncorking an already-uncorked connection does nothing, so the caller that
+// ends the round does not re-flush a queue a mid-round flush already left
+// behind.
+func (c *Connection) uncork() error {
+	c.mu.Lock()
+	wasCorked := c.corked
+	c.corked = false
+	queued := c.sendHead != len(c.sends)
+	c.mu.Unlock()
+	if !wasCorked || !queued {
+		return nil
+	}
+	return c.flushOutput()
+}
+
+// overWriteWatermark reports whether queued output has reached the budget that
+// bounds how much the connection buffers in userspace.
+func (c *Connection) overWriteWatermark() bool {
+	return c.server.writeHighWatermark > 0 &&
+		c.pendingBytes.Load() >= int64(c.server.writeHighWatermark)
+}
+
+func (c *Connection) readLoop() error {
 	buffer := c.server.readBufferPool.Get().(*readBuffer)
 	buf := buffer.data
 	defer c.server.readBufferPool.Put(buffer)
@@ -756,9 +903,25 @@ func (c *Connection) drainInput() error {
 		n, err := syscall.Read(c.FD(), buf)
 		if n > 0 {
 			c.server.handler.OnData(c, buf[:n])
-			pauseReads := c.server.writeHighWatermark > 0 && c.pendingBytes.Load() >= int64(c.server.writeHighWatermark)
-			if pauseReads {
-				return nil
+			if c.overWriteWatermark() {
+				// The replies queued so far already fill the write budget.
+				// Hand them to the socket before reading on rather than
+				// stopping outright: stopping would leave readable bytes
+				// behind an edge that does not fire again until the peer sends
+				// more, and it is the flush, not the queue depth, that says
+				// whether the peer is actually keeping up.
+				if flushErr := c.uncork(); flushErr != nil {
+					return flushErr
+				}
+				if c.overWriteWatermark() {
+					// The peer is behind. Stop reading; the flush has already
+					// asked the loop to pause reads until the queue drains,
+					// and re-arming EPOLLIN then redelivers what is left.
+					return nil
+				}
+				c.mu.Lock()
+				c.corked = true
+				c.mu.Unlock()
 			}
 			if n < len(buf) {
 				// A short read means the socket buffer is empty, so the next
@@ -815,20 +978,18 @@ func (c *Connection) flushOutput() error {
 	for {
 		c.mu.Lock()
 		if c.sendHead == len(c.sends) {
-			if cap(c.sends) > maxWritevItems*2 {
-				c.sends = nil
-			} else {
-				c.sends = c.sends[:0]
-			}
-			c.sendHead = 0
+			c.resetQueueLocked()
 			c.flushing = false
 			closeAfterSend := c.closeAfterSend
+			refresh := c.pauseStateChangedLocked()
 			c.mu.Unlock()
 			if closeAfterSend {
 				c.closeWithError(nil)
 				return nil
 			}
-			c.server.request(command{kind: commandRefresh, connection: c})
+			if refresh {
+				c.server.request(command{kind: commandRefresh, connection: c})
+			}
 			return nil
 		}
 		var n int
@@ -873,8 +1034,11 @@ func (c *Connection) flushOutput() error {
 				// A short write means the socket send buffer is full, so
 				// retrying now would only earn an EAGAIN. Wait for EPOLLOUT.
 				c.flushing = false
+				refresh := c.pauseStateChangedLocked()
 				c.mu.Unlock()
-				c.server.request(command{kind: commandRefresh, connection: c})
+				if refresh {
+					c.server.request(command{kind: commandRefresh, connection: c})
+				}
 				return nil
 			}
 			c.mu.Unlock()
@@ -885,9 +1049,12 @@ func (c *Connection) flushOutput() error {
 			continue
 		}
 		c.flushing = false
+		refresh := c.pauseStateChangedLocked()
 		c.mu.Unlock()
 		if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
-			c.server.request(command{kind: commandRefresh, connection: c})
+			if refresh {
+				c.server.request(command{kind: commandRefresh, connection: c})
+			}
 			return nil
 		}
 		return err
