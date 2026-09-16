@@ -21,6 +21,10 @@ func TestHandshakeParserFragmentedWithRemainder(t *testing.T) {
 	if request.Method != "GET" || request.Host != "example.test" || request.URL.RequestURI() != "/chat?id=1" {
 		t.Fatalf("unexpected request: %#v", request)
 	}
+	if request.Header.Get("Sec-WebSocket-Key") != "MDEyMzQ1Njc4OWFiY2RlZg==" ||
+		request.Header.Get("Sec-WebSocket-Version") != "13" {
+		t.Fatalf("websocket headers were not canonicalized: %#v", request.Header)
+	}
 	if got := parser.TakeBuffered(); len(got) != 2 || got[0] != 0x81 || got[1] != 0x80 {
 		t.Fatalf("remainder = %x", got)
 	}
