@@ -21,6 +21,23 @@ type handshakeParser struct {
 }
 
 func (p *handshakeParser) Feed(data []byte) (*stdhttp.Request, bool, error) {
+	// The common case is a complete handshake in one socket read. Parse it
+	// directly from the caller's buffer; all request fields copied below remain
+	// valid after OnData returns. Only fragmented handshakes need buffering.
+	if len(p.buffer) == 0 {
+		if at := bytes.Index(data, []byte("\r\n\r\n")); at >= 0 {
+			headerEnd := at + 4
+			if headerEnd > p.maxHeaderBytes {
+				return nil, false, errHandshakeHeaderTooLarge
+			}
+			request, err := parseHandshakeRequest(data[:headerEnd])
+			if err != nil {
+				return nil, false, err
+			}
+			p.buffer = data[headerEnd:]
+			return request, true, nil
+		}
+	}
 	p.buffer = append(p.buffer, data...)
 	at := bytes.Index(p.buffer[p.headerScan:], []byte("\r\n\r\n"))
 	if at < 0 {
@@ -53,6 +70,11 @@ func (p *handshakeParser) TakeBuffered() []byte {
 	return data
 }
 
+func (p *handshakeParser) Reset() {
+	p.buffer = nil
+	p.headerScan = 0
+}
+
 func parseHandshakeRequest(data []byte) (*stdhttp.Request, error) {
 	lineEnd := bytes.Index(data, []byte("\r\n"))
 	if lineEnd <= 0 {
@@ -70,8 +92,8 @@ func parseHandshakeRequest(data []byte) (*stdhttp.Request, error) {
 	if !validToken(method) || proto != "HTTP/1.1" {
 		return nil, errMalformedHandshake
 	}
-	parsedURL, err := url.ParseRequestURI(requestURI)
-	if err != nil {
+	parsed := new(handshakeRequest)
+	if err := parseRequestURI(&parsed.url, requestURI); err != nil {
 		return nil, errMalformedHandshake
 	}
 
@@ -110,9 +132,9 @@ func parseHandshakeRequest(data []byte) (*stdhttp.Request, error) {
 	if host == "" || header.Get("Content-Length") != "" || header.Get("Transfer-Encoding") != "" {
 		return nil, errMalformedHandshake
 	}
-	return &stdhttp.Request{
+	parsed.request = stdhttp.Request{
 		Method:        method,
-		URL:           parsedURL,
+		URL:           &parsed.url,
 		Proto:         proto,
 		ProtoMajor:    1,
 		ProtoMinor:    1,
@@ -121,7 +143,27 @@ func parseHandshakeRequest(data []byte) (*stdhttp.Request, error) {
 		Host:          host,
 		RequestURI:    requestURI,
 		ContentLength: 0,
-	}, nil
+	}
+	return &parsed.request, nil
+}
+
+type handshakeRequest struct {
+	request stdhttp.Request
+	url     url.URL
+}
+
+func parseRequestURI(dst *url.URL, requestURI string) error {
+	if strings.HasPrefix(requestURI, "/") && strings.IndexAny(requestURI, "%#\r\n\t ") < 0 {
+		path, query, _ := strings.Cut(requestURI, "?")
+		dst.Path = path
+		dst.RawQuery = query
+		return nil
+	}
+	parsed, err := url.ParseRequestURI(requestURI)
+	if err == nil {
+		*dst = *parsed
+	}
+	return err
 }
 
 func handshakeHeaderName(name []byte) string {
@@ -132,6 +174,7 @@ func handshakeHeaderName(name []byte) string {
 		"Sec-Websocket-Version",
 		"Sec-Websocket-Key",
 		"Sec-Websocket-Protocol",
+		"Sec-Websocket-Extensions",
 		"Origin",
 		"Cookie",
 		"Authorization",

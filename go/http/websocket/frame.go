@@ -43,11 +43,15 @@ type Event struct {
 	Payload []byte
 }
 
+type fragmentedMessage struct {
+	opcode Opcode
+	data   []byte
+}
+
 type Parser struct {
 	maxMessageBytes int64
 	buffer          []byte
-	fragmentOpcode  Opcode
-	fragment        []byte
+	fragment        *fragmentedMessage
 	pendingConsume  int
 	borrowedBuffer  bool
 }
@@ -65,11 +69,13 @@ func (p *Parser) Reset() {
 	} else {
 		p.buffer = p.buffer[:0]
 	}
-	p.fragmentOpcode = 0
-	if cap(p.fragment) > maxRetainedFrameBuffer {
-		p.fragment = nil
-	} else {
-		p.fragment = p.fragment[:0]
+	if p.fragment != nil {
+		p.fragment.opcode = 0
+		if cap(p.fragment.data) > maxRetainedFrameBuffer {
+			p.fragment = nil
+		} else {
+			p.fragment.data = p.fragment.data[:0]
+		}
 	}
 	p.pendingConsume = 0
 	p.borrowedBuffer = false
@@ -128,7 +134,6 @@ func (p *Parser) feedOne(data []byte, borrowPayload bool) (Event, bool, error) {
 			p.buffer = nil
 			p.borrowedBuffer = false
 			p.fragment = nil
-			p.fragmentOpcode = 0
 			return Event{}, false, err
 		}
 		if !complete {
@@ -160,11 +165,11 @@ func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 	}
 	switch opcode {
 	case Continuation:
-		if p.fragmentOpcode == 0 {
+		if p.fragment == nil {
 			return Event{}, false, false, ErrProtocol
 		}
 	case Text, Binary:
-		if p.fragmentOpcode != 0 {
+		if p.fragment != nil {
 			return Event{}, false, false, ErrProtocol
 		}
 	case Close, Ping, Pong:
@@ -196,7 +201,10 @@ func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 	if control && payloadLen > 125 {
 		return Event{}, false, false, ErrProtocol
 	}
-	current := int64(len(p.fragment))
+	current := int64(0)
+	if p.fragment != nil {
+		current = int64(len(p.fragment.data))
+	}
 	if !control && (payloadLen > uint64(p.maxMessageBytes) || current > p.maxMessageBytes-int64(payloadLen)) {
 		return Event{}, false, false, ErrMessageTooBig
 	}
@@ -238,21 +246,19 @@ func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 			p.finishFrame(frameEnd, borrowPayload)
 			return Event{Opcode: opcode, Payload: payload}, true, true, nil
 		}
-		p.fragmentOpcode = opcode
-		p.fragment = append(p.fragment[:0], payload...)
+		p.fragment = &fragmentedMessage{opcode: opcode, data: append([]byte(nil), payload...)}
 		p.consume(frameEnd)
 		return Event{}, false, true, nil
 	}
-	p.fragment = append(p.fragment, payload...)
+	p.fragment.data = append(p.fragment.data, payload...)
 	p.consume(frameEnd)
 	if !fin {
 		return Event{}, false, true, nil
 	}
-	event := Event{Opcode: p.fragmentOpcode, Payload: p.fragment}
+	event := Event{Opcode: p.fragment.opcode, Payload: p.fragment.data}
 	if event.Opcode == Text && !utf8.Valid(event.Payload) {
 		return Event{}, false, false, ErrInvalidPayload
 	}
-	p.fragmentOpcode = 0
 	p.fragment = nil
 	return event, true, true, nil
 }
