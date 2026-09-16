@@ -649,9 +649,20 @@ func (c *Connection) process() {
 			panic(recovered)
 		}
 	}()
+	// deferred carries readiness that this round observed but did not act on
+	// because output was still queued. It is folded back into pendingEvents
+	// before the next round so the notification is never lost: epoll is
+	// edge-triggered, so a dropped EPOLLIN would only reappear once the peer
+	// sent more data, leaving readable bytes stranded on a connection that
+	// looks idle.
+	var deferred uint32
 	for {
 		c.mu.Lock()
-		if c.pendingEvents == 0 {
+		c.pendingEvents |= deferred
+		if c.pendingEvents == deferred {
+			// Only the deferred readiness remains. Stop here instead of spinning:
+			// the next EPOLLOUT resubmits the connection, flushOutput runs first,
+			// and drainInput follows once the queue is empty.
 			c.scheduled = false
 			c.mu.Unlock()
 			return
@@ -660,24 +671,37 @@ func (c *Connection) process() {
 		c.pendingEvents = 0
 		closed := c.closed || c.closing
 		c.mu.Unlock()
+		deferred = 0
 		alive := !closed
 		var closeErr error
+		// Flush before reading so that a round which both frees socket send
+		// space and delivers new input never reads while output is still
+		// queued behind it. This keeps userspace buffering bounded by what the
+		// peer is willing to accept instead of what it is willing to send.
+		if alive && events&syscall.EPOLLOUT != 0 {
+			closeErr = c.flushOutput()
+			alive = closeErr == nil
+		}
 		if alive && events&syscall.EPOLLPRI != 0 {
 			closeErr = c.drainPriorityInput()
 			alive = closeErr == nil
 		}
 		if alive && events&syscall.EPOLLIN != 0 {
-			closeErr = c.drainInput()
-			alive = closeErr == nil
-		}
-		if alive && events&syscall.EPOLLOUT != 0 {
-			closeErr = c.flushOutput()
-			alive = closeErr == nil
+			if c.hasQueuedOutput() {
+				// Queued output means EPOLLOUT interest is registered or a flush
+				// requested it, so a later round is guaranteed. Carry the read,
+				// and any half-close that arrived with it, into that round so
+				// the peer's final bytes are still delivered after the flush.
+				deferred = syscall.EPOLLIN | events&syscall.EPOLLRDHUP
+			} else {
+				closeErr = c.drainInput()
+				alive = closeErr == nil
+			}
 		}
 		if alive && events&syscall.EPOLLERR != 0 {
 			closeErr = c.socketError()
 			alive = false
-		} else if alive && events&(syscall.EPOLLHUP|syscall.EPOLLRDHUP) != 0 {
+		} else if alive && events&(syscall.EPOLLHUP|syscall.EPOLLRDHUP)&^deferred != 0 {
 			closeErr = io.EOF
 			alive = false
 		}
@@ -685,6 +709,15 @@ func (c *Connection) process() {
 			c.closeWithError(closeErr)
 		}
 	}
+}
+
+// hasQueuedOutput reports whether bytes accepted by Send are still waiting for
+// the socket. Reads are deferred while it is true.
+func (c *Connection) hasQueuedOutput() bool {
+	c.mu.Lock()
+	queued := c.sendHead != len(c.sends)
+	c.mu.Unlock()
+	return queued
 }
 func (c *Connection) drainInput() error {
 	buffer := c.server.readBufferPool.Get().(*readBuffer)

@@ -17,3 +17,14 @@ epoll_connection_send当前都是把数据放到connection的发送队列、加�
 2. flush_output既支持可配置、是否使用writev提高性能
 3. flush_output中单次write/writev之前，从待发送队列中取数据时加锁的粒度要小，可以用一个新的item记录所有取出来并且发送完成的链表，用于flush_output函数退出前清理
 4. flush_output直到没有待发送数据时，先清空发送队列、再解锁，以此来保证epoll_connection_send、flush_output之间的并发一致性、避免漏掉添加可写事件导致数据不能及时发送
+
+
+### 003
+
+优化Connection读写事件处理，优化为更好的背压机制,Connection执行RunTask/process时，依次执行：
+1. flushOutput
+2. drainPriorityInput
+3. drainInput：执行drainInput前先判断Connection当前是否仍有待发送数据，如果有、则不执行drainInput，如果没有则执行drainInput。
+4. socketError
+5. 1-4都执行完毕后，如果本轮已经执行了flushOutput、但仍然有待发送数据等待发送，并且有可读事件但是没有执行drainInput进行数据读取，则重新设置pendingEvents的可读状态，确保下一次可写事件到来并flushOutput清空剩余待发送数据后可以进行正常数据读取、避免有数据却不能读取成为僵尸连接
+

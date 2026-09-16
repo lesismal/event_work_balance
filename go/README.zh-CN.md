@@ -8,6 +8,7 @@
   worker 固定绑定。
 - 每个 connection 有 FIFO 事件队列；同一 connection 串行执行，不同 connection 动态负载均衡。
 - ET 读写均排空到 `EAGAIN`；仅发送队列非空时关注 `EPOLLOUT`。
+- 每轮事件处理先 flush 发送队列，再读 OOB，再读普通数据；发送队列仍有数据时跳过读取，并把可读状态保留到下一轮，待可写事件清空队列后再读，既限制用户态缓冲又不会漏读。
 - 读 buffer 由 Server 级 `sync.Pool` 复用，大小通过 `Config.ReadBufferSize`
   设置，默认 16 KiB。
 - `DefaultConfig` 根据 `runtime.GOMAXPROCS(0)` 计算池容量：`WorkerCount`
