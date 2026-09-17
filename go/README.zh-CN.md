@@ -11,12 +11,24 @@
 - 每轮事件处理先 flush 发送队列，再读 OOB，再读普通数据；发送队列仍有数据时跳过读取，并把可读状态保留到下一轮，待可写事件清空队列后再读，既限制用户态缓冲又不会漏读。
 - 读 buffer 由 Server 级 `sync.Pool` 复用，大小通过 `Config.ReadBufferSize`
   设置，默认 16 KiB。
-- `DefaultConfig` 根据 `runtime.GOMAXPROCS(0)` 计算池容量：`WorkerCount`
-  默认等于可运行的 Go 线程数；`MaxEvents` 默认为其 64 倍，并限制在
-  1024～16384。
-- `Config.TaskPoolMode` 可选择 `taskpool.ModeCond`（默认，基于 `sync.Cond`
-  的有界环形队列）、`taskpool.ModeFixed`（channel worker）或
-  `taskpool.ModeElastic`（nbio 风格的弹性 fork/dispatcher）。
+- `Config.TaskPoolMode` 可选 `taskpool.ModeCond`（基于 `sync.Cond` 的有界环形
+  队列，按 worker 数分片）或 `taskpool.ModeElastic`（nbio 风格的弹性
+  fork/dispatcher，Linux 后端默认）。
+- 池容量按 Mode 分别给默认值，因为 `WorkerCount` 在两个 Mode 下含义不同：
+  ModeCond 会预先创建这么多协程并让它们挂在条件变量上，这个数就是实际存在的
+  协程数量，多了只是让调度器在同样的核上搬运更多协程；ModeElastic 则是按需
+  fork、空闲短暂驻留后回收，这个数是上限而不是实际数量，调高在负载没到之前
+  不产生开销。`DefaultPoolSizing(mode)` 返回对应 Mode 的默认值。
+- `SetTaskPoolMode(mode)` 切换 Mode 时会同时把 `WorkerCount`、`MaxEvents`
+  换成该 Mode 的默认值；`SetPoolSizing(workerCount, maxEvents)` 固定为自己的
+  取值，之后再调 `SetTaskPoolMode` 也不会被覆盖，两者调用顺序无关。传 0 表示
+  该项保持不变：
+
+  ```go
+  config := epoll.DefaultConfig()
+  config.SetTaskPoolMode(taskpool.ModeCond)  // 容量随之切到 cond 的默认值
+  config.SetPoolSizing(500, 10000)           // 固定成自己的取值
+  ```
 - `SharedTaskPool` 默认开启；同一进程内配置相同的多个 Server 共享 worker
   和任务队列，避免多监听端口重复创建大量 goroutine 与队列。需要完全隔离时
   可显式设为 `false`。

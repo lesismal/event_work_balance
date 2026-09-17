@@ -105,8 +105,11 @@ type Config struct {
 	// every connection while the budget is exhausted. Zero means unlimited.
 	MaxPendingBytes int64
 	UseWritev       bool
-	TaskPoolMode    taskpool.Mode
-	SharedTaskPool  bool
+	// TaskPoolMode picks the scheduler the workers run under. Prefer
+	// SetTaskPoolMode over assigning it, so that WorkerCount and MaxEvents
+	// follow the mode rather than staying at numbers tuned for the other one.
+	TaskPoolMode   taskpool.Mode
+	SharedTaskPool bool
 	// InlineHandlers runs a ready connection's round on the event loop instead
 	// of handing it to a worker.
 	//
@@ -124,12 +127,15 @@ type Config struct {
 	// I/O, take contended locks, or run unbounded work want the worker pool,
 	// which exists precisely so that one slow connection cannot stall the rest.
 	InlineHandlers bool
+	// customPoolSizing records that SetPoolSizing pinned the sizing, so that a
+	// later SetTaskPoolMode does not overwrite it.
+	customPoolSizing bool
 }
 
 func DefaultConfig() Config {
-	workerCount, maxEvents := defaultPoolSizing()
-	return Config{Network: "tcp", Addr: ":9000", Backlog: defaultBacklog(), WorkerCount: workerCount,
-		MaxEvents: maxEvents, ReadBufferSize: 16 * 1024,
+	sizing := DefaultPoolSizing(taskpool.ModeElastic)
+	return Config{Network: "tcp", Addr: ":9000", Backlog: defaultBacklog(), WorkerCount: sizing.WorkerCount,
+		MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024,
 		WriteBufferHighWatermark: defaultWriteHighWatermark, MaxPendingBytes: defaultMaxPendingBytes,
 		UseWritev: true, TaskPoolMode: taskpool.ModeElastic, SharedTaskPool: true}
 }

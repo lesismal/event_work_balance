@@ -10,15 +10,17 @@ import (
 type Mode uint8
 
 const (
+	// ModeCond runs a fixed set of workers that park on a condition variable
+	// between tasks. The worker count is the number of goroutines that exist.
 	ModeCond Mode = iota
-	ModeFixed
+	// ModeElastic forks a worker per submission while it has capacity, lets
+	// idle ones linger briefly, and retires them after that. The worker count
+	// is a ceiling rather than a population.
 	ModeElastic
 )
 
 func (m Mode) String() string {
 	switch m {
-	case ModeFixed:
-		return "fixed"
 	case ModeElastic:
 		return "elastic"
 	case ModeCond:
@@ -28,7 +30,7 @@ func (m Mode) String() string {
 	}
 }
 
-func (m Mode) Valid() bool { return m == ModeFixed || m == ModeElastic || m == ModeCond }
+func (m Mode) Valid() bool { return m == ModeElastic || m == ModeCond }
 
 type Task interface{ RunTask() }
 
@@ -86,8 +88,6 @@ func NewWithMode(mode Mode, maxConcurrent, queueSize int) *TaskPool {
 	executor := &executor{}
 	pool := &TaskPool{executor: executor}
 	switch mode {
-	case ModeFixed:
-		pool.backend = newFixedPool(executor, maxConcurrent, queueSize)
 	case ModeElastic:
 		pool.backend = newElasticPool(executor, maxConcurrent, queueSize)
 	case ModeCond:

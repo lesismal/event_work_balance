@@ -7,7 +7,7 @@ type benchmarkTask struct{ done chan struct{} }
 func (t *benchmarkTask) RunTask() { t.done <- struct{}{} }
 
 func BenchmarkGoTask(b *testing.B) {
-	for _, mode := range []Mode{ModeFixed, ModeElastic, ModeCond} {
+	for _, mode := range []Mode{ModeElastic, ModeCond} {
 		b.Run(mode.String(), func(b *testing.B) {
 			tp := NewWithMode(mode, 1, 1)
 			defer tp.Stop()

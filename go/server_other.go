@@ -29,13 +29,19 @@ type Config struct {
 	ReadBufferSize                  int
 	WriteBufferHighWatermark        int
 	UseWritev                       bool
-	TaskPoolMode                    taskpool.Mode
-	SharedTaskPool                  bool
+	// TaskPoolMode picks the scheduler the workers run under. Prefer
+	// SetTaskPoolMode over assigning it, so that WorkerCount and MaxEvents
+	// follow the mode rather than staying at numbers tuned for the other one.
+	TaskPoolMode   taskpool.Mode
+	SharedTaskPool bool
+	// customPoolSizing records that SetPoolSizing pinned the sizing, so that a
+	// later SetTaskPoolMode does not overwrite it.
+	customPoolSizing bool
 }
 
 func DefaultConfig() Config {
-	workerCount, maxEvents := defaultPoolSizing()
-	return Config{Network: "tcp", Addr: ":9000", Backlog: 128, WorkerCount: workerCount, MaxEvents: maxEvents, ReadBufferSize: 16 * 1024, WriteBufferHighWatermark: 4 * 1024, UseWritev: true, TaskPoolMode: taskpool.ModeCond, SharedTaskPool: true}
+	sizing := DefaultPoolSizing(taskpool.ModeCond)
+	return Config{Network: "tcp", Addr: ":9000", Backlog: 128, WorkerCount: sizing.WorkerCount, MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024, WriteBufferHighWatermark: 4 * 1024, UseWritev: true, TaskPoolMode: taskpool.ModeCond, SharedTaskPool: true}
 }
 
 type Handler interface {

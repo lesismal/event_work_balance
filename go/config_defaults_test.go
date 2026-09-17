@@ -11,16 +11,16 @@ import (
 
 func TestDefaultConfigPoolSizing(t *testing.T) {
 	config := DefaultConfig()
-	// The exact sizing is defaultPoolSizing's business and is tuned by
+	// The exact sizing is DefaultPoolSizing's business and is tuned by
 	// measurement; restating its arithmetic here would only pin the test to
 	// whatever the constants happen to be. What DefaultConfig owes is that it
 	// reports that sizing rather than one of its own.
-	wantWorkers, wantEvents := defaultPoolSizing()
-	if config.WorkerCount != wantWorkers {
-		t.Fatalf("WorkerCount = %d, want %d", config.WorkerCount, wantWorkers)
+	want := DefaultPoolSizing(config.TaskPoolMode)
+	if config.WorkerCount != want.WorkerCount {
+		t.Fatalf("WorkerCount = %d, want %d", config.WorkerCount, want.WorkerCount)
 	}
-	if config.MaxEvents != wantEvents {
-		t.Fatalf("MaxEvents = %d, want %d", config.MaxEvents, wantEvents)
+	if config.MaxEvents != want.MaxEvents {
+		t.Fatalf("MaxEvents = %d, want %d", config.MaxEvents, want.MaxEvents)
 	}
 	// Workers are deliberately oversubscribed relative to cores: each one runs
 	// its connection's syscalls inline, so a pool the size of GOMAXPROCS leaves
@@ -54,5 +54,89 @@ func TestDefaultConfigPoolSizing(t *testing.T) {
 	}
 	if !config.SharedTaskPool {
 		t.Fatal("SharedTaskPool = false, want shared workers by default")
+	}
+}
+
+// A worker count means a population of goroutines under one mode and a ceiling
+// under the other, so the modes cannot share one default.
+func TestDefaultPoolSizingDiffersByMode(t *testing.T) {
+	cond := DefaultPoolSizing(taskpool.ModeCond)
+	elastic := DefaultPoolSizing(taskpool.ModeElastic)
+	if cond.WorkerCount <= runtime.GOMAXPROCS(0) {
+		t.Fatalf("cond WorkerCount = %d, want more than GOMAXPROCS %d", cond.WorkerCount, runtime.GOMAXPROCS(0))
+	}
+	// Elastic only forks what the load asks for, so its ceiling is set far
+	// above the population cond pays for up front.
+	if elastic.WorkerCount <= cond.WorkerCount {
+		t.Fatalf("elastic WorkerCount = %d, want more than cond's %d", elastic.WorkerCount, cond.WorkerCount)
+	}
+	for _, sizing := range []PoolSizing{cond, elastic} {
+		if sizing.MaxEvents < minMaxEvents || sizing.MaxEvents > maxMaxEvents {
+			t.Fatalf("MaxEvents = %d, want within [%d, %d]", sizing.MaxEvents, minMaxEvents, maxMaxEvents)
+		}
+	}
+}
+
+// Switching the mode has to carry the sizing with it, or a config keeps numbers
+// tuned for the mode it no longer runs.
+func TestSetTaskPoolModeMovesSizing(t *testing.T) {
+	config := DefaultConfig()
+	config.SetTaskPoolMode(taskpool.ModeCond)
+	want := DefaultPoolSizing(taskpool.ModeCond)
+	if config.TaskPoolMode != taskpool.ModeCond {
+		t.Fatalf("TaskPoolMode = %v, want cond", config.TaskPoolMode)
+	}
+	if config.WorkerCount != want.WorkerCount || config.MaxEvents != want.MaxEvents {
+		t.Fatalf("sizing = %d/%d, want cond's %d/%d",
+			config.WorkerCount, config.MaxEvents, want.WorkerCount, want.MaxEvents)
+	}
+
+	config.SetTaskPoolMode(taskpool.ModeElastic)
+	want = DefaultPoolSizing(taskpool.ModeElastic)
+	if config.WorkerCount != want.WorkerCount || config.MaxEvents != want.MaxEvents {
+		t.Fatalf("sizing = %d/%d, want elastic's %d/%d",
+			config.WorkerCount, config.MaxEvents, want.WorkerCount, want.MaxEvents)
+	}
+}
+
+// Sizing the caller chose is theirs to keep, whichever order the two setters
+// are called in.
+func TestSetPoolSizingSurvivesModeSwitch(t *testing.T) {
+	const workers, events = 512, 4096
+	for _, order := range []string{"sizing first", "mode first"} {
+		t.Run(order, func(t *testing.T) {
+			config := DefaultConfig()
+			if order == "sizing first" {
+				config.SetPoolSizing(workers, events)
+				config.SetTaskPoolMode(taskpool.ModeCond)
+			} else {
+				config.SetTaskPoolMode(taskpool.ModeCond)
+				config.SetPoolSizing(workers, events)
+			}
+			if config.WorkerCount != workers || config.MaxEvents != events {
+				t.Fatalf("sizing = %d/%d, want the pinned %d/%d",
+					config.WorkerCount, config.MaxEvents, workers, events)
+			}
+			// And it still holds across a further switch.
+			config.SetTaskPoolMode(taskpool.ModeElastic)
+			if config.WorkerCount != workers || config.MaxEvents != events {
+				t.Fatalf("after switching modes sizing = %d/%d, want the pinned %d/%d",
+					config.WorkerCount, config.MaxEvents, workers, events)
+			}
+		})
+	}
+}
+
+// A field left at zero means "leave it", so that one of the two can be tuned
+// without having to restate the other.
+func TestSetPoolSizingKeepsFieldsLeftUnset(t *testing.T) {
+	config := DefaultConfig()
+	events := config.MaxEvents
+	config.SetPoolSizing(64, 0)
+	if config.WorkerCount != 64 {
+		t.Fatalf("WorkerCount = %d, want 64", config.WorkerCount)
+	}
+	if config.MaxEvents != events {
+		t.Fatalf("MaxEvents = %d, want it left at %d", config.MaxEvents, events)
 	}
 }
