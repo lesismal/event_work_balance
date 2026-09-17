@@ -10,6 +10,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -79,7 +82,7 @@ type Config struct {
 
 func DefaultConfig() Config {
 	workerCount, maxEvents := defaultPoolSizing()
-	return Config{BindAddress: "0.0.0.0", Port: 9000, Backlog: 128, WorkerCount: workerCount,
+	return Config{BindAddress: "0.0.0.0", Port: 9000, Backlog: defaultBacklog(), WorkerCount: workerCount,
 		MaxEvents: maxEvents, ReadBufferSize: 16 * 1024,
 		WriteBufferHighWatermark: defaultWriteHighWatermark, MaxPendingBytes: defaultMaxPendingBytes,
 		UseWritev: true, TaskPoolMode: taskpool.ModeElastic, SharedTaskPool: true}
@@ -547,7 +550,7 @@ func Bind(config Config, handler Handler) (*Server, error) {
 		config.WriteBufferHighWatermark = 4 * 1024
 	}
 	if config.Backlog <= 0 {
-		config.Backlog = 128
+		config.Backlog = defaultBacklog()
 	}
 	if config.BindAddress == "" {
 		config.BindAddress = "0.0.0.0"
@@ -830,6 +833,16 @@ func (s *Server) noteEvent(token uint64, events uint32) *Connection {
 	}
 	events &= allEvents
 	if events == 0 {
+		c.mu.Unlock()
+		return nil
+	}
+	if events == uint32(syscall.EPOLLOUT) && c.sendHead == len(c.sends) {
+		// Write interest is armed for the connection's whole life, so the
+		// socket reports itself writable the moment it is registered and again
+		// every time it drains. With nothing queued there is nothing for a
+		// worker to do, and the edge that does matter, the one after a write
+		// stops short, always arrives later. Skipping the wake-up keeps an
+		// accept burst from scheduling every new connection a second time.
 		c.mu.Unlock()
 		return nil
 	}
@@ -1251,6 +1264,37 @@ func (c *Connection) socketError() error {
 		return syscall.Errno(errno)
 	}
 	return syscall.ECONNRESET
+}
+
+var (
+	backlogOnce  sync.Once
+	backlogValue int
+)
+
+// defaultBacklog reports the accept queue depth the kernel is willing to
+// honour, which is what net.Listen asks for and therefore what every framework
+// built on it gets. The historical SOMAXCONN of 128 is far below a connection
+// burst: an overflowing accept queue makes the kernel drop the client's ACK
+// rather than refuse it, so the client learns nothing until its SYN-ACK
+// retransmission timer fires a second later.
+func defaultBacklog() int {
+	backlogOnce.Do(func() {
+		backlogValue = syscall.SOMAXCONN
+		data, err := os.ReadFile("/proc/sys/net/core/somaxconn")
+		if err != nil {
+			return
+		}
+		limit, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err != nil || limit <= 0 {
+			return
+		}
+		// Above this the value no longer fits the kernel's backlog field.
+		if limit > 1<<16-1 {
+			limit = 1<<16 - 1
+		}
+		backlogValue = limit
+	})
+	return backlogValue
 }
 
 func createListener(config Config) (int, error) {

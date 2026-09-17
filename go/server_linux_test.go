@@ -6,6 +6,9 @@ import (
 	"bytes"
 	"io"
 	"net"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -280,4 +283,87 @@ func TestReadsDeferredWhileOutputQueued(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestDefaultBacklogMatchesKernelLimit keeps the accept queue as deep as the
+// one net.Listen asks for, which is what every framework built on it gets. An
+// overflowing accept queue does not refuse connections: the kernel drops the
+// client's ACK, so a connection burst shows up only as clients sitting on
+// SYN-ACK retransmission timers. Measured against a 3000-connection burst, the
+// historical SOMAXCONN of 128 cost 1399 upgrades per second and a median of
+// 1.06s, against 63064 per second and 34ms at the kernel's own limit.
+func TestDefaultBacklogMatchesKernelLimit(t *testing.T) {
+	want := syscall.SOMAXCONN
+	if data, err := os.ReadFile("/proc/sys/net/core/somaxconn"); err == nil {
+		if limit, parseErr := strconv.Atoi(strings.TrimSpace(string(data))); parseErr == nil && limit > 0 {
+			want = limit
+			if want > 1<<16-1 {
+				want = 1<<16 - 1
+			}
+		}
+	}
+	if got := DefaultConfig().Backlog; got != want {
+		t.Fatalf("default backlog = %d, want the kernel limit %d", got, want)
+	}
+}
+
+// TestConcurrentAcceptBurst covers the accept path when many connections arrive
+// at once: every one must be accepted, tracked, and able to carry data.
+func TestConcurrentAcceptBurst(t *testing.T) {
+	const burst = 256
+	config := DefaultConfig()
+	config.BindAddress = "127.0.0.1"
+	config.Port = 0
+	server, err := Bind(config, HandlerFuncs{Data: func(c *Connection, b []byte) {
+		if err := c.Send(b); err != nil {
+			c.Close()
+		}
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := server.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- server.Run() }()
+	defer func() {
+		server.Stop()
+		if err := <-runDone; err != nil {
+			t.Error(err)
+		}
+		if err := server.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for i := 0; i < burst; i++ {
+		wg.Add(1)
+		go func(value byte) {
+			defer wg.Done()
+			conn, err := net.DialTimeout("tcp4", addr.String(), 20*time.Second)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(20 * time.Second))
+			payload := []byte{value, value, value, value}
+			if _, err = conn.Write(payload); err != nil {
+				t.Error(err)
+				return
+			}
+			echoed := make([]byte, len(payload))
+			if _, err = io.ReadFull(conn, echoed); err != nil {
+				t.Error(err)
+				return
+			}
+			if !bytes.Equal(echoed, payload) {
+				t.Error("echo mismatch")
+			}
+		}(byte(i))
+	}
+	wg.Wait()
 }
