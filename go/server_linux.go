@@ -22,11 +22,17 @@ import (
 )
 
 const (
-	listenerToken = uint64(0)
-	wakeToken     = uint64(1)
+	// A token's low half is always a descriptor and its high half says what
+	// that descriptor is: one of the server's listeners, the wake-up eventfd,
+	// or a connection. For a connection the high half doubles as a generation,
+	// so an event left over from a descriptor's previous owner resolves to
+	// nothing. Tagging rather than reserving whole token values is what lets a
+	// server carry any number of listeners.
+	listenerKind = uint64(0)
+	wakeKind     = uint64(1)
 	// firstGeneration seeds the generation half of a connection token. Starting
-	// above the reserved listener and wake tokens keeps every connection token
-	// distinct from them whatever descriptor it lands on.
+	// above the reserved kinds keeps every connection token distinct from a
+	// listener or wake token whatever descriptor it lands on.
 	firstGeneration = uint64(2)
 	maxWritevItems  = 64
 	// maxWaitBatch caps the epoll_wait output buffer. MaxEvents keeps sizing
@@ -61,8 +67,13 @@ const (
 
 // Config controls listener and worker-pool sizing.
 type Config struct {
-	BindAddress    string
-	Port           uint16
+	BindAddress string
+	Port        uint16
+	// Ports, when it is not empty, is the complete set of ports to listen on
+	// and Port is ignored. One server spanning several ports shares a single
+	// event loop, descriptor table, task pool and buffer pool across all of
+	// them, where a server per port gives each its own copy of all four.
+	Ports          []uint16
 	Backlog        int
 	WorkerCount    int
 	MaxEvents      int
@@ -516,23 +527,24 @@ func (c *Connection) SendParts(first, second []byte) error {
 
 // Server owns the listener, epoll descriptor, command queue, and worker pool.
 type Server struct {
-	epollFD, listenFD, wakeFD int
-	maxEvents                 int
-	useWritev                 bool
-	inlineHandlers            bool
-	writeHighWatermark        int
-	writeLowWatermark         int
-	maxPendingBytes           int64
-	budgetResumeBytes         int64
-	retainedSendBuffer        int
-	handler                   Handler
-	stopping                  atomic.Bool
-	nextGeneration            atomic.Uint64
-	pendingTotal              atomic.Int64
-	commandMu                 sync.Mutex
-	commands                  *commandBatch
-	commandPool               sync.Pool
-	wakePending               atomic.Bool
+	epollFD, wakeFD    int
+	listenFDs          []int
+	maxEvents          int
+	useWritev          bool
+	inlineHandlers     bool
+	writeHighWatermark int
+	writeLowWatermark  int
+	maxPendingBytes    int64
+	budgetResumeBytes  int64
+	retainedSendBuffer int
+	handler            Handler
+	stopping           atomic.Bool
+	nextGeneration     atomic.Uint64
+	pendingTotal       atomic.Int64
+	commandMu          sync.Mutex
+	commands           *commandBatch
+	commandPool        sync.Pool
+	wakePending        atomic.Bool
 	// connections is a paged table indexed by file descriptor: a descriptor is
 	// a small dense integer the kernel already allocates, so the lookup on
 	// every epoll event is two bounds checks rather than a hash.
@@ -559,6 +571,9 @@ type Server struct {
 	sendBufferPool  sync.Pool
 	closeOnce       sync.Once
 }
+
+func listenerToken(fd int) uint64 { return uint64(uint32(fd)) | listenerKind<<32 }
+func wakeToken(fd int) uint64     { return uint64(uint32(fd)) | wakeKind<<32 }
 
 // connectionFor returns the connection a token refers to, or nil if the token
 // is stale. The low half is the descriptor and the high half a generation, so a
@@ -624,22 +639,37 @@ func Bind(config Config, handler Handler) (*Server, error) {
 		handler = HandlerFuncs{}
 	}
 
+	ports := config.Ports
+	if len(ports) == 0 {
+		ports = []uint16{config.Port}
+	}
+
 	epfd, err := syscall.EpollCreate1(syscall.EPOLL_CLOEXEC)
 	if err != nil {
 		return nil, err
 	}
-	listenFD, err := createListener(config)
-	if err != nil {
-		syscall.Close(epfd)
-		return nil, err
+	listenFDs := make([]int, 0, len(ports))
+	closeListeners := func() {
+		for _, fd := range listenFDs {
+			syscall.Close(fd)
+		}
+	}
+	for _, port := range ports {
+		listenFD, listenErr := createListener(config, port)
+		if listenErr != nil {
+			closeListeners()
+			syscall.Close(epfd)
+			return nil, listenErr
+		}
+		listenFDs = append(listenFDs, listenFD)
 	}
 	wakeFD, err := eventfd()
 	if err != nil {
-		syscall.Close(listenFD)
+		closeListeners()
 		syscall.Close(epfd)
 		return nil, err
 	}
-	s := &Server{epollFD: epfd, listenFD: listenFD, wakeFD: wakeFD, maxEvents: config.MaxEvents,
+	s := &Server{epollFD: epfd, listenFDs: listenFDs, wakeFD: wakeFD, maxEvents: config.MaxEvents,
 		useWritev: config.UseWritev, inlineHandlers: config.InlineHandlers,
 		writeHighWatermark: config.WriteBufferHighWatermark,
 		// Resume at a quarter of the budget rather than at the budget itself,
@@ -676,29 +706,49 @@ func Bind(config Config, handler Handler) (*Server, error) {
 	s.sendBufferPool.New = func() any {
 		return &sendBuffer{data: make([]byte, 0, s.retainedSendBuffer)}
 	}
-	if err = s.addFD(listenFD, listenerToken, uint32(syscall.EPOLLIN)|epollET); err == nil {
-		err = s.addFD(wakeFD, wakeToken, uint32(syscall.EPOLLIN)|epollET)
+	for _, fd := range listenFDs {
+		if err = s.addFD(fd, listenerToken(fd), uint32(syscall.EPOLLIN)|epollET); err != nil {
+			break
+		}
+	}
+	if err == nil {
+		err = s.addFD(wakeFD, wakeToken(wakeFD), uint32(syscall.EPOLLIN)|epollET)
 	}
 	if err != nil {
 		s.releaseTaskPool()
 		syscall.Close(wakeFD)
-		syscall.Close(listenFD)
+		closeListeners()
 		syscall.Close(epfd)
 		return nil, err
 	}
 	return s, nil
 }
 
+// LocalAddr returns the address of the server's first listener.
 func (s *Server) LocalAddr() (*net.TCPAddr, error) {
-	sa, err := syscall.Getsockname(s.listenFD)
+	addrs, err := s.LocalAddrs()
 	if err != nil {
 		return nil, err
 	}
-	v4, ok := sa.(*syscall.SockaddrInet4)
-	if !ok {
-		return nil, errors.New("listener is not IPv4")
+	return addrs[0], nil
+}
+
+// LocalAddrs returns one address per listener, in configured order. Ports left
+// at zero report the port the kernel chose.
+func (s *Server) LocalAddrs() ([]*net.TCPAddr, error) {
+	addrs := make([]*net.TCPAddr, 0, len(s.listenFDs))
+	for _, fd := range s.listenFDs {
+		sa, err := syscall.Getsockname(fd)
+		if err != nil {
+			return nil, err
+		}
+		v4, ok := sa.(*syscall.SockaddrInet4)
+		if !ok {
+			return nil, errors.New("listener is not IPv4")
+		}
+		addrs = append(addrs, &net.TCPAddr{IP: net.IP(v4.Addr[:]), Port: v4.Port})
 	}
-	return &net.TCPAddr{IP: net.IP(v4.Addr[:]), Port: v4.Port}, nil
+	return addrs, nil
 }
 
 func (s *Server) Run() error {
@@ -719,10 +769,10 @@ func (s *Server) Run() error {
 		}
 		for i := 0; i < n; i++ {
 			token := uint64(uint32(events[i].Fd)) | uint64(uint32(events[i].Pad))<<32
-			switch token {
-			case listenerToken:
-				s.acceptConnections()
-			case wakeToken:
+			switch token >> 32 {
+			case listenerKind:
+				s.acceptConnections(int(uint32(token)))
+			case wakeKind:
 				s.drainCommands()
 			default:
 				if c := s.noteEvent(token, events[i].Events); c != nil {
@@ -810,7 +860,7 @@ func (s *Server) Close() error {
 			}
 		}
 		s.budgetPaused = nil
-		for _, fd := range []int{s.listenFD, s.wakeFD, s.epollFD} {
+		for _, fd := range append(append([]int(nil), s.listenFDs...), s.wakeFD, s.epollFD) {
 			if err := syscall.Close(fd); err != nil && closeErr == nil {
 				closeErr = err
 			}
@@ -849,9 +899,9 @@ func (s *Server) modifyFD(c *Connection, events uint32) error {
 	return syscall.EpollCtl(s.epollFD, syscall.EPOLL_CTL_MOD, c.FD(), &e)
 }
 
-func (s *Server) acceptConnections() {
+func (s *Server) acceptConnections(listenFD int) {
 	for {
-		fd, err := accept4(s.listenFD)
+		fd, err := accept4(listenFD)
 		if err == syscall.EINTR {
 			continue
 		}
@@ -1373,7 +1423,7 @@ func defaultBacklog() int {
 	return backlogValue
 }
 
-func createListener(config Config) (int, error) {
+func createListener(config Config, port uint16) (int, error) {
 	ip := net.ParseIP(config.BindAddress).To4()
 	if ip == nil {
 		return -1, fmt.Errorf("invalid IPv4 bind address %q", config.BindAddress)
@@ -1383,7 +1433,7 @@ func createListener(config Config) (int, error) {
 		return -1, err
 	}
 	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
-	sa := &syscall.SockaddrInet4{Port: int(config.Port)}
+	sa := &syscall.SockaddrInet4{Port: int(port)}
 	copy(sa.Addr[:], ip)
 	if err = syscall.Bind(fd, sa); err == nil {
 		err = syscall.Listen(fd, config.Backlog)

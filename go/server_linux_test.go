@@ -441,3 +441,87 @@ func TestInlineHandlersServeConcurrentConnections(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestMultipleListenersShareOneServer covers a server carrying several
+// listeners: every port must accept, and the connections from all of them must
+// land in the one descriptor table, event loop and worker pool rather than
+// needing a server each.
+func TestMultipleListenersShareOneServer(t *testing.T) {
+	const listeners = 4
+	config := DefaultConfig()
+	config.BindAddress = "127.0.0.1"
+	config.Port = 9999 // ignored once Ports is set
+	config.Ports = make([]uint16, listeners)
+	server, err := Bind(config, HandlerFuncs{Data: func(c *Connection, b []byte) {
+		if err := c.Send(b); err != nil {
+			c.Close()
+		}
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addrs, err := server.LocalAddrs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(addrs) != listeners {
+		t.Fatalf("LocalAddrs returned %d addresses, want %d", len(addrs), listeners)
+	}
+	seen := make(map[int]bool, listeners)
+	for _, addr := range addrs {
+		if addr.Port == 0 || addr.Port == 9999 || seen[addr.Port] {
+			t.Fatalf("listener ports are not distinct ephemeral ports: %v", addrs)
+		}
+		seen[addr.Port] = true
+	}
+	first, err := server.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Port != addrs[0].Port {
+		t.Fatalf("LocalAddr port = %d, want the first listener %d", first.Port, addrs[0].Port)
+	}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- server.Run() }()
+	defer func() {
+		server.Stop()
+		if err := <-runDone; err != nil {
+			t.Error(err)
+		}
+		if err := server.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for i, addr := range addrs {
+		for round := 0; round < 4; round++ {
+			wg.Add(1)
+			go func(addr string, value byte) {
+				defer wg.Done()
+				conn, err := net.DialTimeout("tcp4", addr, 10*time.Second)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+				payload := bytes.Repeat([]byte{value}, 64)
+				if _, err = conn.Write(payload); err != nil {
+					t.Error(err)
+					return
+				}
+				echoed := make([]byte, len(payload))
+				if _, err = io.ReadFull(conn, echoed); err != nil {
+					t.Error(err)
+					return
+				}
+				if !bytes.Equal(echoed, payload) {
+					t.Errorf("echo mismatch on listener %s", addr)
+				}
+			}(addr.String(), byte(i))
+		}
+	}
+	wg.Wait()
+}

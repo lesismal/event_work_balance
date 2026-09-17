@@ -14,8 +14,12 @@ import (
 )
 
 type Config struct {
-	BindAddress                     string
-	Port                            uint16
+	BindAddress string
+	Port        uint16
+	// Ports, when it is not empty, is the complete set of ports to listen on
+	// and Port is ignored. One server spanning several ports shares its
+	// connection table, task pool and buffer pool across all of them.
+	Ports                           []uint16
 	Backlog, WorkerCount, MaxEvents int
 	ReadBufferSize                  int
 	WriteBufferHighWatermark        int
@@ -195,7 +199,7 @@ func (c *Connection) RunTask() {
 }
 
 type Server struct {
-	listener        net.Listener
+	listeners       []net.Listener
 	handler         Handler
 	taskPool        *taskpool.TaskPool
 	releaseTaskPool func()
@@ -227,12 +231,23 @@ func Bind(config Config, handler Handler) (*Server, error) {
 	if handler == nil {
 		handler = HandlerFuncs{}
 	}
-	listener, err := net.Listen("tcp4", net.JoinHostPort(config.BindAddress, fmt.Sprint(config.Port)))
-	if err != nil {
-		return nil, err
+	ports := config.Ports
+	if len(ports) == 0 {
+		ports = []uint16{config.Port}
+	}
+	listeners := make([]net.Listener, 0, len(ports))
+	for _, port := range ports {
+		listener, err := net.Listen("tcp4", net.JoinHostPort(config.BindAddress, fmt.Sprint(port)))
+		if err != nil {
+			for _, opened := range listeners {
+				_ = opened.Close()
+			}
+			return nil, err
+		}
+		listeners = append(listeners, listener)
 	}
 	pool, releasePool := acquireTaskPool(config)
-	s := &Server{listener: listener, handler: handler, taskPool: pool, releaseTaskPool: releasePool, connections: make(map[*Connection]struct{})}
+	s := &Server{listeners: listeners, handler: handler, taskPool: pool, releaseTaskPool: releasePool, connections: make(map[*Connection]struct{})}
 	s.readBufferPool.New = func() any { return &readBuffer{data: make([]byte, config.ReadBufferSize)} }
 	return s, nil
 }
@@ -245,16 +260,57 @@ func (s *Server) submit(c *Connection) bool {
 	}
 	return true
 }
+
+// LocalAddr returns the address of the server's first listener.
 func (s *Server) LocalAddr() (*net.TCPAddr, error) {
-	addr, ok := s.listener.Addr().(*net.TCPAddr)
-	if !ok {
-		return nil, errors.New("listener is not TCP")
+	addrs, err := s.LocalAddrs()
+	if err != nil {
+		return nil, err
 	}
-	return addr, nil
+	return addrs[0], nil
 }
+
+// LocalAddrs returns one address per listener, in configured order.
+func (s *Server) LocalAddrs() ([]*net.TCPAddr, error) {
+	addrs := make([]*net.TCPAddr, 0, len(s.listeners))
+	for _, listener := range s.listeners {
+		addr, ok := listener.Addr().(*net.TCPAddr)
+		if !ok {
+			return nil, errors.New("listener is not TCP")
+		}
+		addrs = append(addrs, addr)
+	}
+	return addrs, nil
+}
+
+// Run serves every listener until the server is stopped. It returns the first
+// error any of them reported.
 func (s *Server) Run() error {
+	if len(s.listeners) == 1 {
+		return s.serve(s.listeners[0])
+	}
+	errs := make(chan error, len(s.listeners))
+	var serving sync.WaitGroup
+	for _, listener := range s.listeners {
+		serving.Add(1)
+		go func(listener net.Listener) {
+			defer serving.Done()
+			errs <- s.serve(listener)
+		}(listener)
+	}
+	serving.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) serve(listener net.Listener) error {
 	for {
-		conn, err := s.listener.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
 			if s.stopping.Load() || errors.Is(err, net.ErrClosed) {
 				return nil
@@ -307,7 +363,9 @@ func (s *Server) finishConnection(c *Connection, err error) {
 }
 func (s *Server) Stop() {
 	if s.stopping.CompareAndSwap(false, true) {
-		_ = s.listener.Close()
+		for _, listener := range s.listeners {
+			_ = listener.Close()
+		}
 	}
 }
 func (s *Server) Close() error {
