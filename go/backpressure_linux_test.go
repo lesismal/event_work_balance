@@ -16,8 +16,7 @@ import (
 // plus a shutdown function that fails the test if the loop errored.
 func startEchoServer(t *testing.T, config Config, handler Handler) (*Server, string) {
 	t.Helper()
-	config.BindAddress = "127.0.0.1"
-	config.Port = 0
+	config.Addr = "127.0.0.1:0"
 	server, err := Bind(config, handler)
 	if err != nil {
 		t.Fatal(err)
@@ -401,8 +400,7 @@ func TestDrainedItemReturnsBufferToPool(t *testing.T) {
 func newOfflineServer(t *testing.T) *Server {
 	t.Helper()
 	config := DefaultConfig()
-	config.BindAddress = "127.0.0.1"
-	config.Port = 0
+	config.Addr = "127.0.0.1:0"
 	server, err := Bind(config, HandlerFuncs{})
 	if err != nil {
 		t.Fatal(err)

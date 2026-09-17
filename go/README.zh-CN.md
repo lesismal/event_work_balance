@@ -39,7 +39,11 @@
 
 ```go
 config := epoll.DefaultConfig()
-config.BindAddress = "127.0.0.1"
+// Network、Addr 与标准库 net.Listen 的参数含义一致：
+// Network 取 "tcp"、"tcp4"、"tcp6"，Addr 形如 ":9000"、"127.0.0.1:9000"、"[::1]:9000"，
+// 端口为 0 时由内核分配。Network 为空按 "tcp" 处理，Addr 为空按 ":0" 处理。
+config.Network = "tcp"
+config.Addr = "127.0.0.1:9000"
 config.ReadBufferSize = 32 * 1024
 server, err := epoll.Bind(config, epoll.HandlerFuncs{
     Data: func(c *epoll.Connection, data []byte) {
@@ -56,6 +60,14 @@ server, err := epoll.Bind(config, epoll.HandlerFuncs{
 if err != nil { panic(err) }
 defer server.Close()
 if err := server.Run(); err != nil { panic(err) }
+```
+
+一个 server 监听多个地址时用 `Addrs`（此时 `Addr` 被忽略），它们共用同一个事件循环、
+描述符表、任务池和缓冲池；`LocalAddrs()` 按配置顺序返回各监听地址，端口为 0 的会
+返回内核实际分配的端口：
+
+```go
+config.Addrs = []string{"127.0.0.1:9000", "127.0.0.1:9001"}
 ```
 
 运行示例和测试：

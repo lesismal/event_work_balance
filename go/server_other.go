@@ -14,12 +14,17 @@ import (
 )
 
 type Config struct {
-	BindAddress string
-	Port        uint16
-	// Ports, when it is not empty, is the complete set of ports to listen on
-	// and Port is ignored. One server spanning several ports shares its
-	// connection table, task pool and buffer pool across all of them.
-	Ports                           []uint16
+	// Network and Addr name the listener the way net.Listen does: Network is
+	// "tcp", "tcp4" or "tcp6", and Addr is a "host:port" such as ":9000",
+	// "127.0.0.1:9000" or "[::1]:9000". An empty Network means "tcp", and an
+	// empty Addr means ":0".
+	Network string
+	Addr    string
+	// Addrs, when it is not empty, is the complete set of addresses to listen
+	// on and Addr is ignored; they all share Network. One server spanning
+	// several addresses shares its connection table, task pool and buffer pool
+	// across all of them.
+	Addrs                           []string
 	Backlog, WorkerCount, MaxEvents int
 	ReadBufferSize                  int
 	WriteBufferHighWatermark        int
@@ -30,7 +35,7 @@ type Config struct {
 
 func DefaultConfig() Config {
 	workerCount, maxEvents := defaultPoolSizing()
-	return Config{BindAddress: "0.0.0.0", Port: 9000, Backlog: 128, WorkerCount: workerCount, MaxEvents: maxEvents, ReadBufferSize: 16 * 1024, WriteBufferHighWatermark: 4 * 1024, UseWritev: true, TaskPoolMode: taskpool.ModeCond, SharedTaskPool: true}
+	return Config{Network: "tcp", Addr: ":9000", Backlog: 128, WorkerCount: workerCount, MaxEvents: maxEvents, ReadBufferSize: 16 * 1024, WriteBufferHighWatermark: 4 * 1024, UseWritev: true, TaskPoolMode: taskpool.ModeCond, SharedTaskPool: true}
 }
 
 type Handler interface {
@@ -225,19 +230,23 @@ func Bind(config Config, handler Handler) (*Server, error) {
 	if config.ReadBufferSize <= 0 {
 		config.ReadBufferSize = 16 * 1024
 	}
-	if config.BindAddress == "" {
-		config.BindAddress = "0.0.0.0"
-	}
 	if handler == nil {
 		handler = HandlerFuncs{}
 	}
-	ports := config.Ports
-	if len(ports) == 0 {
-		ports = []uint16{config.Port}
+	network := config.Network
+	if network == "" {
+		network = "tcp"
 	}
-	listeners := make([]net.Listener, 0, len(ports))
-	for _, port := range ports {
-		listener, err := net.Listen("tcp4", net.JoinHostPort(config.BindAddress, fmt.Sprint(port)))
+	addrs := config.Addrs
+	if len(addrs) == 0 {
+		addrs = []string{config.Addr}
+	}
+	listeners := make([]net.Listener, 0, len(addrs))
+	for _, addr := range addrs {
+		if addr == "" {
+			addr = ":0"
+		}
+		listener, err := net.Listen(network, addr)
 		if err != nil {
 			for _, opened := range listeners {
 				_ = opened.Close()

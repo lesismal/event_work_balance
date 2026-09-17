@@ -14,14 +14,10 @@ import (
 
 func main() {
 	config := epoll.DefaultConfig()
-	config.BindAddress = "127.0.0.1"
+	config.Addr = "127.0.0.1:9000"
 	config.Backlog = 256
 	if len(os.Args) > 1 {
-		port, err := strconv.ParseUint(os.Args[1], 10, 16)
-		if err != nil {
-			panic(err)
-		}
-		config.Port = uint16(port)
+		config.Addr = os.Args[1]
 	}
 	if len(os.Args) > 2 {
 		enabled, _ := strconv.ParseBool(os.Args[2])

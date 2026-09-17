@@ -67,13 +67,24 @@ const (
 
 // Config controls listener and worker-pool sizing.
 type Config struct {
-	BindAddress string
-	Port        uint16
-	// Ports, when it is not empty, is the complete set of ports to listen on
-	// and Port is ignored. One server spanning several ports shares a single
-	// event loop, descriptor table, task pool and buffer pool across all of
-	// them, where a server per port gives each its own copy of all four.
-	Ports          []uint16
+	// Network and Addr name the listener the way net.Listen does: Network is
+	// "tcp", "tcp4" or "tcp6", and Addr is a "host:port" such as ":9000",
+	// "127.0.0.1:9000" or "[::1]:9000". A host resolves through the net
+	// package, and a zero port asks the kernel to choose one. An empty Network
+	// means "tcp", and an empty Addr means ":0", again as net.Listen reads
+	// them.
+	//
+	// "tcp" with no host listens on both families where the kernel has IPv6,
+	// "tcp4" and "tcp6" pin it to one. This is the same choice net.Listen
+	// makes from the same arguments.
+	Network string
+	Addr    string
+	// Addrs, when it is not empty, is the complete set of addresses to listen
+	// on and Addr is ignored; they all share Network. One server spanning
+	// several addresses shares a single event loop, descriptor table, task
+	// pool and buffer pool across all of them, where a server per address
+	// gives each its own copy of all four.
+	Addrs          []string
 	Backlog        int
 	WorkerCount    int
 	MaxEvents      int
@@ -117,7 +128,7 @@ type Config struct {
 
 func DefaultConfig() Config {
 	workerCount, maxEvents := defaultPoolSizing()
-	return Config{BindAddress: "0.0.0.0", Port: 9000, Backlog: defaultBacklog(), WorkerCount: workerCount,
+	return Config{Network: "tcp", Addr: ":9000", Backlog: defaultBacklog(), WorkerCount: workerCount,
 		MaxEvents: maxEvents, ReadBufferSize: 16 * 1024,
 		WriteBufferHighWatermark: defaultWriteHighWatermark, MaxPendingBytes: defaultMaxPendingBytes,
 		UseWritev: true, TaskPoolMode: taskpool.ModeElastic, SharedTaskPool: true}
@@ -632,30 +643,27 @@ func Bind(config Config, handler Handler) (*Server, error) {
 	if config.Backlog <= 0 {
 		config.Backlog = defaultBacklog()
 	}
-	if config.BindAddress == "" {
-		config.BindAddress = "0.0.0.0"
-	}
 	if handler == nil {
 		handler = HandlerFuncs{}
 	}
 
-	ports := config.Ports
-	if len(ports) == 0 {
-		ports = []uint16{config.Port}
+	addrs := config.Addrs
+	if len(addrs) == 0 {
+		addrs = []string{config.Addr}
 	}
 
 	epfd, err := syscall.EpollCreate1(syscall.EPOLL_CLOEXEC)
 	if err != nil {
 		return nil, err
 	}
-	listenFDs := make([]int, 0, len(ports))
+	listenFDs := make([]int, 0, len(addrs))
 	closeListeners := func() {
 		for _, fd := range listenFDs {
 			syscall.Close(fd)
 		}
 	}
-	for _, port := range ports {
-		listenFD, listenErr := createListener(config, port)
+	for _, addr := range addrs {
+		listenFD, listenErr := createListener(config, addr)
 		if listenErr != nil {
 			closeListeners()
 			syscall.Close(epfd)
@@ -742,11 +750,20 @@ func (s *Server) LocalAddrs() ([]*net.TCPAddr, error) {
 		if err != nil {
 			return nil, err
 		}
-		v4, ok := sa.(*syscall.SockaddrInet4)
-		if !ok {
-			return nil, errors.New("listener is not IPv4")
+		switch bound := sa.(type) {
+		case *syscall.SockaddrInet4:
+			addrs = append(addrs, &net.TCPAddr{IP: net.IP(bound.Addr[:]), Port: bound.Port})
+		case *syscall.SockaddrInet6:
+			addr := &net.TCPAddr{IP: net.IP(bound.Addr[:]), Port: bound.Port}
+			if bound.ZoneId != 0 {
+				if zone, zoneErr := net.InterfaceByIndex(int(bound.ZoneId)); zoneErr == nil {
+					addr.Zone = zone.Name
+				}
+			}
+			addrs = append(addrs, addr)
+		default:
+			return nil, fmt.Errorf("listener is not TCP: %T", sa)
 		}
-		addrs = append(addrs, &net.TCPAddr{IP: net.IP(v4.Addr[:]), Port: v4.Port})
 	}
 	return addrs, nil
 }
@@ -1423,19 +1440,74 @@ func defaultBacklog() int {
 	return backlogValue
 }
 
-func createListener(config Config, port uint16) (int, error) {
-	ip := net.ParseIP(config.BindAddress).To4()
-	if ip == nil {
-		return -1, fmt.Errorf("invalid IPv4 bind address %q", config.BindAddress)
+// resolveListenAddr turns a net.Listen network and address into the socket
+// address to bind, using the net package so that a host, a service name and an
+// empty address all mean here what they mean there.
+func resolveListenAddr(network, addr string) (family int, sa syscall.Sockaddr, err error) {
+	switch network {
+	case "", "tcp":
+		network = "tcp"
+	case "tcp4", "tcp6":
+	default:
+		return 0, nil, net.UnknownNetworkError(network)
 	}
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM|syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC, 0)
+	if addr == "" {
+		// net.Listen reads an empty address as every interface on a port of
+		// the kernel's choosing.
+		addr = ":0"
+	}
+	resolved, err := net.ResolveTCPAddr(network, addr)
+	if err != nil {
+		return 0, nil, err
+	}
+	ip4 := resolved.IP.To4()
+	switch {
+	case network == "tcp4":
+		if resolved.IP != nil && ip4 == nil {
+			return 0, nil, fmt.Errorf("address %q is not IPv4", addr)
+		}
+		bound := &syscall.SockaddrInet4{Port: resolved.Port}
+		copy(bound.Addr[:], ip4)
+		return syscall.AF_INET, bound, nil
+	case ip4 != nil:
+		// An IPv4 literal under "tcp" binds an IPv4 socket, as net.Listen does.
+		bound := &syscall.SockaddrInet4{Port: resolved.Port}
+		copy(bound.Addr[:], ip4)
+		return syscall.AF_INET, bound, nil
+	default:
+		bound := &syscall.SockaddrInet6{Port: resolved.Port}
+		copy(bound.Addr[:], resolved.IP.To16())
+		if resolved.Zone != "" {
+			zone, zoneErr := net.InterfaceByName(resolved.Zone)
+			if zoneErr != nil {
+				return 0, nil, zoneErr
+			}
+			bound.ZoneId = uint32(zone.Index)
+		}
+		return syscall.AF_INET6, bound, nil
+	}
+}
+
+func createListener(config Config, addr string) (int, error) {
+	family, bound, err := resolveListenAddr(config.Network, addr)
+	if err != nil {
+		return -1, err
+	}
+	fd, err := syscall.Socket(family, syscall.SOCK_STREAM|syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return -1, err
 	}
 	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
-	sa := &syscall.SockaddrInet4{Port: int(port)}
-	copy(sa.Addr[:], ip)
-	if err = syscall.Bind(fd, sa); err == nil {
+	if family == syscall.AF_INET6 {
+		// "tcp" accepts both families on one socket; "tcp6" is IPv6 only. This
+		// is the distinction net.Listen draws between the two networks.
+		v6only := 0
+		if config.Network == "tcp6" {
+			v6only = 1
+		}
+		_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, v6only)
+	}
+	if err = syscall.Bind(fd, bound); err == nil {
 		err = syscall.Listen(fd, config.Backlog)
 	}
 	if err != nil {

@@ -19,8 +19,7 @@ func TestServerHandlerKeepAliveAndClose(t *testing.T) {
 		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(request.URL.Path))
 	}))
 	config := epoll.DefaultConfig()
-	config.BindAddress = "127.0.0.1"
-	config.Port = 0
+	config.Addr = "127.0.0.1:0"
 	server, err := epoll.Bind(config, handler)
 	if err != nil {
 		t.Fatal(err)

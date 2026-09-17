@@ -25,8 +25,7 @@ func TestServerHandshakeEchoPingAndClose(t *testing.T) {
 		},
 	})
 	config := epoll.DefaultConfig()
-	config.BindAddress = "127.0.0.1"
-	config.Port = 0
+	config.Addr = "127.0.0.1:0"
 	server, err := epoll.Bind(config, handler)
 	if err != nil {
 		t.Fatal(err)
@@ -162,8 +161,7 @@ func BenchmarkServerEcho1KiB(b *testing.B) {
 		},
 	})
 	config := epoll.DefaultConfig()
-	config.BindAddress = "127.0.0.1"
-	config.Port = 0
+	config.Addr = "127.0.0.1:0"
 	server, err := epoll.Bind(config, handler)
 	if err != nil {
 		b.Fatal(err)

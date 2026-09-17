@@ -25,8 +25,7 @@ func main() {
 		},
 	})
 	config := epoll.DefaultConfig()
-	config.BindAddress = "127.0.0.1"
-	config.Port = 8080
+	config.Addr = "127.0.0.1:8080"
 	server, err := epoll.Bind(config, handler)
 	if err != nil {
 		panic(err)

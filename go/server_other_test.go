@@ -13,8 +13,7 @@ import (
 
 func TestPortableConcurrentEcho(t *testing.T) {
 	config := DefaultConfig()
-	config.BindAddress = "127.0.0.1"
-	config.Port = 0
+	config.Addr = "127.0.0.1:0"
 	server, err := Bind(config, HandlerFuncs{Data: func(c *Connection, data []byte) {
 		if err := c.Send(data); err != nil {
 			c.Close()

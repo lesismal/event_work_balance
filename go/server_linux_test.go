@@ -4,6 +4,7 @@ package epoll
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -19,8 +20,7 @@ func TestConcurrentBackpressuredEcho(t *testing.T) {
 	for _, useWritev := range []bool{false, true} {
 		t.Run(map[bool]string{false: "write", true: "writev"}[useWritev], func(t *testing.T) {
 			config := DefaultConfig()
-			config.BindAddress = "127.0.0.1"
-			config.Port = 0
+			config.Addr = "127.0.0.1:0"
 			config.UseWritev = useWritev
 			server, err := Bind(config, HandlerFuncs{Data: func(c *Connection, b []byte) {
 				if err := c.Send(b); err != nil {
@@ -80,8 +80,7 @@ func TestConcurrentBackpressuredEcho(t *testing.T) {
 func TestOnCloseReportsPeerEOF(t *testing.T) {
 	closed := make(chan error, 1)
 	config := DefaultConfig()
-	config.BindAddress = "127.0.0.1"
-	config.Port = 0
+	config.Addr = "127.0.0.1:0"
 	server, err := Bind(config, HandlerFuncs{Close: func(_ *Connection, err error) { closed <- err }})
 	if err != nil {
 		t.Fatal(err)
@@ -120,8 +119,7 @@ func TestPriorityDataUsesDedicatedCallback(t *testing.T) {
 	regular := make(chan []byte, 1)
 	priority := make(chan []byte, 1)
 	config := DefaultConfig()
-	config.BindAddress = "127.0.0.1"
-	config.Port = 0
+	config.Addr = "127.0.0.1:0"
 	server, err := Bind(config, HandlerFuncs{
 		Data:         func(_ *Connection, data []byte) { regular <- append([]byte(nil), data...) },
 		PriorityData: func(_ *Connection, data []byte) { priority <- append([]byte(nil), data...) },
@@ -192,8 +190,7 @@ func TestReadsDeferredWhileOutputQueued(t *testing.T) {
 			second := make(chan []byte, 1)
 			closed := make(chan error, 1)
 			config := DefaultConfig()
-			config.BindAddress = "127.0.0.1"
-			config.Port = 0
+			config.Addr = "127.0.0.1:0"
 			// Disable the watermark so epoll keeps EPOLLIN registered and only
 			// the process ordering stands between queued output and a read.
 			config.WriteBufferHighWatermark = -1
@@ -312,8 +309,7 @@ func TestDefaultBacklogMatchesKernelLimit(t *testing.T) {
 func TestConcurrentAcceptBurst(t *testing.T) {
 	const burst = 256
 	config := DefaultConfig()
-	config.BindAddress = "127.0.0.1"
-	config.Port = 0
+	config.Addr = "127.0.0.1:0"
 	server, err := Bind(config, HandlerFuncs{Data: func(c *Connection, b []byte) {
 		if err := c.Send(b); err != nil {
 			c.Close()
@@ -373,8 +369,7 @@ func TestConcurrentAcceptBurst(t *testing.T) {
 // their rounds itself instead of handing them to workers.
 func TestInlineHandlersServeConcurrentConnections(t *testing.T) {
 	config := DefaultConfig()
-	config.BindAddress = "127.0.0.1"
-	config.Port = 0
+	config.Addr = "127.0.0.1:0"
 	config.InlineHandlers = true
 	server, err := Bind(config, HandlerFuncs{Data: func(c *Connection, b []byte) {
 		if err := c.Send(b); err != nil {
@@ -449,9 +444,11 @@ func TestInlineHandlersServeConcurrentConnections(t *testing.T) {
 func TestMultipleListenersShareOneServer(t *testing.T) {
 	const listeners = 4
 	config := DefaultConfig()
-	config.BindAddress = "127.0.0.1"
-	config.Port = 9999 // ignored once Ports is set
-	config.Ports = make([]uint16, listeners)
+	config.Addr = "127.0.0.1:9999" // ignored once Addrs is set
+	config.Addrs = make([]string, listeners)
+	for i := range config.Addrs {
+		config.Addrs[i] = "127.0.0.1:0"
+	}
 	server, err := Bind(config, HandlerFuncs{Data: func(c *Connection, b []byte) {
 		if err := c.Send(b); err != nil {
 			c.Close()
@@ -524,4 +521,106 @@ func TestMultipleListenersShareOneServer(t *testing.T) {
 		}
 	}
 	wg.Wait()
+}
+
+// Network and Addr are read the way net.Listen reads them, so the same strings
+// that name a listener there name one here.
+func TestListenAddressFormsMatchNetListen(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		network string
+		addr    string
+		wantIP  func(net.IP) bool
+	}{
+		{"tcp4 literal", "tcp4", "127.0.0.1:0", func(ip net.IP) bool { return ip.Equal(net.IPv4(127, 0, 0, 1)) }},
+		{"tcp literal", "tcp", "127.0.0.1:0", func(ip net.IP) bool { return ip.Equal(net.IPv4(127, 0, 0, 1)) }},
+		{"tcp6 literal", "tcp6", "[::1]:0", func(ip net.IP) bool { return ip.Equal(net.IPv6loopback) }},
+		{"tcp wildcard", "tcp", ":0", func(ip net.IP) bool { return ip.IsUnspecified() }},
+		{"empty network defaults to tcp", "", "127.0.0.1:0", func(ip net.IP) bool { return ip.Equal(net.IPv4(127, 0, 0, 1)) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Whatever this library does with the arguments, net.Listen has to
+			// accept them too, or they are not the standard forms.
+			reference, err := net.Listen(map[bool]string{true: "tcp", false: tc.network}[tc.network == ""], tc.addr)
+			if err != nil {
+				t.Skipf("net.Listen(%q, %q): %v", tc.network, tc.addr, err)
+			}
+			reference.Close()
+
+			config := DefaultConfig()
+			config.Network = tc.network
+			config.Addr = tc.addr
+			server, err := Bind(config, HandlerFuncs{Data: func(c *Connection, b []byte) {
+				if err := c.Send(b); err != nil {
+					c.Close()
+				}
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			runDone := make(chan error, 1)
+			go func() { runDone <- server.Run() }()
+			defer func() {
+				server.Stop()
+				if err := <-runDone; err != nil {
+					t.Errorf("Run: %v", err)
+				}
+				if err := server.Close(); err != nil {
+					t.Errorf("Close: %v", err)
+				}
+			}()
+
+			addr, err := server.LocalAddr()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if addr.Port == 0 {
+				t.Fatal("LocalAddr reports port 0, want the port the kernel chose")
+			}
+			if !tc.wantIP(addr.IP) {
+				t.Fatalf("LocalAddr IP = %v, not the address asked for", addr.IP)
+			}
+
+			// A wildcard listener is reachable over loopback; a literal one is
+			// reachable at itself. Dialing the reported address covers both.
+			dialAddr := addr.String()
+			if addr.IP.IsUnspecified() {
+				dialAddr = net.JoinHostPort("127.0.0.1", strconv.Itoa(addr.Port))
+			}
+			conn, err := net.DialTimeout("tcp", dialAddr, 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			payload := []byte("listen")
+			if _, err := conn.Write(payload); err != nil {
+				t.Fatal(err)
+			}
+			reply := make([]byte, len(payload))
+			if _, err := io.ReadFull(conn, reply); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(reply, payload) {
+				t.Fatalf("echo returned %q, want %q", reply, payload)
+			}
+		})
+	}
+}
+
+func TestListenRejectsUnknownNetwork(t *testing.T) {
+	config := DefaultConfig()
+	config.Network = "udp"
+	config.Addr = "127.0.0.1:0"
+	server, err := Bind(config, HandlerFuncs{})
+	if err == nil {
+		server.Close()
+		t.Fatal("Bind accepted network \"udp\", want an error")
+	}
+	var unknown net.UnknownNetworkError
+	if !errors.As(err, &unknown) {
+		t.Fatalf("Bind error = %v, want net.UnknownNetworkError", err)
+	}
 }
