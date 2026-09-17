@@ -367,3 +367,77 @@ func TestConcurrentAcceptBurst(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// InlineHandlers moves handler execution onto the event loop. The connections
+// still have to be served correctly and concurrently: the loop now interleaves
+// their rounds itself instead of handing them to workers.
+func TestInlineHandlersServeConcurrentConnections(t *testing.T) {
+	config := DefaultConfig()
+	config.BindAddress = "127.0.0.1"
+	config.Port = 0
+	config.InlineHandlers = true
+	server, err := Bind(config, HandlerFuncs{Data: func(c *Connection, b []byte) {
+		if err := c.Send(b); err != nil {
+			c.Close()
+		}
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := server.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- server.Run() }()
+	defer func() {
+		server.Stop()
+		if err := <-runDone; err != nil {
+			t.Errorf("Run: %v", err)
+		}
+		if err := server.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
+
+	const connections, rounds = 16, 32
+	payload := bytes.Repeat([]byte("inline"), 64)
+	var wg sync.WaitGroup
+	errs := make(chan error, connections)
+	for i := 0; i < connections; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn, err := net.DialTimeout("tcp", addr.String(), 5*time.Second)
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer conn.Close()
+			reply := make([]byte, len(payload))
+			for round := 0; round < rounds; round++ {
+				if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+					errs <- err
+					return
+				}
+				if _, err := conn.Write(payload); err != nil {
+					errs <- err
+					return
+				}
+				if _, err := io.ReadFull(conn, reply); err != nil {
+					errs <- err
+					return
+				}
+				if !bytes.Equal(reply, payload) {
+					errs <- io.ErrUnexpectedEOF
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+}

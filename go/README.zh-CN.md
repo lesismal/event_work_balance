@@ -108,3 +108,29 @@ server, err := epoll.Bind(config, handler)
 cd go
 go run ./examples/websocket_server
 ```
+
+## GOMAXPROCS
+
+工作协程在自己的协程里直接执行连接的 read/write，而协程进入系统调用时会一直占着它的 P，
+直到调度器把这个 P 收回转交出去。所以 GOMAXPROCS 等于核数时，核会在等这次转交的过程中空转：
+10 万连接的 echo 压测里，进程在分到的 5 个核上只用掉 2.3 个核，execution trace 显示 2 秒窗口内
+有 872 秒的「已就绪但没在运行」时间，几乎全部落在被事件循环唤醒的 worker 上。
+
+把 GOMAXPROCS 设成核数的 2 倍即可：同一份构建下 echo 从 330k/s 提升到 415k/s，建连从 55k/s
+提升到 71k/s，TP99 从 145ms 降到 69ms。这是使用方的选择，库不会去改这个全局设置：
+
+```go
+runtime.GOMAXPROCS(2 * runtime.NumCPU())
+```
+
+需要注意 `runtime.NumCPU()` 取的是本进程的 CPU 亲和性掩码，被 taskset 或 cpuset 限制时它已经
+是实际可用的核数。
+
+## InlineHandlers
+
+`Config.InlineHandlers` 让事件循环直接执行连接的这一轮处理，不再交给工作协程。省掉这次交接
+在高消息速率下很可观：同一压测里 echo 446k/s 对 395k/s，建连 104k/s 对 95k/s。
+
+代价是 handler 会阻塞它所在的整个 server —— 在它返回之前，事件循环无法收事件、无法 accept、
+也无法服务这个 server 上的其他连接。只有在所有 handler 都很短且不会阻塞时才开启；会做 I/O、
+抢锁或执行不定长工作的 handler 应该继续走工作协程池，这个池存在的意义正是让一条慢连接不拖住其他连接。

@@ -37,13 +37,23 @@ func newCondPool(executor *executor, workerCount, queueSize int) *condPool {
 }
 
 func (p *condPool) enqueueLocked(task Task) {
-	p.pending.Add(1)
 	p.queue[p.tail] = task
 	p.tail++
 	if p.tail == len(p.queue) {
 		p.tail = 0
 	}
 	p.count++
+}
+
+// signal wakes n parked workers. It runs after the queue lock is released: a
+// worker woken while the submitter still holds the lock only gets as far as
+// that lock, so signaling under it turns every handoff into two acquisitions
+// and leaves the submitter, which is an event loop, holding the lock through
+// the whole wake-up.
+func (p *condPool) signal(n int) {
+	for ; n > 0; n-- {
+		p.notEmpty.Signal()
+	}
 }
 
 func (p *condPool) submit(task Task) bool {
@@ -57,11 +67,13 @@ func (p *condPool) submit(task Task) bool {
 		p.mu.Unlock()
 		return false
 	}
+	p.pending.Add(1)
 	p.enqueueLocked(task)
-	if p.waiters > 0 {
+	wake := p.waiters > 0
+	p.mu.Unlock()
+	if wake {
 		p.notEmpty.Signal()
 	}
-	p.mu.Unlock()
 	return true
 }
 
@@ -71,15 +83,31 @@ func (p *condPool) submit(task Task) bool {
 // was rejected.
 func (p *condPool) submitBatch(tasks []Task) int {
 	submitted := 0
+	wake := 0
 	p.mu.Lock()
+	if p.stopped {
+		p.mu.Unlock()
+		return 0
+	}
 	// wakeBudget bounds how many parked workers this batch still has to wake.
 	// A worker that has been signaled keeps taking tasks on its own, and a
 	// worker only parks when the queue is empty, so the tasks after the budget
 	// runs out are picked up without a signal. The budget is recomputed after
 	// every wait, because workers park again while a full queue blocks us.
 	wakeBudget := p.waiters
+	// One Add for the whole batch rather than one per task: the counter is
+	// shared by every producer, and inside the queue lock its cache line
+	// bounces extend the hold time that the wake-ups queue behind. It may only
+	// be raised once this batch has seen !stopped under the lock, because
+	// stop() sets that flag under the same lock before waiting on the counter.
+	p.pending.Add(len(tasks))
 	for _, task := range tasks {
 		for !p.stopped && p.count == len(p.queue) {
+			// Deferring the wake-ups is only safe while this batch keeps
+			// running: parking with tasks enqueued that no worker has been
+			// told about is a lost wake-up.
+			p.signal(wake)
+			wake = 0
 			p.fullWaiters++
 			p.notFull.Wait()
 			p.fullWaiters--
@@ -91,11 +119,15 @@ func (p *condPool) submitBatch(tasks []Task) int {
 		p.enqueueLocked(task)
 		submitted++
 		if wakeBudget > 0 {
-			p.notEmpty.Signal()
+			wake++
 			wakeBudget--
 		}
 	}
+	if rejected := len(tasks) - submitted; rejected > 0 {
+		p.pending.Add(-rejected)
+	}
 	p.mu.Unlock()
+	p.signal(wake)
 	return submitted
 }
 
@@ -134,10 +166,11 @@ func (p *condPool) worker() {
 			p.head = 0
 		}
 		p.count--
-		if p.fullWaiters > 0 {
+		wakeFull := p.fullWaiters > 0
+		p.mu.Unlock()
+		if wakeFull {
 			p.notFull.Signal()
 		}
-		p.mu.Unlock()
 		p.executor.call(task)
 		p.pending.Done()
 	}

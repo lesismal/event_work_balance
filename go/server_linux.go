@@ -85,6 +85,23 @@ type Config struct {
 	UseWritev       bool
 	TaskPoolMode    taskpool.Mode
 	SharedTaskPool  bool
+	// InlineHandlers runs a ready connection's round on the event loop instead
+	// of handing it to a worker.
+	//
+	// The handoff is not free, and at high message rates it is the dominant
+	// cost: it makes a goroutine runnable, and that goroutine has to be given a
+	// P before it can issue the read. An execution trace of a 100k-connection
+	// echo run measured 872 seconds of runnable-but-not-running time in a
+	// 2-second window, almost all of it on workers woken from the loop.
+	// Skipping the handoff measured 446k echoes/s against 395k for the same
+	// build with workers, and 104k accepted connections/s against 95k.
+	//
+	// The cost is that a handler now blocks its whole server: the loop cannot
+	// collect events, accept, or serve any other connection while it runs. Set
+	// this only when every handler is short and never blocks. Handlers that do
+	// I/O, take contended locks, or run unbounded work want the worker pool,
+	// which exists precisely so that one slow connection cannot stall the rest.
+	InlineHandlers bool
 }
 
 func DefaultConfig() Config {
@@ -502,6 +519,7 @@ type Server struct {
 	epollFD, listenFD, wakeFD int
 	maxEvents                 int
 	useWritev                 bool
+	inlineHandlers            bool
 	writeHighWatermark        int
 	writeLowWatermark         int
 	maxPendingBytes           int64
@@ -622,7 +640,8 @@ func Bind(config Config, handler Handler) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{epollFD: epfd, listenFD: listenFD, wakeFD: wakeFD, maxEvents: config.MaxEvents,
-		useWritev: config.UseWritev, writeHighWatermark: config.WriteBufferHighWatermark,
+		useWritev: config.UseWritev, inlineHandlers: config.InlineHandlers,
+		writeHighWatermark: config.WriteBufferHighWatermark,
 		// Resume at a quarter of the budget rather than at the budget itself,
 		// so recovery admits a useful amount of work instead of re-pausing on
 		// the first reply.
@@ -712,7 +731,13 @@ func (s *Server) Run() error {
 			}
 		}
 		if len(ready) > 0 {
-			tasks = s.submitReady(ready, tasks[:0])
+			if s.inlineHandlers {
+				for _, c := range ready {
+					c.process()
+				}
+			} else {
+				tasks = s.submitReady(ready, tasks[:0])
+			}
 			clear(ready)
 			ready = ready[:0]
 		}
