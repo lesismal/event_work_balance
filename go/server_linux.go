@@ -265,8 +265,14 @@ func (c *Connection) queueLocked(first, second []byte) {
 		tail := &c.sends[n-1]
 		// Merging is only safe while the socket has taken nothing from the
 		// item: appending may move the array, and re-pointing an item a write
-		// has already consumed part of would disturb that write.
-		if tail.buf != nil && tail.offset == 0 {
+		// has already consumed part of would disturb that write. It also has
+		// to fit: growing past the pooled capacity would both reallocate and
+		// produce a buffer too large to hand back, so a round's replies would
+		// allocate their way up the size classes and throw the result away.
+		// Starting a new item instead keeps every buffer poolable, and writev
+		// still hands the whole round to the socket in one call.
+		if tail.buf != nil && tail.offset == 0 &&
+			len(tail.buf.data)+len(first)+len(second) <= cap(tail.buf.data) {
 			tail.buf.data = append(append(tail.buf.data, first...), second...)
 			tail.data = tail.buf.data
 			return

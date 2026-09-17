@@ -139,8 +139,10 @@ func TestFeedOneBorrowedCompletesOwnedFrameWithoutRetainingTail(t *testing.T) {
 	if _, complete, err := parser.FeedOneBorrowed(first[:cut]); err != nil || complete {
 		t.Fatalf("partial frame complete=%v, err=%v", complete, err)
 	}
-	if cap(parser.buffer) != len(first) {
-		t.Fatalf("partial buffer capacity=%d, want frame size %d", cap(parser.buffer), len(first))
+	// The adopted buffer must hold the whole frame so the rest of it arrives
+	// without a regrow. A recycled buffer may already be larger than that.
+	if cap(parser.buffer) < len(first) {
+		t.Fatalf("partial buffer capacity=%d, want at least frame size %d", cap(parser.buffer), len(first))
 	}
 	event, complete, err := parser.FeedOneBorrowed(append(first[cut:], second...))
 	if err != nil || !complete || event.Opcode != Binary || len(event.Payload) != len(payload) {
@@ -154,4 +156,48 @@ func TestFeedOneBorrowedCompletesOwnedFrameWithoutRetainingTail(t *testing.T) {
 	if parser.borrowedTail != nil || parser.borrowedBuffer || len(parser.buffer) != 0 {
 		t.Fatalf("borrowed input retained after release")
 	}
+}
+
+// TestPooledBufferNotSharedWhileFrameIsPartial guards the recycling of adopted
+// frame buffers. A parser holding half a frame must keep its array until the
+// rest arrives; handing that array back while it is still in use would let a
+// second connection overwrite the first one's message.
+func TestPooledBufferNotSharedWhileFrameIsPartial(t *testing.T) {
+	payload := make([]byte, 4096)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	frame := clientFrame(Binary, true, payload)
+	split := len(frame) - 1
+
+	held := NewParser(1 << 20)
+	if _, complete, err := held.FeedOneBorrowed(frame[:split]); err != nil || complete {
+		t.Fatalf("partial feed: complete=%v err=%v", complete, err)
+	}
+	held.ReleaseBorrowed()
+
+	// Cycle other parsers through the pool. Each adopts a partial frame of its
+	// own, completes it, and releases, so any array the pool is willing to hand
+	// out gets filled with a pattern the held frame must not pick up.
+	noise := clientFrame(Binary, true, bytes.Repeat([]byte{0xff}, 4096))
+	for i := 0; i < 32; i++ {
+		other := NewParser(1 << 20)
+		if _, complete, err := other.FeedOneBorrowed(noise[:len(noise)-1]); err != nil || complete {
+			t.Fatalf("noise partial feed: complete=%v err=%v", complete, err)
+		}
+		other.ReleaseBorrowed()
+		if _, complete, err := other.FeedOneBorrowed(noise[len(noise)-1:]); err != nil || !complete {
+			t.Fatalf("noise completion: complete=%v err=%v", complete, err)
+		}
+		other.ReleaseBorrowed()
+	}
+
+	event, complete, err := held.FeedOneBorrowed(frame[split:])
+	if err != nil || !complete {
+		t.Fatalf("completion: complete=%v err=%v", complete, err)
+	}
+	if !bytes.Equal(event.Payload, payload) {
+		t.Fatal("payload was corrupted while the frame was split across reads")
+	}
+	held.ReleaseBorrowed()
 }

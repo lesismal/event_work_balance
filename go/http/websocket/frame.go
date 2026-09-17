@@ -5,6 +5,7 @@ package websocket
 import (
 	"encoding/binary"
 	"errors"
+	"sync"
 	"unicode/utf8"
 )
 
@@ -38,6 +39,15 @@ var (
 
 const maxRetainedFrameBuffer = 64 << 10
 
+type frameBuffer struct{ data []byte }
+
+// frameBuffers recycles the arrays a parser adopts a partial frame into. A
+// connection needs one only while a frame is split across reads, so pooling
+// them lets a connection that is between messages hold none at all instead of
+// keeping its own for as long as it stays open. At high connection counts
+// those retained arrays were the largest thing on the heap.
+var frameBuffers = sync.Pool{New: func() any { return new(frameBuffer) }}
+
 type Event struct {
 	Opcode  Opcode
 	Payload []byte
@@ -51,7 +61,7 @@ type fragmentedMessage struct {
 type Parser struct {
 	maxMessageBytes int64
 	buffer          []byte
-	owned           []byte
+	owned           *frameBuffer
 	borrowedTail    []byte
 	fragment        *fragmentedMessage
 	pendingConsume  int
@@ -79,12 +89,13 @@ func (p *Parser) Reset() {
 			p.fragment.data = p.fragment.data[:0]
 		}
 	}
-	if cap(p.owned) > maxRetainedFrameBuffer {
-		p.owned = nil
-	}
 	p.pendingConsume = 0
 	p.borrowedBuffer = false
 	p.borrowedTail = nil
+	if len(p.buffer) == 0 {
+		p.buffer = nil
+		p.releaseOwned()
+	}
 }
 
 // Feed parses masked client frames and returns complete messages and control
@@ -126,6 +137,27 @@ func (p *Parser) ReleaseBorrowed() {
 		p.buffer = nil
 		p.borrowedBuffer = false
 	}
+	if len(p.buffer) == 0 {
+		// Nothing is half-parsed, so the adopted array can go back for another
+		// connection to use until this one needs one again.
+		p.buffer = nil
+		p.releaseOwned()
+	}
+}
+
+// releaseOwned returns the adopted array to the pool. The caller must have
+// established that no partial frame still lives in it. An array that outgrew
+// the retention limit is dropped instead, so one large message cannot leave
+// every pooled array permanently inflated.
+func (p *Parser) releaseOwned() {
+	if p.owned == nil {
+		return
+	}
+	if cap(p.owned.data) <= maxRetainedFrameBuffer {
+		p.owned.data = p.owned.data[:0]
+		frameBuffers.Put(p.owned)
+	}
+	p.owned = nil
 }
 
 func (p *Parser) feedOne(data []byte, borrowPayload bool) (Event, bool, error) {
@@ -174,9 +206,10 @@ func (p *Parser) feedOne(data []byte, borrowPayload bool) (Event, bool, error) {
 // reuse it. An emptied or borrowed buffer must not displace a larger array that
 // is still worth keeping, so the retained one only ever grows.
 func (p *Parser) keepOwned() {
-	if !p.borrowedBuffer && cap(p.buffer) >= cap(p.owned) {
-		p.owned = p.buffer
+	if p.borrowedBuffer || p.owned == nil || cap(p.buffer) < cap(p.owned.data) {
+		return
 	}
+	p.owned.data = p.buffer
 }
 
 // adopt copies the borrowed tail into the parser's own array so the read
@@ -197,11 +230,14 @@ func (p *Parser) adopt() {
 			capacity = frameEnd
 		}
 	}
-	if cap(p.owned) < capacity {
-		p.owned = make([]byte, 0, capacity)
+	if p.owned == nil {
+		p.owned = frameBuffers.Get().(*frameBuffer)
 	}
-	p.owned = append(p.owned[:0], p.buffer...)
-	p.buffer = p.owned
+	if cap(p.owned.data) < capacity {
+		p.owned.data = make([]byte, 0, capacity)
+	}
+	p.owned.data = append(p.owned.data[:0], p.buffer...)
+	p.buffer = p.owned.data
 	p.borrowedBuffer = false
 }
 
