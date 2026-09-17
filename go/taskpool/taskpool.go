@@ -91,7 +91,7 @@ func NewWithMode(mode Mode, maxConcurrent, queueSize int) *TaskPool {
 	case ModeElastic:
 		pool.backend = newElasticPool(executor, maxConcurrent, queueSize)
 	case ModeCond:
-		pool.backend = newCondPool(executor, maxConcurrent, queueSize)
+		pool.backend = newCondBackend(executor, maxConcurrent, queueSize)
 	default:
 		panic("taskpool: invalid mode")
 	}

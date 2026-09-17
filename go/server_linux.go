@@ -19,19 +19,32 @@ import (
 )
 
 const (
-	listenerToken  = uint64(0)
-	wakeToken      = uint64(1)
-	firstConnToken = uint64(2)
-	maxWritevItems = 64
+	listenerToken = uint64(0)
+	wakeToken     = uint64(1)
+	// firstGeneration seeds the generation half of a connection token. Starting
+	// above the reserved listener and wake tokens keeps every connection token
+	// distinct from them whatever descriptor it lands on.
+	firstGeneration = uint64(2)
+	maxWritevItems  = 64
 	// maxWaitBatch caps the epoll_wait output buffer. MaxEvents keeps sizing
 	// the task queue; beyond this many events per wait the loop just calls
 	// epoll_wait again, so a larger buffer only costs memory per server.
 	maxWaitBatch = 1024
-	// maxRetainedSendBuffer bounds the per-connection outbound buffer kept for
-	// reuse once its queue drains.
-	maxRetainedSendBuffer = 64 << 10
-	epollET               = uint32(1 << 31)
-	baseEvents            = uint32(syscall.EPOLLIN|syscall.EPOLLPRI|syscall.EPOLLERR|
+	// defaultWriteHighWatermark is the per-connection outbound budget. It is
+	// one read round's worth of replies, which is the size that balances the
+	// two costs either side of it. Lower, and ordinary traffic crosses it on
+	// every reply, and each crossing costs an eventfd write and an epoll_ctl:
+	// at 4KB that churn was 16% of a 100k-connection profile. Higher, and the
+	// buffer holding those bytes grows past what the pool will retain, so it is
+	// dropped and reallocated every round: at 64KB that treadmill allocated
+	// 13.7GB across a 15-second rate test against the same run's 254MB live.
+	defaultWriteHighWatermark = 16 << 10
+	// defaultMaxPendingBytes is the server-wide outbound budget. It is the
+	// bound that actually holds at high connection counts, where the
+	// per-connection watermark alone would admit gigabytes in aggregate.
+	defaultMaxPendingBytes = 64 << 20
+	epollET                = uint32(1 << 31)
+	baseEvents             = uint32(syscall.EPOLLIN|syscall.EPOLLPRI|syscall.EPOLLERR|
 		syscall.EPOLLHUP|syscall.EPOLLRDHUP) | epollET
 	allEvents = baseEvents | syscall.EPOLLOUT
 )
@@ -47,15 +60,29 @@ type Config struct {
 	// WriteBufferHighWatermark pauses socket reads while at least this many
 	// bytes are waiting to be written. This bounds userspace buffering while
 	// TCP backpressure catches up. Set below zero to disable write backpressure.
+	//
+	// Crossing it is not free: the worker hands a command to the event loop,
+	// which costs an eventfd write and an epoll_ctl. A watermark near the
+	// message size makes every reply a crossing, so keep it well above one
+	// round's worth of output.
 	WriteBufferHighWatermark int
-	UseWritev                bool
-	TaskPoolMode             taskpool.Mode
-	SharedTaskPool           bool
+	// MaxPendingBytes caps the bytes this server may hold across all of its
+	// connections waiting for their sockets. WriteBufferHighWatermark bounds a
+	// single connection, which at 100k connections still admits a per-server
+	// total of watermark*100k; this is the bound on the sum. Reads pause on
+	// every connection while the budget is exhausted. Zero means unlimited.
+	MaxPendingBytes int64
+	UseWritev       bool
+	TaskPoolMode    taskpool.Mode
+	SharedTaskPool  bool
 }
 
 func DefaultConfig() Config {
 	workerCount, maxEvents := defaultPoolSizing()
-	return Config{BindAddress: "0.0.0.0", Port: 9000, Backlog: 128, WorkerCount: workerCount, MaxEvents: maxEvents, ReadBufferSize: 16 * 1024, WriteBufferHighWatermark: 4 * 1024, UseWritev: true, TaskPoolMode: taskpool.ModeCond, SharedTaskPool: true}
+	return Config{BindAddress: "0.0.0.0", Port: 9000, Backlog: 128, WorkerCount: workerCount,
+		MaxEvents: maxEvents, ReadBufferSize: 16 * 1024,
+		WriteBufferHighWatermark: defaultWriteHighWatermark, MaxPendingBytes: defaultMaxPendingBytes,
+		UseWritev: true, TaskPoolMode: taskpool.ModeElastic, SharedTaskPool: true}
 }
 
 // Handler callbacks run on a logical worker, except OnOpen and OnClose which
@@ -111,9 +138,15 @@ type command struct {
 type commandBatch struct{ items []command }
 type readBuffer struct{ data []byte }
 type sendBuffer struct{ data []byte }
+
+// sendItem is one queued chunk. buf is the pooled buffer backing data, or nil
+// when the caller handed over an array the connection does not own. Returning
+// buf to the pool as soon as the item drains is what keeps a backpressured
+// connection from allocating a fresh array per reply.
 type sendItem struct {
 	data   []byte
 	offset int
+	buf    *sendBuffer
 }
 
 type connectionAttachment struct{ value any }
@@ -127,12 +160,11 @@ type Connection struct {
 	pendingEvents  uint32
 	sends          []sendItem
 	sendHead       int
-	scratch        *sendBuffer
-	scratchQueued  bool
 	scheduled      bool
 	closing        bool
 	closed         bool
 	readPaused     bool
+	budgetPaused   bool
 	flushing       bool
 	corked         bool
 	closeAfterSend bool
@@ -196,8 +228,9 @@ func (c *Connection) canWriteDirectlyLocked() bool {
 	return c.sendHead == len(c.sends) && !c.flushing && !c.corked
 }
 
-// rewindQueueLocked restarts an emptied item queue, keeping the outbound
-// buffer because a send is about to refill it. Callers hold c.mu.
+// rewindQueueLocked restarts an emptied item queue. Every item has already
+// surrendered its buffer as it drained, so there is nothing left to return.
+// Callers hold c.mu.
 func (c *Connection) rewindQueueLocked() {
 	if cap(c.sends) > maxWritevItems*2 {
 		c.sends = nil
@@ -205,79 +238,57 @@ func (c *Connection) rewindQueueLocked() {
 		c.sends = c.sends[:0]
 	}
 	c.sendHead = 0
-	c.scratchQueued = false
 }
 
-// resetQueueLocked restarts an emptied queue and returns the outbound buffer.
-// Callers hold c.mu.
+// resetQueueLocked restarts an emptied queue. Callers hold c.mu.
 func (c *Connection) resetQueueLocked() {
 	c.rewindQueueLocked()
-	c.releaseScratchLocked()
 }
 
-// acquireScratchLocked returns the connection's outbound buffer, borrowing one
-// from the server pool if it does not hold one. Callers hold c.mu.
-func (c *Connection) acquireScratchLocked() *sendBuffer {
-	if c.scratch == nil {
-		c.scratch = c.server.sendBufferPool.Get().(*sendBuffer)
+// releaseItemLocked returns a drained item's buffer to the server pool. An
+// outsized buffer is dropped instead so that one large message does not leave
+// every pooled buffer permanently inflated. Callers hold c.mu.
+func (c *Connection) releaseItemLocked(item *sendItem) {
+	if item.buf != nil && cap(item.buf.data) <= c.server.retainedSendBuffer {
+		item.buf.data = item.buf.data[:0]
+		c.server.sendBufferPool.Put(item.buf)
 	}
-	return c.scratch
-}
-
-// releaseScratchLocked hands the outbound buffer back once no queued item can
-// reference it. The buffers live in a server-wide pool rather than on each
-// connection: a round needs one only until its replies reach the socket, so the
-// server keeps roughly one per busy worker instead of one per connection.
-// Callers hold c.mu.
-func (c *Connection) releaseScratchLocked() {
-	if c.scratch == nil {
-		return
-	}
-	if cap(c.scratch.data) <= maxRetainedSendBuffer {
-		c.scratch.data = c.scratch.data[:0]
-		c.server.sendBufferPool.Put(c.scratch)
-	}
-	c.scratch = nil
+	*item = sendItem{}
 }
 
 // queueLocked copies the parts into the send queue. Consecutive chunks merge
-// into one reusable buffer, so a round that answers several messages leaves a
-// single item for writev and allocates nothing once the buffer has grown.
-// Callers hold c.mu.
+// into the trailing item's buffer, so a round that answers several messages
+// leaves a single item for the socket and allocates nothing once that buffer
+// has grown. Callers hold c.mu.
 func (c *Connection) queueLocked(first, second []byte) {
-	if c.scratchQueued && c.sends[len(c.sends)-1].offset == 0 {
-		buffer := c.scratch
-		buffer.data = append(append(buffer.data, first...), second...)
-		// Appending may have moved the buffer. The trailing item spans all of
-		// it and nothing has been written from it yet, so re-pointing the item
-		// is enough and no in-flight write can be disturbed.
-		c.sends[len(c.sends)-1].data = buffer.data
-		return
+	if n := len(c.sends); n > 0 {
+		tail := &c.sends[n-1]
+		// Merging is only safe while the socket has taken nothing from the
+		// item: appending may move the array, and re-pointing an item a write
+		// has already consumed part of would disturb that write.
+		if tail.buf != nil && tail.offset == 0 {
+			tail.buf.data = append(append(tail.buf.data, first...), second...)
+			tail.data = tail.buf.data
+			return
+		}
 	}
-	if c.sendHead != len(c.sends) {
-		// Items are still queued and one of them may reference the shared
-		// buffer, so this chunk gets its own.
-		queued := make([]byte, 0, len(first)+len(second))
-		c.sends = append(c.sends, sendItem{data: append(append(queued, first...), second...)})
-		c.scratchQueued = false
-		return
+	if c.sendHead == len(c.sends) {
+		// Nothing is queued any more, so the item slice can start over.
+		c.rewindQueueLocked()
 	}
-	// The queue is empty, so nothing references the shared buffer any more.
-	c.rewindQueueLocked()
-	buffer := c.acquireScratchLocked()
-	buffer.data = append(append(buffer.data[:0], first...), second...)
-	c.sends = append(c.sends, sendItem{data: buffer.data})
-	c.scratchQueued = true
+	buf := c.server.sendBufferPool.Get().(*sendBuffer)
+	buf.data = append(append(buf.data[:0], first...), second...)
+	c.sends = append(c.sends, sendItem{data: buf.data, buf: buf})
 }
 
-// queueOwnedLocked queues data the caller handed over, which cannot be merged
-// into the shared buffer. Callers hold c.mu.
+// queueOwnedLocked queues data the caller handed over. The connection does not
+// own the array, so the item carries no pooled buffer and later chunks cannot
+// merge into it. Callers hold c.mu.
 func (c *Connection) queueOwnedLocked(data []byte) {
 	if c.sendHead == len(c.sends) {
 		c.rewindQueueLocked()
 	}
 	c.sends = append(c.sends, sendItem{data: data})
-	c.scratchQueued = false
 }
 
 // pauseStateChangedLocked reports whether queued output has crossed a watermark
@@ -285,15 +296,60 @@ func (c *Connection) queueOwnedLocked(data []byte) {
 // refreshConnection makes, so that a refresh is only requested when the event
 // loop actually has an epoll_ctl to perform. Callers hold c.mu.
 func (c *Connection) pauseStateChangedLocked() bool {
-	if c.server.writeHighWatermark <= 0 {
-		return false
+	pause, _ := c.pauseDecision(c.readPaused)
+	return pause != c.readPaused
+}
+
+// pauseDecision is the single definition of whether a connection's reads should
+// be paused, used by the worker to decide whether a refresh is worth asking for
+// and by the event loop to carry it out, so the two cannot disagree. The second
+// result reports that the server-wide budget, rather than this connection's own
+// backlog, is what forces the pause: such a connection may have nothing left to
+// flush and so cannot re-evaluate on its own, and the event loop has to wake it
+// once the budget recovers.
+func (c *Connection) pauseDecision(readPaused bool) (pause, byBudget bool) {
+	s := c.server
+	if s.maxPendingBytes > 0 && s.pendingTotal.Load() >= s.maxPendingBytes {
+		return true, true
+	}
+	if s.writeHighWatermark <= 0 {
+		return false, false
 	}
 	pendingBytes := c.pendingBytes.Load()
-	pauseReads := pendingBytes >= int64(c.server.writeHighWatermark)
-	if c.readPaused && pendingBytes > int64(c.server.writeLowWatermark) {
-		pauseReads = true
+	if pendingBytes >= int64(s.writeHighWatermark) {
+		return true, false
 	}
-	return pauseReads != c.readPaused
+	// Hysteresis: once paused, stay paused until the backlog falls well below
+	// the watermark. Resuming at the watermark itself would make every reply
+	// re-cross it, and each crossing costs an eventfd write and an epoll_ctl.
+	return readPaused && pendingBytes > int64(s.writeLowWatermark), false
+}
+
+// addPending grows both the connection's outbound backlog and the server-wide
+// total, which are kept in step so that the budget is always the sum of its
+// connections.
+func (c *Connection) addPending(n int64) {
+	if n <= 0 {
+		return
+	}
+	c.pendingBytes.Add(n)
+	c.server.pendingTotal.Add(n)
+}
+
+// subPending shrinks both counters. If the connection counter would go below
+// zero the decrement is trimmed to what was actually there, so a clamp on one
+// counter cannot let the other drift.
+func (c *Connection) subPending(n int64) {
+	if n <= 0 {
+		return
+	}
+	if pending := c.pendingBytes.Add(-n); pending < 0 {
+		c.pendingBytes.Store(0)
+		n += pending
+	}
+	if n > 0 {
+		c.server.pendingTotal.Add(-n)
+	}
 }
 
 // Send copies data before returning. It first attempts a direct nonblocking write.
@@ -344,7 +400,7 @@ func (c *Connection) send(data []byte, copyData bool) error {
 	} else {
 		c.queueOwnedLocked(queued)
 	}
-	c.pendingBytes.Add(int64(len(queued)))
+	c.addPending(int64(len(queued)))
 	// EPOLLOUT stays armed, so queueing alone needs no epoll change; only a
 	// watermark crossing does. While corked the flush at the end of the read
 	// round settles the read interest instead.
@@ -395,7 +451,7 @@ func (c *Connection) SendParts(first, second []byte) error {
 	} else {
 		c.queueLocked(second[sent-len(first):], nil)
 	}
-	c.pendingBytes.Add(int64(total - sent))
+	c.addPending(int64(total - sent))
 	refresh := !c.corked && c.pauseStateChangedLocked()
 	c.mu.Unlock()
 	if refresh {
@@ -411,20 +467,61 @@ type Server struct {
 	useWritev                 bool
 	writeHighWatermark        int
 	writeLowWatermark         int
+	maxPendingBytes           int64
+	budgetResumeBytes         int64
+	retainedSendBuffer        int
 	handler                   Handler
 	stopping                  atomic.Bool
-	nextToken                 atomic.Uint64
+	nextGeneration            atomic.Uint64
+	pendingTotal              atomic.Int64
 	commandMu                 sync.Mutex
 	commands                  *commandBatch
 	commandPool               sync.Pool
 	wakePending               atomic.Bool
-	connections               map[uint64]*Connection // event-loop ownership
-	taskPool                  *taskpool.TaskPool
-	releaseTaskPool           func()
-	taskWG                    sync.WaitGroup
-	readBufferPool            sync.Pool
-	sendBufferPool            sync.Pool
-	closeOnce                 sync.Once
+	// connections is indexed by file descriptor rather than keyed by token: a
+	// descriptor is a small dense integer the kernel already allocates, so the
+	// lookup on every epoll event becomes a bounds check instead of a hash.
+	// Event-loop ownership.
+	connections []*Connection
+	// budgetPaused holds connections whose reads the server-wide budget stopped,
+	// waiting to be resumed once it recovers. Event-loop ownership.
+	budgetPaused []*Connection
+	// budgetResume is the spare list resumeBudgetPaused swaps in while it walks
+	// the current one. Event-loop ownership.
+	budgetResume    []*Connection
+	taskPool        *taskpool.TaskPool
+	releaseTaskPool func()
+	taskWG          sync.WaitGroup
+	readBufferPool  sync.Pool
+	sendBufferPool  sync.Pool
+	closeOnce       sync.Once
+}
+
+// connectionFor returns the connection a token refers to, or nil if the token
+// is stale. The low half is the descriptor and the high half a generation, so a
+// reused descriptor never resolves to the connection that previously held it.
+func (s *Server) connectionFor(token uint64) *Connection {
+	fd := int(uint32(token))
+	if fd < 0 || fd >= len(s.connections) {
+		return nil
+	}
+	c := s.connections[fd]
+	if c == nil || c.token != token {
+		return nil
+	}
+	return c
+}
+
+// trackConnection records a newly accepted connection, growing the descriptor
+// table to cover it. Callers run on the event loop.
+func (s *Server) trackConnection(fd int, c *Connection) {
+	if fd >= len(s.connections) {
+		grown := max(fd+1, 2*len(s.connections))
+		table := make([]*Connection, grown)
+		copy(table, s.connections)
+		s.connections = table
+	}
+	s.connections[fd] = c
 }
 
 func Bind(config Config, handler Handler) (*Server, error) {
@@ -470,12 +567,40 @@ func Bind(config Config, handler Handler) (*Server, error) {
 	}
 	s := &Server{epollFD: epfd, listenFD: listenFD, wakeFD: wakeFD, maxEvents: config.MaxEvents,
 		useWritev: config.UseWritev, writeHighWatermark: config.WriteBufferHighWatermark,
-		writeLowWatermark: config.WriteBufferHighWatermark / 2, handler: handler,
-		connections: make(map[uint64]*Connection)}
-	s.nextToken.Store(firstConnToken)
+		// Resume at a quarter of the budget rather than at the budget itself,
+		// so recovery admits a useful amount of work instead of re-pausing on
+		// the first reply.
+		writeLowWatermark: config.WriteBufferHighWatermark / 4,
+		maxPendingBytes:   config.MaxPendingBytes,
+		budgetResumeBytes: config.MaxPendingBytes / 4,
+		// Retention is sized to one read round's replies, not to the write
+		// watermark. The watermark bounds the bytes a connection may have
+		// pending; it does not bound the capacity of the buffer holding them,
+		// and a buffer that grew to the watermark during a burst would
+		// otherwise be pooled at that size and handed to the next connection.
+		// At high connection counts that capacity, not the pending bytes, is
+		// what the process actually pays for: retaining at the watermark held
+		// 908MB of buffers against 256MB of pending data.
+		//
+		// The allowance is twice the round size because replies carry framing
+		// on top of the bytes that arrived. Retaining at exactly the round size
+		// would drop the buffer every round and allocate a new one next round.
+		retainedSendBuffer: 2 * config.ReadBufferSize,
+		handler:            handler}
+	s.nextGeneration.Store(firstGeneration)
 	s.taskPool, s.releaseTaskPool = acquireTaskPool(config)
 	s.readBufferPool.New = func() any { return &readBuffer{data: make([]byte, config.ReadBufferSize)} }
-	s.sendBufferPool.New = func() any { return &sendBuffer{} }
+	// Pooled outbound buffers start at the size a full round's replies actually
+	// reach, which is the bytes that arrived plus the framing put back on top
+	// of them, not the read buffer size alone. Starting any smaller costs a
+	// reallocation per round on every connection, and starting from empty costs
+	// one per doubling: empty cost 49.5GB of allocation across a 15-second rate
+	// test, and an exact-fit 16KB still cost 12.4GB. Matching the retention
+	// limit means a buffer that has grown is still handed back to the pool
+	// rather than dropped.
+	s.sendBufferPool.New = func() any {
+		return &sendBuffer{data: make([]byte, 0, s.retainedSendBuffer)}
+	}
 	if err = s.addFD(listenFD, listenerToken, uint32(syscall.EPOLLIN)|epollET); err == nil {
 		err = s.addFD(wakeFD, wakeToken, uint32(syscall.EPOLLIN)|epollET)
 	}
@@ -535,9 +660,36 @@ func (s *Server) Run() error {
 			clear(ready)
 			ready = ready[:0]
 		}
+		s.resumeBudgetPaused()
 	}
 	s.drainCommands()
 	return nil
+}
+
+// resumeBudgetPaused re-arms reads on connections the server-wide budget held
+// back, once enough of that budget has drained. They are re-examined rather
+// than resumed outright: a connection that has since built a backlog of its own
+// stays paused on its own account, and simply goes back on the list.
+func (s *Server) resumeBudgetPaused() {
+	if len(s.budgetPaused) == 0 || s.pendingTotal.Load() > s.budgetResumeBytes {
+		return
+	}
+	// Swap in the spare list before refreshing. A connection that is still held
+	// back goes straight back onto s.budgetPaused, which therefore must not
+	// share an array with the one being iterated.
+	waiting := s.budgetPaused
+	s.budgetPaused = s.budgetResume[:0]
+	for _, c := range waiting {
+		// Clear the flag first: it is what stops a connection already on the
+		// list from being added twice, so leaving it set would drop a
+		// connection that turns out to still need the budget.
+		c.mu.Lock()
+		c.budgetPaused = false
+		c.mu.Unlock()
+		s.refreshConnection(c)
+	}
+	clear(waiting)
+	s.budgetResume = waiting
 }
 
 // submitReady hands one epoll round's newly runnable connections to the task
@@ -570,8 +722,11 @@ func (s *Server) Close() error {
 		s.releaseTaskPool()
 		s.drainCommands()
 		for _, c := range s.connections {
-			s.closeConnection(c, nil, false)
+			if c != nil {
+				s.closeConnection(c, nil, false)
+			}
 		}
+		s.budgetPaused = nil
 		for _, fd := range []int{s.listenFD, s.wakeFD, s.epollFD} {
 			if err := syscall.Close(fd); err != nil && closeErr == nil {
 				closeErr = err
@@ -620,7 +775,10 @@ func (s *Server) acceptConnections() {
 		if err != nil {
 			return
 		}
-		token := s.nextToken.Add(1) - 1
+		// The token pairs the descriptor with a generation: the descriptor
+		// indexes the table, and the generation makes an event left over from a
+		// previous owner of the same descriptor resolve to nothing.
+		token := uint64(uint32(fd)) | s.nextGeneration.Add(1)<<32
 		c := &Connection{token: token, server: s}
 		c.fd.Store(int32(fd))
 		// EPOLLOUT is registered up front and never modified again. The
@@ -631,7 +789,7 @@ func (s *Server) acceptConnections() {
 			syscall.Close(fd)
 			continue
 		}
-		s.connections[token] = c
+		s.trackConnection(fd, c)
 		s.handler.OnOpen(c)
 	}
 }
@@ -655,7 +813,7 @@ func accept4(listenFD int) (int, error) {
 // noteEvent folds readiness into the connection and reports whether it needs
 // to be scheduled. Actual submission happens once per epoll round in Run.
 func (s *Server) noteEvent(token uint64, events uint32) *Connection {
-	c := s.connections[token]
+	c := s.connectionFor(token)
 	if c == nil {
 		return nil
 	}
@@ -725,14 +883,23 @@ func (s *Server) drainCommands() {
 func (s *Server) refreshConnection(c *Connection) {
 	c.mu.Lock()
 	usable := !c.closing && !c.closed
-	pendingBytes := c.pendingBytes.Load()
-	pauseReads := s.writeHighWatermark > 0 && pendingBytes >= int64(s.writeHighWatermark)
-	if c.readPaused && pendingBytes > int64(s.writeLowWatermark) {
-		pauseReads = true
-	}
+	pauseReads, byBudget := c.pauseDecision(c.readPaused)
 	changed := c.readPaused != pauseReads
 	c.readPaused = pauseReads
+	track := usable && pauseReads && byBudget && !c.budgetPaused
+	if track {
+		c.budgetPaused = true
+	}
+	if !pauseReads {
+		c.budgetPaused = false
+	}
 	c.mu.Unlock()
+	if track {
+		// A connection held back only by the server-wide budget may have
+		// nothing of its own left to flush, so no later event of its own would
+		// re-evaluate it. The loop resumes it when the budget recovers.
+		s.budgetPaused = append(s.budgetPaused, c)
+	}
 	if usable && changed {
 		// Write interest is permanent, so registration only tracks whether
 		// reads are paused while the peer catches up.
@@ -754,18 +921,27 @@ func (s *Server) closeConnection(c *Connection, closeErr error, callback bool) {
 	}
 	c.closed = true
 	c.closing = true
+	for i := c.sendHead; i < len(c.sends); i++ {
+		c.releaseItemLocked(&c.sends[i])
+	}
 	c.sends = nil
 	c.sendHead = 0
-	c.scratchQueued = false
-	c.releaseScratchLocked()
-	c.pendingBytes.Store(0)
+	c.budgetPaused = false
+	// Drop this connection's share of the server-wide budget in the same step
+	// that abandons its queue, so a closed connection cannot hold the budget
+	// against the ones still running.
+	if pending := c.pendingBytes.Swap(0); pending > 0 {
+		s.pendingTotal.Add(-pending)
+	}
 	c.mu.Unlock()
 	fd := int(c.fd.Swap(-1))
 	if fd >= 0 {
 		_ = syscall.EpollCtl(s.epollFD, syscall.EPOLL_CTL_DEL, fd, nil)
 		_ = syscall.Close(fd)
 	}
-	delete(s.connections, c.token)
+	if fd >= 0 && fd < len(s.connections) && s.connections[fd] == c {
+		s.connections[fd] = nil
+	}
 	if callback {
 		s.handler.OnClose(c, closeErr)
 	}
@@ -889,10 +1065,11 @@ func (c *Connection) uncork() error {
 }
 
 // overWriteWatermark reports whether queued output has reached the budget that
-// bounds how much the connection buffers in userspace.
+// bounds how much this connection, or the server as a whole, buffers in
+// userspace.
 func (c *Connection) overWriteWatermark() bool {
-	return c.server.writeHighWatermark > 0 &&
-		c.pendingBytes.Load() >= int64(c.server.writeHighWatermark)
+	pause, _ := c.pauseDecision(false)
+	return pause
 }
 
 func (c *Connection) readLoop() error {
@@ -1015,9 +1192,7 @@ func (c *Connection) flushOutput() error {
 			n, err = syscall.Write(c.FD(), item.data[item.offset:])
 		}
 		if n > 0 {
-			if pending := c.pendingBytes.Add(-int64(n)); pending < 0 {
-				c.pendingBytes.Store(0)
-			}
+			c.subPending(int64(n))
 			left := n
 			for c.sendHead < len(c.sends) {
 				item := &c.sends[c.sendHead]
@@ -1027,7 +1202,7 @@ func (c *Connection) flushOutput() error {
 					break
 				}
 				left -= remaining
-				c.sends[c.sendHead] = sendItem{}
+				c.releaseItemLocked(item)
 				c.sendHead++
 			}
 			if n < attempted {
