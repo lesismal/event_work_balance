@@ -33,6 +33,13 @@ const (
 	// the task queue; beyond this many events per wait the loop just calls
 	// epoll_wait again, so a larger buffer only costs memory per server.
 	maxWaitBatch = 1024
+	// connPageShift sizes one page of the descriptor table. 4096 entries is
+	// 32KB per page, small enough that a server holding few connections in a
+	// wide descriptor range wastes little, large enough that the page
+	// directory stays tiny.
+	connPageShift = 12
+	connPageSize  = 1 << connPageShift
+	connPageMask  = connPageSize - 1
 	// defaultWriteHighWatermark is the per-connection outbound budget. It is
 	// one read round's worth of replies, which is the size that balances the
 	// two costs either side of it. Lower, and ordinary traffic crosses it on
@@ -252,11 +259,32 @@ func (c *Connection) resetQueueLocked() {
 // outsized buffer is dropped instead so that one large message does not leave
 // every pooled buffer permanently inflated. Callers hold c.mu.
 func (c *Connection) releaseItemLocked(item *sendItem) {
-	if item.buf != nil && cap(item.buf.data) <= c.server.retainedSendBuffer {
-		item.buf.data = item.buf.data[:0]
-		c.server.sendBufferPool.Put(item.buf)
+	if item.buf != nil {
+		c.server.releaseSendBuffer(item.buf)
 	}
 	*item = sendItem{}
+}
+
+// acquireSendBuffer returns a pooled outbound buffer.
+//
+// One size for every buffer is deliberate. Sizing buffers to the backlog was
+// measured twice and helped neither: a 4KB class left 736MB of buffers about a
+// third full, and stepping down to 1KB classes made it worse still at 1181MB,
+// because several pools each retain their own idle buffers. Resident peak did
+// not move for any of them, so the bound that matters is MaxPendingBytes, not
+// the shape of the buffers underneath it.
+func (s *Server) acquireSendBuffer() *sendBuffer {
+	return s.sendBufferPool.Get().(*sendBuffer)
+}
+
+// releaseSendBuffer hands a buffer back. One larger than the retention limit is
+// dropped, so that a single big message cannot leave every pooled buffer
+// permanently inflated.
+func (s *Server) releaseSendBuffer(b *sendBuffer) {
+	if cap(b.data) <= s.retainedSendBuffer {
+		b.data = b.data[:0]
+		s.sendBufferPool.Put(b)
+	}
 }
 
 // queueLocked copies the parts into the send queue. Consecutive chunks merge
@@ -285,7 +313,7 @@ func (c *Connection) queueLocked(first, second []byte) {
 		// Nothing is queued any more, so the item slice can start over.
 		c.rewindQueueLocked()
 	}
-	buf := c.server.sendBufferPool.Get().(*sendBuffer)
+	buf := c.server.acquireSendBuffer()
 	buf.data = append(append(buf.data[:0], first...), second...)
 	c.sends = append(c.sends, sendItem{data: buf.data, buf: buf})
 }
@@ -487,11 +515,19 @@ type Server struct {
 	commands                  *commandBatch
 	commandPool               sync.Pool
 	wakePending               atomic.Bool
-	// connections is indexed by file descriptor rather than keyed by token: a
-	// descriptor is a small dense integer the kernel already allocates, so the
-	// lookup on every epoll event becomes a bounds check instead of a hash.
+	// connections is a paged table indexed by file descriptor: a descriptor is
+	// a small dense integer the kernel already allocates, so the lookup on
+	// every epoll event is two bounds checks rather than a hash.
+	//
+	// It is paged rather than flat because descriptors are handed out per
+	// process while this table is per server. A process running one server per
+	// listening port sees every server's descriptors drawn from one
+	// interleaved range, so a flat table would grow to the highest descriptor
+	// in the process no matter how few connections this server holds, and
+	// doubling its way there copied 102MB across a 100k-connection dial.
+	// Pages are allocated once, on demand, and never copied.
 	// Event-loop ownership.
-	connections []*Connection
+	connections [][]*Connection
 	// budgetPaused holds connections whose reads the server-wide budget stopped,
 	// waiting to be resumed once it recovers. Event-loop ownership.
 	budgetPaused []*Connection
@@ -511,10 +547,15 @@ type Server struct {
 // reused descriptor never resolves to the connection that previously held it.
 func (s *Server) connectionFor(token uint64) *Connection {
 	fd := int(uint32(token))
-	if fd < 0 || fd >= len(s.connections) {
+	page := fd >> connPageShift
+	if page < 0 || page >= len(s.connections) {
 		return nil
 	}
-	c := s.connections[fd]
+	entries := s.connections[page]
+	if entries == nil {
+		return nil
+	}
+	c := entries[fd&connPageMask]
 	if c == nil || c.token != token {
 		return nil
 	}
@@ -524,13 +565,19 @@ func (s *Server) connectionFor(token uint64) *Connection {
 // trackConnection records a newly accepted connection, growing the descriptor
 // table to cover it. Callers run on the event loop.
 func (s *Server) trackConnection(fd int, c *Connection) {
-	if fd >= len(s.connections) {
-		grown := max(fd+1, 2*len(s.connections))
-		table := make([]*Connection, grown)
-		copy(table, s.connections)
-		s.connections = table
+	page := fd >> connPageShift
+	if page >= len(s.connections) {
+		// Only the page directory is ever copied, and it holds one pointer per
+		// 4096 descriptors, so growing it stays cheap however high descriptors
+		// climb.
+		directory := make([][]*Connection, max(page+1, 2*len(s.connections)))
+		copy(directory, s.connections)
+		s.connections = directory
 	}
-	s.connections[fd] = c
+	if s.connections[page] == nil {
+		s.connections[page] = make([]*Connection, connPageSize)
+	}
+	s.connections[page][fd&connPageMask] = c
 }
 
 func Bind(config Config, handler Handler) (*Server, error) {
@@ -730,9 +777,11 @@ func (s *Server) Close() error {
 		s.taskWG.Wait()
 		s.releaseTaskPool()
 		s.drainCommands()
-		for _, c := range s.connections {
-			if c != nil {
-				s.closeConnection(c, nil, false)
+		for _, entries := range s.connections {
+			for _, c := range entries {
+				if c != nil {
+					s.closeConnection(c, nil, false)
+				}
 			}
 		}
 		s.budgetPaused = nil
@@ -958,8 +1007,10 @@ func (s *Server) closeConnection(c *Connection, closeErr error, callback bool) {
 		_ = syscall.EpollCtl(s.epollFD, syscall.EPOLL_CTL_DEL, fd, nil)
 		_ = syscall.Close(fd)
 	}
-	if fd >= 0 && fd < len(s.connections) && s.connections[fd] == c {
-		s.connections[fd] = nil
+	if page := fd >> connPageShift; fd >= 0 && page < len(s.connections) {
+		if entries := s.connections[page]; entries != nil && entries[fd&connPageMask] == c {
+			entries[fd&connPageMask] = nil
+		}
 	}
 	if callback {
 		s.handler.OnClose(c, closeErr)

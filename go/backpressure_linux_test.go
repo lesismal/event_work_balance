@@ -279,37 +279,90 @@ func TestConnectionForRejectsStaleToken(t *testing.T) {
 	}
 }
 
-// Chunks queued behind an undrained item must merge into that item's buffer
+// Chunks queued behind an undrained item must pack into that item's buffer
 // rather than each taking one of their own. Before this, a connection under
 // backpressure allocated a fresh array per reply, which is what made a
-// 100k-connection rate test hold gigabytes.
-func TestQueuedChunksMergeIntoOneBuffer(t *testing.T) {
+// 100k-connection rate test hold gigabytes. Packing stops at the buffer's
+// capacity rather than growing past it, so what a connection holds tracks what
+// it has actually queued instead of a full round's worth apiece.
+func TestQueuedChunksPackIntoPooledBuffers(t *testing.T) {
 	server := newOfflineServer(t)
 	c := &Connection{token: 1, server: server}
 	c.fd.Store(-1)
 
 	chunk := bytes.Repeat([]byte{'z'}, 1024)
+	const chunks = 16
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for i := 0; i < 16; i++ {
+	for i := 0; i < chunks; i++ {
 		c.queueLocked(chunk, nil)
 	}
-	if len(c.sends) != 1 {
-		t.Fatalf("queue holds %d items, want the chunks merged into 1", len(c.sends))
+
+	// Every item must carry a pooled buffer, hold no more than it, and be
+	// filled before the next one starts: that is what makes the footprint
+	// proportional to the backlog.
+	queued := 0
+	for i := range c.sends {
+		item := &c.sends[i]
+		if item.buf == nil {
+			t.Fatalf("item %d has no pooled buffer to return", i)
+		}
+		if len(item.data) > cap(item.buf.data) {
+			t.Fatalf("item %d holds %d bytes in a buffer of %d", i, len(item.data), cap(item.buf.data))
+		}
+		if i < len(c.sends)-1 && len(item.data)+len(chunk) <= cap(item.buf.data) {
+			t.Fatalf("item %d holds %d of %d bytes; another chunk still fit",
+				i, len(item.data), cap(item.buf.data))
+		}
+		queued += len(item.data)
 	}
-	if got, want := len(c.sends[0].data), 16*len(chunk); got != want {
-		t.Fatalf("merged item holds %d bytes, want %d", got, want)
+	if want := chunks * len(chunk); queued != want {
+		t.Fatalf("queue holds %d bytes, want %d", queued, want)
 	}
-	if c.sends[0].buf == nil {
-		t.Fatal("merged item has no pooled buffer to return")
+	// The whole round still reaches the socket in one writev.
+	if len(c.sends) > maxWritevItems {
+		t.Fatalf("queue holds %d items, more than one writev takes (%d)", len(c.sends), maxWritevItems)
 	}
 
-	// Once the socket has consumed part of the item, merging into it would
-	// disturb the write in progress, so the next chunk takes its own buffer.
-	c.sends[0].offset = 1
+	// Once the socket has consumed part of the trailing item, packing into it
+	// would disturb the write in progress, so the next chunk starts a new one.
+	before := len(c.sends)
+	c.sends[before-1].offset = 1
 	c.queueLocked(chunk, nil)
-	if len(c.sends) != 2 {
-		t.Fatalf("queue holds %d items, want a second item for the partially written one", len(c.sends))
+	if len(c.sends) != before+1 {
+		t.Fatalf("queue holds %d items, want %d: a partially written item must not be packed into",
+			len(c.sends), before+1)
+	}
+}
+
+// Queued bytes, not buffer capacity, are what bounds this server's outbound
+// memory. Sizing buffers to the backlog was tried and measured twice without
+// moving the resident peak, so what the pool owes is simply that every buffer
+// it hands out can hold a full round and comes back reusable.
+func TestPooledSendBuffersHoldAFullRound(t *testing.T) {
+	server := newOfflineServer(t)
+	buf := server.acquireSendBuffer()
+	if cap(buf.data) < server.retainedSendBuffer {
+		t.Fatalf("pooled buffer holds %d bytes, want a full round of %d",
+			cap(buf.data), server.retainedSendBuffer)
+	}
+	if len(buf.data) != 0 {
+		t.Fatalf("pooled buffer came back holding %d bytes", len(buf.data))
+	}
+
+	// A chunk larger than a round still lands in one item, so a big message is
+	// never split across buffers.
+	c := &Connection{token: 1, server: server}
+	c.fd.Store(-1)
+	big := bytes.Repeat([]byte{'y'}, server.retainedSendBuffer*2)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.queueLocked(big, nil)
+	if len(c.sends) != 1 {
+		t.Fatalf("one large chunk produced %d items, want 1", len(c.sends))
+	}
+	if got := cap(c.sends[0].buf.data); got < len(big) {
+		t.Fatalf("large chunk took a buffer of %d, want at least %d", got, len(big))
 	}
 }
 
@@ -373,7 +426,7 @@ func TestOutsizedSendBufferIsDropped(t *testing.T) {
 		t.Fatal("released item still references its buffer")
 	}
 	// The pool must not be holding the oversized array: a fresh Get should come
-	// back with a small one.
+	// back with a buffer of the ordinary size.
 	got := server.sendBufferPool.Get().(*sendBuffer)
 	if cap(got.data) > server.retainedSendBuffer {
 		t.Fatalf("pool returned a buffer of cap %d, want at most %d", cap(got.data), server.retainedSendBuffer)
