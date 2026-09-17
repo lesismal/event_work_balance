@@ -4,12 +4,15 @@ package websocket
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha1"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net"
 	stdhttp "net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -213,4 +216,158 @@ func BenchmarkServerEcho1KiB(b *testing.B) {
 	}
 	wg.Wait()
 	b.StopTimer()
+}
+
+// dialWebSocket opens a connection and completes the handshake, returning the
+// connection and the buffered reader the handshake response was read through.
+// Anything the server sends afterwards has to be read through that reader,
+// since it may already hold the first bytes of it.
+func dialWebSocket(t *testing.T, addr string) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp4", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	key := base64.StdEncoding.EncodeToString([]byte("0123456789abcdef"))
+	request := "GET /chat HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n" +
+		"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " + key + "\r\n\r\n"
+	if _, err = io.WriteString(conn, request); err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(conn)
+	response, err := stdhttp.ReadResponse(reader, &stdhttp.Request{Method: stdhttp.MethodGet})
+	if err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	if response.StatusCode != stdhttp.StatusSwitchingProtocols {
+		conn.Close()
+		t.Fatalf("handshake status = %d, want %d", response.StatusCode, stdhttp.StatusSwitchingProtocols)
+	}
+	return conn, reader
+}
+
+// A peer that only ever sends must not be able to make the server read without
+// limit. Its replies cannot leave, so they queue; once that queue crosses the
+// write watermark the server has to stop reading this connection and let the
+// backlog push back through TCP to the peer itself. Reading on regardless is
+// what turns one silent peer into unbounded memory on the server.
+//
+// The pause is only correct if it is a pause, so the test carries on past it:
+// once the peer starts reading, the server has to pick its connection back up
+// on its own.
+func TestReadsPauseForPeerThatNeverReadsAndResumeWhenItDoes(t *testing.T) {
+	const (
+		watermark   = 64 << 10
+		payloadSize = 8 << 10
+		// Far more than the watermark and both kernel socket buffers together,
+		// so reaching it means nothing ever stopped the server reading.
+		maxWrite = 64 << 20
+	)
+	var received atomic.Int64
+	handler := NewHandler(HandlerFuncs{
+		Message: func(c *Connection, opcode Opcode, payload []byte) {
+			received.Add(int64(len(payload)))
+			if err := c.WriteMessage(opcode, payload); err != nil {
+				_ = c.Close(CloseInternalError, "write failed")
+			}
+		},
+	})
+	config := epoll.DefaultConfig()
+	config.Addr = "127.0.0.1:0"
+	config.WriteBufferHighWatermark = watermark
+	// Leave the server-wide budget off, so the per-connection watermark is the
+	// only thing that can stop these reads.
+	config.MaxPendingBytes = 0
+	server, err := epoll.Bind(config, handler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := server.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- server.Run() }()
+	defer func() {
+		server.Stop()
+		<-runDone
+		_ = server.Close()
+	}()
+
+	conn, reader := dialWebSocket(t, addr.String())
+	defer conn.Close()
+
+	// Send, and never read. Every reply the server produces stays in its queue
+	// and in the socket buffers between the two.
+	frame := clientFrame(Binary, true, bytes.Repeat([]byte{'x'}, payloadSize))
+	written := 0
+	blocked := false
+	for written < maxWrite {
+		if err = conn.SetWriteDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		n, writeErr := conn.Write(frame)
+		written += n
+		if writeErr == nil {
+			continue
+		}
+		var netErr net.Error
+		if errors.As(writeErr, &netErr) && netErr.Timeout() {
+			blocked = true
+			break
+		}
+		t.Fatalf("after %d bytes: %v", written, writeErr)
+	}
+	if !blocked {
+		t.Fatalf("wrote %d bytes without ever blocking: the server never stopped reading", written)
+	}
+	if received.Load() == 0 {
+		t.Fatal("the server read nothing at all; the test never exercised the pause")
+	}
+
+	// Blocked on write means the pushback reached this end, so the server is
+	// not reading this connection any more. It must stay that way while the
+	// peer keeps ignoring its replies.
+	paused := received.Load()
+	time.Sleep(500 * time.Millisecond)
+	if grown := received.Load(); grown != paused {
+		t.Fatalf("server read %d more bytes while the peer was not reading, want the reads to stay paused",
+			grown-paused)
+	}
+
+	// Now drain. The replies leave, the queue falls back under the watermark,
+	// and the server has to resume reading what the peer already sent.
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		buf := make([]byte, 32<<10)
+		for {
+			select {
+			case <-drainDone:
+				return
+			default:
+			}
+			if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+				return
+			}
+			if _, err := reader.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for received.Load() == paused && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	conn.Close()
+	<-drainDone
+	if resumed := received.Load(); resumed == paused {
+		t.Fatalf("server read nothing more after the peer drained %d bytes of replies; the pause never lifted", paused)
+	}
 }
