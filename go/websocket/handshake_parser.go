@@ -165,7 +165,7 @@ type handshakeRequest struct {
 }
 
 func parseRequestURI(dst *url.URL, requestURI string) error {
-	if strings.HasPrefix(requestURI, "/") && strings.IndexAny(requestURI, "%#\r\n\t ") < 0 {
+	if strings.HasPrefix(requestURI, "/") && !strings.ContainsAny(requestURI, "%#\r\n\t ") {
 		path, query, _ := strings.Cut(requestURI, "?")
 		dst.Path = path
 		dst.RawQuery = query

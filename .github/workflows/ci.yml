@@ -1,0 +1,156 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (gofmt / vet / staticcheck)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: go/go.mod
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@latest
+      # The engine is split per OS, so vet and staticcheck run once per target.
+      - name: go vet
+        run: |
+          for goos in linux darwin windows freebsd; do
+            echo "::group::GOOS=$goos"
+            GOOS=$goos go vet ./...
+            echo "::endgroup::"
+          done
+      - name: staticcheck
+        run: |
+          for goos in linux darwin windows; do
+            echo "::group::GOOS=$goos"
+            GOOS=$goos "$(go env GOPATH)/bin/staticcheck" ./...
+            echo "::endgroup::"
+          done
+
+  test:
+    name: Test (${{ matrix.os }}, Go ${{ matrix.go }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go: ['1.22.x', stable]
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: go/go.mod
+      - name: Build
+        run: go build ./...
+      - name: Test
+        run: go test -race -count=1 -timeout 10m ./...
+
+  cross-build:
+    name: Cross build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: go/go.mod
+      - name: Build all targets
+        working-directory: go
+        run: |
+          # freebsd exercises the portable fallback engine.
+          for target in \
+            linux/amd64 linux/arm64 linux/arm linux/riscv64 linux/loong64 \
+            darwin/amd64 darwin/arm64 \
+            windows/amd64 windows/arm64 windows/386 \
+            freebsd/amd64; do
+            echo "building $target"
+            GOOS=${target%/*} GOARCH=${target#*/} go build ./...
+          done
+
+  c:
+    name: C (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make -C c CC=${{ matrix.cc }} CFLAGS="-O2 -g -std=c11 -Wall -Wextra -Wpedantic -Werror"
+      - name: Integration test
+        run: make -C c test CC=${{ matrix.cc }}
+
+  autobahn:
+    name: Autobahn WebSocket (ws://)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: go/go.mod
+      - name: Build echo server
+        working-directory: go
+        run: go build -o "$RUNNER_TEMP/websocket_server" ./examples/websocket_server
+      - name: Start echo server
+        run: |
+          "$RUNNER_TEMP/websocket_server" -addr 127.0.0.1:9001 > "$RUNNER_TEMP/server.log" 2>&1 &
+          for _ in $(seq 50); do
+            nc -z 127.0.0.1 9001 && exit 0
+            sleep 0.2
+          done
+          echo "server did not start"
+          cat "$RUNNER_TEMP/server.log"
+          exit 1
+      # permessage-deflate (cases 12.* and 13.*) is not implemented and is
+      # excluded in fuzzingclient.json. TLS is not covered.
+      - name: Run fuzzingclient
+        run: |
+          mkdir -p reports
+          docker run --rm --network host \
+            -v "$PWD/.github/autobahn:/config" \
+            -v "$PWD/reports:/reports" \
+            crossbario/autobahn-testsuite \
+            wstest -m fuzzingclient -s /config/fuzzingclient.json
+      - name: Check results
+        run: python3 .github/autobahn/check_report.py reports/servers/index.json
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autobahn-report
+          path: reports/servers
+          if-no-files-found: ignore

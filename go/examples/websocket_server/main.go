@@ -3,6 +3,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	stdhttp "net/http"
 
@@ -11,6 +12,9 @@ import (
 )
 
 func main() {
+	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
+	flag.Parse()
+
 	handler := websocket.NewHandler(websocket.HandlerFuncs{
 		Open: func(_ *websocket.Connection, request *stdhttp.Request) {
 			fmt.Printf("WebSocket opened: %s\n", request.RemoteAddr)
@@ -25,13 +29,13 @@ func main() {
 		},
 	})
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:8080"
+	config.Addr = *addr
 	server, err := fib.Bind(config, handler)
 	if err != nil {
 		panic(err)
 	}
 	defer server.Close()
-	fmt.Println("WebSocket echo server listening on ws://127.0.0.1:8080")
+	fmt.Printf("WebSocket echo server listening on ws://%s\n", config.Addr)
 	if err := server.Run(); err != nil {
 		panic(err)
 	}
