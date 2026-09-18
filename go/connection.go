@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin || windows
 
 package fib
 
@@ -28,26 +28,28 @@ type connectionAttachment struct{ value any }
 
 // Connection is safe to use from callback and application goroutines.
 type Connection struct {
-	fd             atomic.Int32
-	token          uint64
-	engine         *Engine
-	mu             sync.Mutex
-	pendingEvents  uint32
-	sends          []sendItem
-	sendHead       int
-	scheduled      bool
-	closing        bool
-	closed         bool
-	readPaused     bool
-	budgetPaused   bool
+	connPlatform
+	engine        *Engine
+	mu            sync.Mutex
+	pendingEvents uint32
+	sends         []sendItem
+	sendHead      int
+	scheduled     bool
+	closing       bool
+	closed        bool
+	readPaused    bool
+	budgetPaused  bool
+	// readStalled records that a read round stopped with bytes possibly
+	// still in the socket, because the write backlog filled up first. Those
+	// bytes raise no further edge on their own, so the event loop owes the
+	// connection either a paused-then-resumed read or a direct redelivery.
+	readStalled    bool
 	flushing       bool
 	corked         bool
 	closeAfterSend bool
 	pendingBytes   atomic.Int64
 	attachment     atomic.Pointer[connectionAttachment]
 }
-
-func (c *Connection) FD() int { return int(c.fd.Load()) }
 
 // Attachment returns application state associated with the connection.
 func (c *Connection) Attachment() any {
@@ -253,13 +255,14 @@ func (c *Connection) send(data []byte, copyData bool) error {
 		return syscall.EPIPE
 	}
 	sent := 0
-	if c.canWriteDirectlyLocked() {
+	direct := c.canWriteDirectlyLocked()
+	if direct {
 		for {
-			n, err := syscall.Write(c.FD(), data)
+			n, err := c.sysWrite(data)
 			if err == syscall.EINTR {
 				continue
 			}
-			if err != nil && err != syscall.EAGAIN && err != syscall.EWOULDBLOCK {
+			if err != nil && !isWouldBlock(err) {
 				c.mu.Unlock()
 				c.closeWithError(err)
 				return err
@@ -281,11 +284,19 @@ func (c *Connection) send(data []byte, copyData bool) error {
 		c.queueOwnedLocked(queued)
 	}
 	c.addPending(int64(len(queued)))
-	// EPOLLOUT stays armed, so queueing alone needs no epoll change; only a
-	// watermark crossing does. While corked the flush at the end of the read
-	// round settles the read interest instead.
+	// Write interest stays armed, so queueing alone needs no registration
+	// change; only a watermark crossing does. While corked the flush at the end
+	// of the read round settles the read interest instead.
+	var armErr error
+	if direct {
+		armErr = c.awaitWritableLocked()
+	}
 	refresh := !c.corked && c.pauseStateChangedLocked()
 	c.mu.Unlock()
+	if armErr != nil {
+		c.closeWithError(armErr)
+		return armErr
+	}
 	if refresh {
 		c.engine.request(command{kind: commandRefresh, connection: c})
 	}
@@ -305,13 +316,14 @@ func (c *Connection) SendParts(first, second []byte) error {
 		return syscall.EPIPE
 	}
 	sent := 0
-	if c.canWriteDirectlyLocked() {
+	direct := c.canWriteDirectlyLocked()
+	if direct {
 		for {
-			n, err := writev2(c.FD(), first, second)
+			n, err := c.sysWrite2(first, second)
 			if err == syscall.EINTR {
 				continue
 			}
-			if err != nil && err != syscall.EAGAIN && err != syscall.EWOULDBLOCK {
+			if err != nil && !isWouldBlock(err) {
 				c.mu.Unlock()
 				c.closeWithError(err)
 				return err
@@ -332,8 +344,16 @@ func (c *Connection) SendParts(first, second []byte) error {
 		c.queueLocked(second[sent-len(first):], nil)
 	}
 	c.addPending(int64(total - sent))
+	var armErr error
+	if direct {
+		armErr = c.awaitWritableLocked()
+	}
 	refresh := !c.corked && c.pauseStateChangedLocked()
 	c.mu.Unlock()
+	if armErr != nil {
+		c.closeWithError(armErr)
+		return armErr
+	}
 	if refresh {
 		c.engine.request(command{kind: commandRefresh, connection: c})
 	}
@@ -362,8 +382,8 @@ func (c *Connection) process() {
 	}()
 	// deferred carries readiness that this round observed but did not act on
 	// because output was still queued. It is folded back into pendingEvents
-	// before the next round so the notification is never lost: epoll is
-	// edge-triggered, so a dropped EPOLLIN would only reappear once the peer
+	// before the next round so the notification is never lost: readiness is
+	// edge-triggered, so a dropped read edge would only reappear once the peer
 	// sent more data, leaving readable bytes stranded on a connection that
 	// looks idle.
 	var deferred uint32
@@ -372,8 +392,8 @@ func (c *Connection) process() {
 		c.pendingEvents |= deferred
 		if c.pendingEvents == deferred {
 			// Only the deferred readiness remains. Stop here instead of spinning:
-			// the next EPOLLOUT resubmits the connection, flushOutput runs first,
-			// and drainInput follows once the queue is empty.
+			// the next write edge resubmits the connection, flushOutput runs
+			// first, and drainInput follows once the queue is empty.
 			c.scheduled = false
 			c.mu.Unlock()
 			return
@@ -389,30 +409,33 @@ func (c *Connection) process() {
 		// space and delivers new input never reads while output is still
 		// queued behind it. This keeps userspace buffering bounded by what the
 		// peer is willing to accept instead of what it is willing to send.
-		if alive && events&syscall.EPOLLOUT != 0 && c.hasQueuedOutput() {
+		if alive && events&evOut != 0 && c.hasQueuedOutput() {
 			closeErr = c.flushOutput()
 			alive = closeErr == nil
 		}
-		if alive && events&syscall.EPOLLPRI != 0 {
+		if alive && events&evPri != 0 {
 			closeErr = c.drainPriorityInput()
 			alive = closeErr == nil
 		}
-		if alive && events&syscall.EPOLLIN != 0 {
+		if alive && events&evIn != 0 {
 			if c.hasQueuedOutput() {
-				// Queued output means EPOLLOUT interest is registered or a flush
-				// requested it, so a later round is guaranteed. Carry the read,
+				// Queued output means write interest is armed or a write is in
+				// flight, so a later round is guaranteed. Carry the read,
 				// and any half-close that arrived with it, into that round so
 				// the peer's final bytes are still delivered after the flush.
-				deferred = syscall.EPOLLIN | events&syscall.EPOLLRDHUP
+				deferred = evIn | events&evRdHup
 			} else {
 				closeErr = c.drainInput()
 				alive = closeErr == nil
+				if alive {
+					c.rearmRead()
+				}
 			}
 		}
-		if alive && events&syscall.EPOLLERR != 0 {
+		if alive && events&evErr != 0 {
 			closeErr = c.socketError()
 			alive = false
-		} else if alive && events&(syscall.EPOLLHUP|syscall.EPOLLRDHUP)&^deferred != 0 {
+		} else if alive && events&(evHup|evRdHup)&^deferred != 0 {
 			closeErr = io.EOF
 			alive = false
 		}
@@ -438,6 +461,7 @@ func (c *Connection) hasQueuedOutput() bool {
 func (c *Connection) drainInput() error {
 	c.mu.Lock()
 	c.corked = true
+	c.readStalled = false
 	c.mu.Unlock()
 	err := c.readLoop()
 	if flushErr := c.uncork(); err == nil {
@@ -477,7 +501,7 @@ func (c *Connection) readLoop() error {
 	buf := buffer.data
 	defer c.engine.readBufferPool.Put(buffer)
 	for {
-		n, err := syscall.Read(c.FD(), buf)
+		n, err := c.sysRead(buf)
 		if n > 0 {
 			c.engine.handler.OnData(c, buf[:n])
 			if c.overWriteWatermark() {
@@ -491,9 +515,18 @@ func (c *Connection) readLoop() error {
 					return flushErr
 				}
 				if c.overWriteWatermark() {
-					// The peer is behind. Stop reading; the flush has already
-					// asked the loop to pause reads until the queue drains,
-					// and re-arming EPOLLIN then redelivers what is left.
+					// The peer is behind. Stop reading and let the event loop
+					// decide what happens to the bytes left behind: it pauses
+					// reads, and re-arming them later redelivers what is left,
+					// or, if the backlog has drained by the time it looks,
+					// hands the read straight back. Without the stall mark a
+					// backlog that drains before the loop gets there leaves
+					// nothing to re-arm, and the bytes sit unread until the
+					// peer happens to send more.
+					c.mu.Lock()
+					c.readStalled = true
+					c.mu.Unlock()
+					c.engine.request(command{kind: commandRefresh, connection: c})
 					return nil
 				}
 				c.mu.Lock()
@@ -514,7 +547,7 @@ func (c *Connection) readLoop() error {
 		if err == syscall.EINTR {
 			continue
 		}
-		if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+		if isWouldBlock(err) {
 			return nil
 		}
 		return err
@@ -524,7 +557,7 @@ func (c *Connection) readLoop() error {
 func (c *Connection) drainPriorityInput() error {
 	buf := []byte{0}
 	for {
-		n, _, err := syscall.Recvfrom(c.FD(), buf, syscall.MSG_OOB)
+		n, err := c.sysRecvOOB(buf)
 		if n > 0 {
 			c.engine.handler.OnPriorityData(c, buf[:n])
 			continue
@@ -535,7 +568,7 @@ func (c *Connection) drainPriorityInput() error {
 		if err == syscall.EINTR {
 			continue
 		}
-		if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK || err == syscall.EINVAL {
+		if isWouldBlock(err) || err == syscall.EINVAL {
 			return nil
 		}
 		return err
@@ -544,7 +577,7 @@ func (c *Connection) drainPriorityInput() error {
 
 func (c *Connection) flushOutput() error {
 	c.mu.Lock()
-	if c.closing || c.closed || c.flushing {
+	if c.closing || c.closed || c.flushing || c.writeBusyLocked() {
 		usable := !c.closing && !c.closed
 		c.mu.Unlock()
 		if usable {
@@ -587,11 +620,11 @@ func (c *Connection) flushOutput() error {
 				buffers[i] = item.data[item.offset:]
 				attempted += len(buffers[i])
 			}
-			n, err = writev(c.FD(), buffers)
+			n, err = c.sysWritev(buffers)
 		} else {
 			item := c.sends[c.sendHead]
 			attempted = len(item.data) - item.offset
-			n, err = syscall.Write(c.FD(), item.data[item.offset:])
+			n, err = c.sysWrite(item.data[item.offset:])
 		}
 		if n > 0 {
 			c.subPending(int64(n))
@@ -609,10 +642,15 @@ func (c *Connection) flushOutput() error {
 			}
 			if n < attempted {
 				// A short write means the socket send buffer is full, so
-				// retrying now would only earn an EAGAIN. Wait for EPOLLOUT.
+				// retrying now would only earn an EAGAIN. Wait for the socket
+				// to become writable again.
 				c.flushing = false
+				armErr := c.awaitWritableLocked()
 				refresh := c.pauseStateChangedLocked()
 				c.mu.Unlock()
+				if armErr != nil {
+					return armErr
+				}
 				if refresh {
 					c.engine.request(command{kind: commandRefresh, connection: c})
 				}
@@ -626,25 +664,19 @@ func (c *Connection) flushOutput() error {
 			continue
 		}
 		c.flushing = false
-		refresh := c.pauseStateChangedLocked()
-		c.mu.Unlock()
-		if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+		if isWouldBlock(err) {
+			armErr := c.awaitWritableLocked()
+			refresh := c.pauseStateChangedLocked()
+			c.mu.Unlock()
+			if armErr != nil {
+				return armErr
+			}
 			if refresh {
 				c.engine.request(command{kind: commandRefresh, connection: c})
 			}
 			return nil
 		}
+		c.mu.Unlock()
 		return err
 	}
-}
-
-func (c *Connection) socketError() error {
-	errno, err := syscall.GetsockoptInt(c.FD(), syscall.SOL_SOCKET, syscall.SO_ERROR)
-	if err != nil {
-		return err
-	}
-	if errno != 0 {
-		return syscall.Errno(errno)
-	}
-	return syscall.ECONNRESET
 }

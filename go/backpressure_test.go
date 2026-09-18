@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin || windows
 
 package fib
 
@@ -158,126 +158,6 @@ func TestBudgetPausedConnectionResumes(t *testing.T) {
 	}
 }
 
-// Descriptors are recycled by the kernel, and the connection table is indexed
-// by descriptor. A new connection landing on a closed one's descriptor must be
-// reached by its own events, and must not inherit anything from its predecessor.
-func TestRecycledDescriptorGetsFreshConnection(t *testing.T) {
-	var mu sync.Mutex
-	tokensByFD := map[int][]uint64{}
-	config := DefaultConfig()
-	_, addr := startEchoServer(t, config, HandlerFuncs{
-		Open: func(c *Connection) {
-			mu.Lock()
-			tokensByFD[c.FD()] = append(tokensByFD[c.FD()], c.token)
-			mu.Unlock()
-		},
-		Data: func(c *Connection, b []byte) {
-			if err := c.Send(b); err != nil {
-				c.Close()
-			}
-		},
-	})
-
-	// Serially open, use and close connections. Closing each before opening the
-	// next makes the kernel hand the same descriptor back repeatedly.
-	payload := []byte("recycled")
-	reply := make([]byte, len(payload))
-	for i := 0; i < 24; i++ {
-		conn, err := net.DialTimeout("tcp4", addr, 5*time.Second)
-		if err != nil {
-			t.Fatalf("dial %d: %v", i, err)
-		}
-		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-		if _, err := conn.Write(payload); err != nil {
-			t.Fatalf("write %d: %v", i, err)
-		}
-		if _, err := io.ReadFull(conn, reply); err != nil {
-			t.Fatalf("read %d: %v", i, err)
-		}
-		if !bytes.Equal(reply, payload) {
-			t.Fatalf("round %d: echo mismatch", i)
-		}
-		if err := conn.Close(); err != nil {
-			t.Fatalf("close %d: %v", i, err)
-		}
-		// Give the loop a moment to process the close before the next dial, so
-		// the descriptor is actually free to be reused.
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	reused := false
-	for fd, tokens := range tokensByFD {
-		if len(tokens) > 1 {
-			reused = true
-		}
-		seen := map[uint64]bool{}
-		for _, token := range tokens {
-			if seen[token] {
-				t.Fatalf("descriptor %d handed out token %d twice", fd, token)
-			}
-			seen[token] = true
-			if int(uint32(token)) != fd {
-				t.Fatalf("token %d does not encode descriptor %d", token, fd)
-			}
-		}
-	}
-	if !reused {
-		t.Skip("kernel never recycled a descriptor; nothing was exercised")
-	}
-}
-
-// A stale token must not resolve, even to a live connection on the same
-// descriptor. This is what the generation half of the token buys.
-//
-// The lookups run inside OnOpen because the connection table belongs to the
-// event loop; checking it from the test goroutine would be the race it is
-// meant to rule out.
-func TestConnectionForRejectsStaleToken(t *testing.T) {
-	type failure struct{ msg string }
-	checked := make(chan failure, 1)
-	config := DefaultConfig()
-	_, addr := startEchoServer(t, config, HandlerFuncs{Open: func(c *Connection) {
-		// Reach the server through the connection rather than through a
-		// variable the test goroutine is still assigning.
-		server := c.engine
-		report := func(msg string) {
-			select {
-			case checked <- failure{msg}:
-			default:
-			}
-		}
-		switch {
-		case server.connectionFor(c.token) != c:
-			report("connectionFor(live token) did not return the live connection")
-		// Same descriptor, different generation.
-		case server.connectionFor(c.token^(1<<32)) != nil:
-			report("connectionFor(stale token) resolved to a connection")
-		// A descriptor past the end of the table must not panic.
-		case server.connectionFor(uint64(uint32(len(server.connections)+100))) != nil:
-			report("connectionFor(out-of-range descriptor) resolved to a connection")
-		default:
-			report("")
-		}
-	}})
-
-	conn, err := net.DialTimeout("tcp4", addr, 5*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-
-	select {
-	case got := <-checked:
-		if got.msg != "" {
-			t.Fatal(got.msg)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("server never registered the connection")
-	}
-}
-
 // Chunks queued behind an undrained item must pack into that item's buffer
 // rather than each taking one of their own. Before this, a connection under
 // backpressure allocated a fresh array per reply, which is what made a
@@ -286,8 +166,7 @@ func TestConnectionForRejectsStaleToken(t *testing.T) {
 // it has actually queued instead of a full round's worth apiece.
 func TestQueuedChunksPackIntoPooledBuffers(t *testing.T) {
 	server := newOfflineServer(t)
-	c := &Connection{token: 1, engine: server}
-	c.fd.Store(-1)
+	c := newOfflineConnection(server)
 
 	chunk := bytes.Repeat([]byte{'z'}, 1024)
 	const chunks = 16
@@ -351,8 +230,7 @@ func TestPooledSendBuffersHoldAFullRound(t *testing.T) {
 
 	// A chunk larger than a round still lands in one item, so a big message is
 	// never split across buffers.
-	c := &Connection{token: 1, engine: server}
-	c.fd.Store(-1)
+	c := newOfflineConnection(server)
 	big := bytes.Repeat([]byte{'y'}, server.retainedSendBuffer*2)
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -369,8 +247,7 @@ func TestPooledSendBuffersHoldAFullRound(t *testing.T) {
 // only postpones the allocation to the next round.
 func TestDrainedItemReturnsBufferToPool(t *testing.T) {
 	server := newOfflineServer(t)
-	c := &Connection{token: 1, engine: server}
-	c.fd.Store(-1)
+	c := newOfflineConnection(server)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -413,8 +290,7 @@ func newOfflineServer(t *testing.T) *Engine {
 // every pooled buffer permanently inflated.
 func TestOutsizedSendBufferIsDropped(t *testing.T) {
 	server := newOfflineServer(t)
-	c := &Connection{token: 1, engine: server}
-	c.fd.Store(-1)
+	c := newOfflineConnection(server)
 	oversized := &sendBuffer{data: make([]byte, 0, server.retainedSendBuffer*2)}
 	item := sendItem{data: oversized.data, buf: oversized}
 	c.mu.Lock()

@@ -1,45 +1,24 @@
-//go:build linux
+//go:build linux || darwin || windows
 
 package fib
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"sync"
 	"sync/atomic"
-	"syscall"
 
 	"github.com/lesismal/fib/go/taskpool"
 )
 
 const (
-	// A token's low half is always a descriptor and its high half says what
-	// that descriptor is: one of the server's listeners, the wake-up eventfd,
-	// or a connection. For a connection the high half doubles as a generation,
-	// so an event left over from a descriptor's previous owner resolves to
-	// nothing. Tagging rather than reserving whole token values is what lets a
-	// server carry any number of listeners.
-	listenerKind = uint64(0)
-	wakeKind     = uint64(1)
-	// firstGeneration seeds the generation half of a connection token. Starting
-	// above the reserved kinds keeps every connection token distinct from a
-	// listener or wake token whatever descriptor it lands on.
-	firstGeneration = uint64(2)
-	maxWritevItems  = 64
-	// maxWaitBatch caps the epoll_wait output buffer. MaxEvents keeps sizing
-	// the task queue; beyond this many events per wait the loop just calls
-	// epoll_wait again, so a larger buffer only costs memory per server.
+	maxWritevItems = 64
+	// maxWaitBatch caps the buffer one wait for events fills. MaxEvents keeps
+	// sizing the task queue; beyond this many events per wait the loop just
+	// waits again, so a larger buffer only costs memory per server.
 	maxWaitBatch = 1024
-	// connPageShift sizes one page of the descriptor table. 4096 entries is
-	// 32KB per page, small enough that a server holding few connections in a
-	// wide descriptor range wastes little, large enough that the page
-	// directory stays tiny.
-	connPageShift = 12
-	connPageSize  = 1 << connPageShift
-	connPageMask  = connPageSize - 1
 	// defaultWriteHighWatermark is the per-connection outbound budget. It is
 	// one read round's worth of replies, which is the size that balances the
 	// two costs either side of it. Lower, and ordinary traffic crosses it on
@@ -53,10 +32,19 @@ const (
 	// bound that actually holds at high connection counts, where the
 	// per-connection watermark alone would admit gigabytes in aggregate.
 	defaultMaxPendingBytes = 64 << 20
-	epollET                = uint32(1 << 31)
-	baseEvents             = uint32(syscall.EPOLLIN|syscall.EPOLLPRI|syscall.EPOLLERR|
-		syscall.EPOLLHUP|syscall.EPOLLRDHUP) | epollET
-	allEvents = baseEvents | syscall.EPOLLOUT
+)
+
+// Readiness a connection accumulates between rounds. The values are epoll's,
+// so the Linux backend passes its events through untranslated; kqueue and IOCP
+// translate what they observe into the same bits.
+const (
+	evIn    uint32 = 0x1
+	evPri   uint32 = 0x2
+	evOut   uint32 = 0x4
+	evErr   uint32 = 0x8
+	evHup   uint32 = 0x10
+	evRdHup uint32 = 0x2000
+	evAll          = evIn | evPri | evOut | evErr | evHup | evRdHup
 )
 
 type commandType uint8
@@ -72,6 +60,48 @@ type command struct {
 	err        error
 }
 type commandBatch struct{ items []command }
+
+// Engine owns the listeners, the event loop, its command queue, and the worker
+// pool. The loop itself is platform code: epoll on Linux, kqueue on macOS and
+// an I/O completion port on Windows, each embedded here as enginePlatform.
+type Engine struct {
+	enginePlatform
+	maxEvents          int
+	useWritev          bool
+	inlineHandlers     bool
+	writeHighWatermark int
+	writeLowWatermark  int
+	maxPendingBytes    int64
+	budgetResumeBytes  int64
+	retainedSendBuffer int
+	handler            Handler
+	stopping           atomic.Bool
+	pendingTotal       atomic.Int64
+	// Backpressure counters, reported by Stats. They move only when a
+	// connection's read interest actually changes, which is rare by design.
+	readsPausedByWatermark atomic.Uint64
+	readsPausedByBudget    atomic.Uint64
+	readsResumed           atomic.Uint64
+	commandMu              sync.Mutex
+	commands               *commandBatch
+	commandPool            sync.Pool
+	wakePending            atomic.Bool
+	// budgetPaused holds connections whose reads the server-wide budget stopped,
+	// waiting to be resumed once it recovers. Event-loop ownership.
+	budgetPaused []*Connection
+	// budgetResume is the spare list resumeBudgetPaused swaps in while it walks
+	// the current one. Event-loop ownership.
+	budgetResume []*Connection
+	// redeliver holds stalled connections whose read the loop is handing back
+	// directly, to be scheduled at the end of the round. Event-loop ownership.
+	redeliver       []*Connection
+	taskPool        *taskpool.TaskPool
+	releaseTaskPool func()
+	taskWG          sync.WaitGroup
+	readBufferPool  sync.Pool
+	sendBufferPool  sync.Pool
+	closeOnce       sync.Once
+}
 
 // acquireSendBuffer returns a pooled outbound buffer.
 //
@@ -93,99 +123,6 @@ func (e *Engine) releaseSendBuffer(b *sendBuffer) {
 		b.data = b.data[:0]
 		e.sendBufferPool.Put(b)
 	}
-}
-
-// Engine owns the listener, epoll descriptor, command queue, and worker pool.
-type Engine struct {
-	epollFD, wakeFD    int
-	listenFDs          []int
-	maxEvents          int
-	useWritev          bool
-	inlineHandlers     bool
-	writeHighWatermark int
-	writeLowWatermark  int
-	maxPendingBytes    int64
-	budgetResumeBytes  int64
-	retainedSendBuffer int
-	handler            Handler
-	stopping           atomic.Bool
-	nextGeneration     atomic.Uint64
-	pendingTotal       atomic.Int64
-	// Backpressure counters, reported by Stats. They move only when a
-	// connection's read interest actually changes, which is rare by design.
-	readsPausedByWatermark atomic.Uint64
-	readsPausedByBudget    atomic.Uint64
-	readsResumed           atomic.Uint64
-	commandMu              sync.Mutex
-	commands               *commandBatch
-	commandPool            sync.Pool
-	wakePending            atomic.Bool
-	// connections is a paged table indexed by file descriptor: a descriptor is
-	// a small dense integer the kernel already allocates, so the lookup on
-	// every epoll event is two bounds checks rather than a hash.
-	//
-	// It is paged rather than flat because descriptors are handed out per
-	// process while this table is per server. A process running one server per
-	// listening port sees every server's descriptors drawn from one
-	// interleaved range, so a flat table would grow to the highest descriptor
-	// in the process no matter how few connections this server holds, and
-	// doubling its way there copied 102MB across a 100k-connection dial.
-	// Pages are allocated once, on demand, and never copied.
-	// Event-loop ownership.
-	connections [][]*Connection
-	// budgetPaused holds connections whose reads the server-wide budget stopped,
-	// waiting to be resumed once it recovers. Event-loop ownership.
-	budgetPaused []*Connection
-	// budgetResume is the spare list resumeBudgetPaused swaps in while it walks
-	// the current one. Event-loop ownership.
-	budgetResume    []*Connection
-	taskPool        *taskpool.TaskPool
-	releaseTaskPool func()
-	taskWG          sync.WaitGroup
-	readBufferPool  sync.Pool
-	sendBufferPool  sync.Pool
-	closeOnce       sync.Once
-}
-
-func listenerToken(fd int) uint64 { return uint64(uint32(fd)) | listenerKind<<32 }
-func wakeToken(fd int) uint64     { return uint64(uint32(fd)) | wakeKind<<32 }
-
-// connectionFor returns the connection a token refers to, or nil if the token
-// is stale. The low half is the descriptor and the high half a generation, so a
-// reused descriptor never resolves to the connection that previously held it.
-func (e *Engine) connectionFor(token uint64) *Connection {
-	fd := int(uint32(token))
-	page := fd >> connPageShift
-	if page < 0 || page >= len(e.connections) {
-		return nil
-	}
-	entries := e.connections[page]
-	if entries == nil {
-		return nil
-	}
-	c := entries[fd&connPageMask]
-	if c == nil || c.token != token {
-		return nil
-	}
-	return c
-}
-
-// trackConnection records a newly accepted connection, growing the descriptor
-// table to cover it. Callers run on the event loop.
-func (e *Engine) trackConnection(fd int, c *Connection) {
-	page := fd >> connPageShift
-	if page >= len(e.connections) {
-		// Only the page directory is ever copied, and it holds one pointer per
-		// 4096 descriptors, so growing it stays cheap however high descriptors
-		// climb.
-		directory := make([][]*Connection, max(page+1, 2*len(e.connections)))
-		copy(directory, e.connections)
-		e.connections = directory
-	}
-	if e.connections[page] == nil {
-		e.connections[page] = make([]*Connection, connPageSize)
-	}
-	e.connections[page][fd&connPageMask] = c
 }
 
 func Bind(config Config, handler Handler) (*Engine, error) {
@@ -216,32 +153,7 @@ func Bind(config Config, handler Handler) (*Engine, error) {
 		addrs = []string{config.Addr}
 	}
 
-	epfd, err := syscall.EpollCreate1(syscall.EPOLL_CLOEXEC)
-	if err != nil {
-		return nil, err
-	}
-	listenFDs := make([]int, 0, len(addrs))
-	closeListeners := func() {
-		for _, fd := range listenFDs {
-			syscall.Close(fd)
-		}
-	}
-	for _, addr := range addrs {
-		listenFD, listenErr := createListener(config, addr)
-		if listenErr != nil {
-			closeListeners()
-			syscall.Close(epfd)
-			return nil, listenErr
-		}
-		listenFDs = append(listenFDs, listenFD)
-	}
-	wakeFD, err := eventfd()
-	if err != nil {
-		closeListeners()
-		syscall.Close(epfd)
-		return nil, err
-	}
-	e := &Engine{epollFD: epfd, listenFDs: listenFDs, wakeFD: wakeFD, maxEvents: config.MaxEvents,
+	e := &Engine{maxEvents: config.MaxEvents,
 		useWritev: config.UseWritev, inlineHandlers: config.InlineHandlers,
 		writeHighWatermark: config.WriteBufferHighWatermark,
 		// Resume at a quarter of the budget rather than at the budget itself,
@@ -264,8 +176,6 @@ func Bind(config Config, handler Handler) (*Engine, error) {
 		// would drop the buffer every round and allocate a new one next round.
 		retainedSendBuffer: 2 * config.ReadBufferSize,
 		handler:            handler}
-	e.nextGeneration.Store(firstGeneration)
-	e.taskPool, e.releaseTaskPool = acquireTaskPool(config)
 	e.readBufferPool.New = func() any { return &readBuffer{data: make([]byte, config.ReadBufferSize)} }
 	// Pooled outbound buffers start at the size a full round's replies actually
 	// reach, which is the bytes that arrived plus the framing put back on top
@@ -278,19 +188,9 @@ func Bind(config Config, handler Handler) (*Engine, error) {
 	e.sendBufferPool.New = func() any {
 		return &sendBuffer{data: make([]byte, 0, e.retainedSendBuffer)}
 	}
-	for _, fd := range listenFDs {
-		if err = e.addFD(fd, listenerToken(fd), uint32(syscall.EPOLLIN)|epollET); err != nil {
-			break
-		}
-	}
-	if err == nil {
-		err = e.addFD(wakeFD, wakeToken(wakeFD), uint32(syscall.EPOLLIN)|epollET)
-	}
-	if err != nil {
+	e.taskPool, e.releaseTaskPool = acquireTaskPool(config)
+	if err := e.open(config, addrs); err != nil {
 		e.releaseTaskPool()
-		syscall.Close(wakeFD)
-		closeListeners()
-		syscall.Close(epfd)
 		return nil, err
 	}
 	return e, nil
@@ -303,33 +203,6 @@ func (e *Engine) LocalAddr() (*net.TCPAddr, error) {
 		return nil, err
 	}
 	return addrs[0], nil
-}
-
-// LocalAddrs returns one address per listener, in configured order. Ports left
-// at zero report the port the kernel chose.
-func (e *Engine) LocalAddrs() ([]*net.TCPAddr, error) {
-	addrs := make([]*net.TCPAddr, 0, len(e.listenFDs))
-	for _, fd := range e.listenFDs {
-		sa, err := syscall.Getsockname(fd)
-		if err != nil {
-			return nil, err
-		}
-		switch bound := sa.(type) {
-		case *syscall.SockaddrInet4:
-			addrs = append(addrs, &net.TCPAddr{IP: net.IP(bound.Addr[:]), Port: bound.Port})
-		case *syscall.SockaddrInet6:
-			addr := &net.TCPAddr{IP: net.IP(bound.Addr[:]), Port: bound.Port}
-			if bound.ZoneId != 0 {
-				if zone, zoneErr := net.InterfaceByIndex(int(bound.ZoneId)); zoneErr == nil {
-					addr.Zone = zone.Name
-				}
-			}
-			addrs = append(addrs, addr)
-		default:
-			return nil, fmt.Errorf("listener is not TCP: %T", sa)
-		}
-	}
-	return addrs, nil
 }
 
 // Stats reports what backpressure this server has applied. It answers the
@@ -362,50 +235,28 @@ func (e *Engine) Stats() Stats {
 	}
 }
 
-func (e *Engine) Run() error {
-	batch := e.maxEvents
-	if batch > maxWaitBatch {
-		batch = maxWaitBatch
-	}
-	events := make([]syscall.EpollEvent, batch)
-	var ready []*Connection
-	var tasks []taskpool.Task
-	for !e.stopping.Load() {
-		n, err := syscall.EpollWait(e.epollFD, events, -1)
-		if err == syscall.EINTR {
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		for i := 0; i < n; i++ {
-			token := uint64(uint32(events[i].Fd)) | uint64(uint32(events[i].Pad))<<32
-			switch token >> 32 {
-			case listenerKind:
-				e.acceptConnections(int(uint32(token)))
-			case wakeKind:
-				e.drainCommands()
-			default:
-				if c := e.noteEvent(token, events[i].Events); c != nil {
-					ready = append(ready, c)
-				}
+// runReady ends one round of the loop: it hands the connections the round made
+// runnable to the workers, or runs them in place when handlers are inline, and
+// then gives connections parked on the server-wide budget a chance to resume.
+func (e *Engine) runReady(ready []*Connection, tasks []taskpool.Task) ([]*Connection, []taskpool.Task) {
+	// Resuming comes first so that a connection it hands a read back to is
+	// scheduled in this round rather than whenever the loop next wakes.
+	e.resumeBudgetPaused()
+	ready = append(ready, e.redeliver...)
+	clear(e.redeliver)
+	e.redeliver = e.redeliver[:0]
+	if len(ready) > 0 {
+		if e.inlineHandlers {
+			for _, c := range ready {
+				c.process()
 			}
+		} else {
+			tasks = e.submitReady(ready, tasks[:0])
 		}
-		if len(ready) > 0 {
-			if e.inlineHandlers {
-				for _, c := range ready {
-					c.process()
-				}
-			} else {
-				tasks = e.submitReady(ready, tasks[:0])
-			}
-			clear(ready)
-			ready = ready[:0]
-		}
-		e.resumeBudgetPaused()
+		clear(ready)
+		ready = ready[:0]
 	}
-	e.drainCommands()
-	return nil
+	return ready, tasks
 }
 
 // resumeBudgetPaused re-arms reads on connections the server-wide budget held
@@ -434,8 +285,8 @@ func (e *Engine) resumeBudgetPaused() {
 	e.budgetResume = waiting
 }
 
-// submitReady hands one epoll round's newly runnable connections to the task
-// pool in a single batch instead of one lock-and-wake cycle per connection.
+// submitReady hands one round's newly runnable connections to the task pool in
+// a single batch instead of one lock-and-wake cycle per connection.
 func (e *Engine) submitReady(ready []*Connection, tasks []taskpool.Task) []taskpool.Task {
 	for _, c := range ready {
 		tasks = append(tasks, c)
@@ -455,31 +306,6 @@ func (e *Engine) submitReady(ready []*Connection, tasks []taskpool.Task) []taskp
 
 func (e *Engine) Stop() { e.stopping.Store(true); e.notify() }
 
-// Close releases all resources. Run must have returned before Close is called.
-func (e *Engine) Close() error {
-	var closeErr error
-	e.closeOnce.Do(func() {
-		e.Stop()
-		e.taskWG.Wait()
-		e.releaseTaskPool()
-		e.drainCommands()
-		for _, entries := range e.connections {
-			for _, c := range entries {
-				if c != nil {
-					e.closeConnection(c, nil, false)
-				}
-			}
-		}
-		e.budgetPaused = nil
-		for _, fd := range append(append([]int(nil), e.listenFDs...), e.wakeFD, e.epollFD) {
-			if err := syscall.Close(fd); err != nil && closeErr == nil {
-				closeErr = err
-			}
-		}
-	})
-	return closeErr
-}
-
 func (e *Engine) request(cmd command) {
 	e.commandMu.Lock()
 	if e.commands == nil {
@@ -493,69 +319,30 @@ func (e *Engine) request(cmd command) {
 	e.commandMu.Unlock()
 	e.notify()
 }
+
+// notify wakes the event loop, coalescing requests that arrive before it has
+// woken into a single wake-up.
 func (e *Engine) notify() {
 	if !e.wakePending.CompareAndSwap(false, true) {
 		return
 	}
-	var b [8]byte
-	binary.LittleEndian.PutUint64(b[:], 1)
-	_, _ = syscall.Write(e.wakeFD, b[:])
-}
-func (e *Engine) addFD(fd int, token uint64, events uint32) error {
-	ev := syscall.EpollEvent{Events: events, Fd: int32(token), Pad: int32(token >> 32)}
-	return syscall.EpollCtl(e.epollFD, syscall.EPOLL_CTL_ADD, fd, &ev)
-}
-func (e *Engine) modifyFD(c *Connection, events uint32) error {
-	ev := syscall.EpollEvent{Events: events, Fd: int32(c.token), Pad: int32(c.token >> 32)}
-	return syscall.EpollCtl(e.epollFD, syscall.EPOLL_CTL_MOD, c.FD(), &ev)
-}
-
-func (e *Engine) acceptConnections(listenFD int) {
-	for {
-		fd, err := accept4(listenFD)
-		if err == syscall.EINTR {
-			continue
-		}
-		if err != nil {
-			return
-		}
-		// The token pairs the descriptor with a generation: the descriptor
-		// indexes the table, and the generation makes an event left over from a
-		// previous owner of the same descriptor resolve to nothing.
-		token := uint64(uint32(fd)) | e.nextGeneration.Add(1)<<32
-		c := &Connection{token: token, engine: e}
-		c.fd.Store(int32(fd))
-		// EPOLLOUT is registered up front and never modified again. The
-		// descriptor is edge-triggered, so an always-armed write interest only
-		// fires when the socket goes from full back to writable, which spares
-		// the loop an epoll_ctl pair per backpressured message.
-		if err := e.addFD(fd, token, allEvents); err != nil {
-			syscall.Close(fd)
-			continue
-		}
-		e.trackConnection(fd, c)
-		e.handler.OnOpen(c)
-	}
+	e.wake()
 }
 
 // noteEvent folds readiness into the connection and reports whether it needs
-// to be scheduled. Actual submission happens once per epoll round in Run.
-func (e *Engine) noteEvent(token uint64, events uint32) *Connection {
-	c := e.connectionFor(token)
-	if c == nil {
-		return nil
-	}
+// to be scheduled. Actual submission happens once per round in Run.
+func (e *Engine) noteEvent(c *Connection, events uint32) *Connection {
 	c.mu.Lock()
 	if c.closing || c.closed {
 		c.mu.Unlock()
 		return nil
 	}
-	events &= allEvents
+	events &= evAll
 	if events == 0 {
 		c.mu.Unlock()
 		return nil
 	}
-	if events == uint32(syscall.EPOLLOUT) && c.sendHead == len(c.sends) {
+	if events == evOut && c.sendHead == len(c.sends) && c.pendingEvents == 0 {
 		// Write interest is armed for the connection's whole life, so the
 		// socket reports itself writable the moment it is registered and again
 		// every time it drains. With nothing queued there is nothing for a
@@ -565,10 +352,10 @@ func (e *Engine) noteEvent(token uint64, events uint32) *Connection {
 		c.mu.Unlock()
 		return nil
 	}
-	// epoll readiness is level information from the connection's point of
-	// view. Coalescing duplicate notifications avoids a slice scan and keeps a
-	// hot connection from allocating an unbounded event queue while its worker
-	// is draining the socket.
+	// Readiness is level information from the connection's point of view.
+	// Coalescing duplicate notifications avoids a slice scan and keeps a hot
+	// connection from allocating an unbounded event queue while its worker is
+	// draining the socket.
 	c.pendingEvents |= events
 	submit := !c.scheduled
 	c.scheduled = true
@@ -580,14 +367,7 @@ func (e *Engine) noteEvent(token uint64, events uint32) *Connection {
 }
 
 func (e *Engine) drainCommands() {
-	// A single read drains the eventfd: reading returns the whole counter and
-	// resets it to zero, so looping until EAGAIN only adds a wasted syscall.
-	var b [8]byte
-	for {
-		if _, err := syscall.Read(e.wakeFD, b[:]); err != syscall.EINTR {
-			break
-		}
-	}
+	e.ackWake()
 	e.wakePending.Store(false)
 	e.commandMu.Lock()
 	batch := e.commands
@@ -611,6 +391,7 @@ func (e *Engine) drainCommands() {
 		e.commandPool.Put(batch)
 	}
 }
+
 func (e *Engine) refreshConnection(c *Connection) {
 	c.mu.Lock()
 	usable := !c.closing && !c.closed
@@ -624,7 +405,20 @@ func (e *Engine) refreshConnection(c *Connection) {
 	if !pauseReads {
 		c.budgetPaused = false
 	}
+	// A stalled read is settled once reads are running again. Resuming them
+	// re-arms the backend, and re-arming reports bytes already waiting, so
+	// only a connection that was never paused needs its read handed back.
+	redeliver := false
+	if c.readStalled && !pauseReads {
+		c.readStalled = false
+		redeliver = usable && !changed
+	}
 	c.mu.Unlock()
+	if redeliver {
+		if ready := e.noteEvent(c, evIn); ready != nil {
+			e.redeliver = append(e.redeliver, ready)
+		}
+	}
 	if track {
 		// A connection held back only by the server-wide budget may have
 		// nothing of its own left to flush, so no later event of its own would
@@ -642,28 +436,29 @@ func (e *Engine) refreshConnection(c *Connection) {
 		}
 	}
 	if usable && changed {
-		// Write interest is permanent, so registration only tracks whether
-		// reads are paused while the peer catches up.
-		events := uint32(allEvents)
-		if pauseReads {
-			events &^= syscall.EPOLLIN
-		}
-		if err := e.modifyFD(c, events); err != nil {
+		// Write interest is permanent, so the backend only has to track
+		// whether reads are paused while the peer catches up.
+		if err := e.setReadPaused(c, pauseReads); err != nil {
 			c.closeWithError(err)
 		}
 	}
 }
+
 func (e *Engine) closeConnection(c *Connection, closeErr error, callback bool) {
 	c.mu.Lock()
-	doClose := !c.closed
-	if !doClose {
+	if c.closed {
 		c.mu.Unlock()
 		return
 	}
 	c.closed = true
 	c.closing = true
-	for i := c.sendHead; i < len(c.sends); i++ {
-		c.releaseItemLocked(&c.sends[i])
+	// Buffers the kernel is still sending from cannot go back to the pool: the
+	// next connection to take one would overwrite bytes still on their way out.
+	// They are left to the garbage collector instead.
+	if !c.writeBusyLocked() {
+		for i := c.sendHead; i < len(c.sends); i++ {
+			c.releaseItemLocked(&c.sends[i])
+		}
 	}
 	c.sends = nil
 	c.sendHead = 0
@@ -675,16 +470,7 @@ func (e *Engine) closeConnection(c *Connection, closeErr error, callback bool) {
 		e.pendingTotal.Add(-pending)
 	}
 	c.mu.Unlock()
-	fd := int(c.fd.Swap(-1))
-	if fd >= 0 {
-		_ = syscall.EpollCtl(e.epollFD, syscall.EPOLL_CTL_DEL, fd, nil)
-		_ = syscall.Close(fd)
-	}
-	if page := fd >> connPageShift; fd >= 0 && page < len(e.connections) {
-		if entries := e.connections[page]; entries != nil && entries[fd&connPageMask] == c {
-			entries[fd&connPageMask] = nil
-		}
-	}
+	e.detach(c)
 	if callback {
 		e.handler.OnClose(c, closeErr)
 	}

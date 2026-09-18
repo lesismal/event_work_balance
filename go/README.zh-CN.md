@@ -2,7 +2,8 @@
 
 这是根目录 C11 实现的 Go 移植版，保留相同的核心架构：
 
-- 单个 edge-triggered epoll event loop 独占所有 `epoll_ctl` 和 fd 关闭操作。
+- 单个 edge-triggered event loop（Linux 上是 epoll，macOS 上是 kqueue，Windows 上是 IOCP）
+  独占所有事件注册和 fd 关闭操作。
 - connection 是本地 `taskpool.TaskPool` 的任务单位。TaskPool 使用常驻、有界
   worker，避免短事件触发大量 goroutine 创建和栈扩容；connection 不与某个
   worker 固定绑定。
@@ -13,7 +14,7 @@
   设置，默认 16 KiB。
 - `Config.TaskPoolMode` 可选 `taskpool.ModeCond`（基于 `sync.Cond` 的有界环形
   队列，按 worker 数分片）或 `taskpool.ModeElastic`（nbio 风格的弹性
-  fork/dispatcher，Linux 后端默认）。
+  fork/dispatcher，原生后端默认）。
 - 池容量按 Mode 分别给默认值，因为 `WorkerCount` 在两个 Mode 下含义不同：
   ModeCond 会预先创建这么多协程并让它们挂在条件变量上，这个数就是实际存在的
   协程数量，多了只是让调度器在同样的核上搬运更多协程；ModeElastic 则是按需
@@ -51,13 +52,25 @@
 
 ## 平台支持
 
-- Linux：原生 edge-triggered epoll、eventfd 和可选 writev，完整对应 C 版架构。
-- macOS、Windows：使用 Go 标准库的系统网络轮询器负责 socket I/O；读取事件仍以
-  connection 为单位进入本地 TaskPool，同一连接的回调保持 FIFO 串行执行。
+三个原生后端共用同一套 worker 调度、发送队列和背压逻辑，只有事件来源不同：
 
-非 Linux 后端保留完全相同的公共 API。`Backlog`、`UseWritev` 和
-`OnPriorityData` 对应的 TCP `MSG_OOB` 处理目前仅在 Linux 后端生效；非 Linux
-后端的 `Connection.FD()` 返回 `-1`。
+- Linux：edge-triggered epoll，`eventfd` 唤醒，可选 `writev`，完整对应 C 版架构。
+- macOS：kqueue，所有过滤器以 `EV_CLEAR` 注册，语义与 epoll ET 一致；
+  `EVFILT_USER` 唤醒；带外数据由 `EVFILT_EXCEPT`/`NOTE_OOB` 报告；`writev`
+  经由 libc。暂停读取时删除读过滤器，恢复时重新添加，添加时会立即报告 socket
+  里已有的数据。
+- Windows：I/O 完成端口（IOCP），在其上模拟就绪模型。可读由零字节的 overlapped
+  `WSARecv` 报告，worker 随后用非阻塞接收排空 socket；非阻塞发送写不完时，剩余
+  数据交给 overlapped `WSASend`，它的完成就相当于可写事件。连接用 `AcceptEx`
+  接入，唤醒用 `PostQueuedCompletionStatus`。`UseWritev` 对应多个 `WSABUF`
+  的一次 `WSASend`。
+
+Windows 后端不会调用 `OnPriorityData`：零字节读不报告带外数据。Windows 上
+`Connection.FD()` 返回 socket handle。
+
+其他系统（如 FreeBSD）使用 Go 标准库网络轮询器的兼容后端：公共 API 相同，读取
+事件仍以 connection 为单位进入 TaskPool 并保持 FIFO 串行执行，但 `Backlog`、
+`UseWritev`、带外数据和背压统计不生效，`Connection.FD()` 返回 `-1`。
 
 ## API
 
