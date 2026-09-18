@@ -256,6 +256,47 @@ cd go
 go run ./examples/websocket_server
 ```
 
+### 异步 WebSocket client
+
+`Dialer` 在 Engine 上发起 WebSocket 连接并完成握手，调用方不会阻塞。握手成功后，
+client 连接与 server 端连接走同一套 `Handler` 回调、同一个 worker 池和同一个
+`Connection` 类型：
+
+```go
+engine, _ := fib.NewEngine(fib.DefaultConfig(), nil) // 或直接复用 server 的 Engine
+go engine.Run()
+dialer := websocket.NewDialer(engine, websocket.DefaultDialerConfig())
+
+handler := websocket.HandlerFuncs{
+    Message: func(c *websocket.Connection, opcode websocket.Opcode, data []byte) {
+        // 服务端发来的消息；data 只在回调期间有效
+    },
+}
+dialer.Dial("ws://127.0.0.1:8080/ws", nil, handler, func(c *websocket.Connection, resp *http.Response, err error) {
+    if err != nil {
+        return // 连接失败、握手被拒（errors.Is(err, websocket.ErrBadHandshake)）或超时
+    }
+    _ = c.WriteText("hello")
+})
+
+conn, resp, err := dialer.Go(url, header, handler).Wait() // Future 形式
+```
+
+- 只支持 `ws://`；`wss://` 返回 `ErrUnsupportedScheme`。
+- 成功时先调用 handler 的 `OnOpen`（参数是握手请求），再调用 done；失败时只调用
+  done，连接为 nil，服务端有响应时一并传入 resp（例如 403），便于查看状态码和头部。
+- 握手会校验 101 状态、`Upgrade`/`Connection` 头、`Sec-WebSocket-Accept` 与本次
+  key 是否匹配，以及服务端选择的子协议是否在 `Subprotocols` 里；服务端选择了未提供的
+  扩展同样视为失败。
+- `header` 用于附加 Origin、鉴权等头部；`Upgrade`、`Connection`、
+  `Sec-WebSocket-Key`/`Version`/`Protocol`/`Extensions` 由 Dialer 设置，不能传入。
+- `HandshakeTimeout` 覆盖建连和握手全过程，超时错误满足
+  `errors.Is(err, os.ErrDeadlineExceeded)`。
+- client 发出的每一帧都按 RFC 6455 用随机 key 掩码，需要复制一次 payload；收到
+  带掩码的服务端帧按协议错误以 1002 关闭。与握手响应同一次读到的首帧也会正常交付。
+- done 可能在任意 goroutine 上执行：握手成功在读取它的 worker 上，超时在定时器
+  goroutine 上，连接失败在单独的 goroutine 上，URL 非法时在调用方 goroutine 上。
+
 ## GOMAXPROCS
 
 工作协程在自己的协程里直接执行连接的 read/write，而协程进入系统调用时会一直占着它的 P，

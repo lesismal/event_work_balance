@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"math/rand/v2"
 	stdhttp "net/http"
 	"strings"
 	"sync"
@@ -66,8 +67,10 @@ func (h HandlerFuncs) OnClose(c *Connection, code uint16, reason string, err err
 type Connection struct {
 	conn        *fib.Connection
 	subprotocol string
-	closeSent   atomic.Bool
-	closeState  atomic.Pointer[connectionCloseState]
+	// client marks the dialing side, whose frames must be masked.
+	client     bool
+	closeSent  atomic.Bool
+	closeState atomic.Pointer[connectionCloseState]
 }
 
 type connectionCloseState struct {
@@ -115,25 +118,42 @@ func (c *Connection) writeFrame(opcode Opcode, payload []byte) error {
 	if c.closeSent.Load() {
 		return errors.New("websocket: close already sent")
 	}
+	return c.sendFrame(opcode, payload)
+}
+
+// sendFrame frames payload for the peer. A server's frames go out as they are.
+// A client has to mask every frame with a key the server cannot predict (RFC
+// 6455 section 5.3), and masking rewrites the payload, which is the caller's
+// buffer and not this connection's to scramble, so a client frame is built in a
+// buffer of its own.
+func (c *Connection) sendFrame(opcode Opcode, payload []byte) error {
 	header, headerLen, err := frameHeader(opcode, len(payload))
 	if err != nil {
 		return err
 	}
-	return c.conn.SendParts(header[:headerLen], payload)
+	if !c.client {
+		return c.conn.SendParts(header[:headerLen], payload)
+	}
+	frame := make([]byte, headerLen+4+len(payload))
+	copy(frame, header[:headerLen])
+	frame[1] |= 0x80
+	mask := frame[headerLen : headerLen+4]
+	binary.LittleEndian.PutUint32(mask, rand.Uint32())
+	applyMask(frame[headerLen+4:], payload, mask)
+	return c.conn.SendOwned(frame)
 }
 
 func (c *Connection) sendClose(payload []byte) error {
 	if !c.closeSent.CompareAndSwap(false, true) {
 		return nil
 	}
-	header, headerLen, err := frameHeader(Close, len(payload))
-	if err != nil {
+	if len(payload) > 125 {
 		c.closeSent.Store(false)
-		return err
+		return ErrProtocol
 	}
 	code, reason := closePayload(payload)
 	c.closeState.Store(&connectionCloseState{code: code, reason: reason})
-	if err = c.conn.SendParts(header[:headerLen], payload); err != nil {
+	if err := c.sendFrame(Close, payload); err != nil {
 		return err
 	}
 	c.conn.CloseAfterSend()
@@ -265,12 +285,20 @@ func (h *ServerHandler) upgrade(c *fib.Connection, state *connectionState, reque
 }
 
 func (h *ServerHandler) handleFrames(state *connectionState, data []byte) {
-	defer state.wsParser.ReleaseBorrowed()
+	serveFrames(h.handler, &state.websocket, &state.wsParser, data)
+}
+
+// serveFrames feeds bytes from the peer through parser and acts on every frame
+// they complete: messages go to handler, pings are answered, and a close is
+// echoed. Both ends of a connection run it; they differ only in the parser's
+// direction and in whether ws masks what it sends.
+func serveFrames(handler Handler, ws *Connection, parser *Parser, data []byte) {
+	defer parser.ReleaseBorrowed()
 	for {
-		event, complete, err := state.wsParser.FeedOneBorrowed(data)
+		event, complete, err := parser.FeedOneBorrowed(data)
 		data = nil
 		if err != nil {
-			h.closeParserError(state, err)
+			closeParserError(ws, err)
 			return
 		}
 		if !complete {
@@ -278,20 +306,20 @@ func (h *ServerHandler) handleFrames(state *connectionState, data []byte) {
 		}
 		switch event.Opcode {
 		case Text, Binary:
-			h.handler.OnMessage(&state.websocket, event.Opcode, event.Payload)
+			handler.OnMessage(ws, event.Opcode, event.Payload)
 		case Ping:
-			if sendErr := state.websocket.Pong(event.Payload); sendErr != nil {
-				state.websocket.conn.Close()
+			if sendErr := ws.Pong(event.Payload); sendErr != nil {
+				ws.conn.Close()
 				return
 			}
 		case Close:
-			_ = state.websocket.sendClose(event.Payload)
+			_ = ws.sendClose(event.Payload)
 			return
 		}
 	}
 }
 
-func (h *ServerHandler) closeParserError(state *connectionState, err error) {
+func closeParserError(ws *Connection, err error) {
 	code := uint16(CloseProtocolError)
 	if errors.Is(err, ErrMessageTooBig) {
 		code = CloseMessageTooBig
@@ -300,7 +328,7 @@ func (h *ServerHandler) closeParserError(state *connectionState, err error) {
 	}
 	var payload [2]byte
 	binary.BigEndian.PutUint16(payload[:], code)
-	_ = state.websocket.sendClose(payload[:])
+	_ = ws.sendClose(payload[:])
 }
 
 func (h *ServerHandler) validateHandshake(request *stdhttp.Request) (string, error) {
@@ -501,15 +529,19 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 	}
 	h.releaseHandshakeParser(state)
 	if state.upgraded {
-		closeState := state.websocket.closeState.Load()
-		code := uint16(1006)
-		reason := ""
-		if closeState != nil {
-			code = closeState.code
-			reason = closeState.reason
-		}
+		code, reason := state.websocket.closeStatus()
 		h.handler.OnClose(&state.websocket, code, reason, err)
 	}
+}
+
+// closeStatus is the code and reason OnClose reports: those of the close frame
+// this end sent, which echoes the peer's when the peer closed first, or 1006
+// when the connection ended without a close handshake.
+func (c *Connection) closeStatus() (uint16, string) {
+	if closeState := c.closeState.Load(); closeState != nil {
+		return closeState.code, closeState.reason
+	}
+	return 1006, ""
 }
 
 func (h *ServerHandler) releaseHandshakeParser(state *connectionState) {

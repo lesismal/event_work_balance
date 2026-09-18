@@ -60,12 +60,16 @@ type fragmentedMessage struct {
 
 type Parser struct {
 	maxMessageBytes int64
-	buffer          []byte
-	owned           *frameBuffer
-	borrowedTail    []byte
-	fragment        *fragmentedMessage
-	pendingConsume  int
-	borrowedBuffer  bool
+	// fromServer makes the parser read the frames a server sends, which are
+	// unmasked, instead of the masked frames a client sends. Either side must
+	// reject a frame masked the other way (RFC 6455 section 5.1).
+	fromServer     bool
+	buffer         []byte
+	owned          *frameBuffer
+	borrowedTail   []byte
+	fragment       *fragmentedMessage
+	pendingConsume int
+	borrowedBuffer bool
 }
 
 func NewParser(maxMessageBytes int64) *Parser {
@@ -73,6 +77,14 @@ func NewParser(maxMessageBytes int64) *Parser {
 		maxMessageBytes = 16 << 20
 	}
 	return &Parser{maxMessageBytes: maxMessageBytes}
+}
+
+// NewServerFrameParser returns a parser for the unmasked frames a server sends,
+// which is what a client reads.
+func NewServerFrameParser(maxMessageBytes int64) *Parser {
+	p := NewParser(maxMessageBytes)
+	p.fromServer = true
+	return p
 }
 
 func (p *Parser) Reset() {
@@ -98,8 +110,9 @@ func (p *Parser) Reset() {
 	}
 }
 
-// Feed parses masked client frames and returns complete messages and control
-// frames. Fragmented data messages are reassembled before being returned.
+// Feed parses frames and returns complete messages and control frames. A
+// parser from NewParser reads a client's masked frames; see
+// NewServerFrameParser for the other direction. Fragmented data messages are reassembled before being returned.
 func (p *Parser) Feed(data []byte) ([]Event, error) {
 	var events []Event
 	for {
@@ -264,13 +277,17 @@ func frameHeaderSize(data []byte) int {
 	if len(data) < 2 {
 		return 2
 	}
+	size := 2
+	if data[1]&0x80 != 0 {
+		size += 4
+	}
 	switch data[1] & 0x7f {
 	case 126:
-		return 8
+		return size + 2
 	case 127:
-		return 14
+		return size + 8
 	default:
-		return 6
+		return size
 	}
 }
 
@@ -298,7 +315,8 @@ func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 	first, second := p.buffer[0], p.buffer[1]
 	fin := first&0x80 != 0
 	opcode := Opcode(first & 0x0f)
-	if first&0x70 != 0 || second&0x80 == 0 {
+	masked := second&0x80 != 0
+	if first&0x70 != 0 || masked == p.fromServer {
 		return Event{}, false, false, ErrProtocol
 	}
 	control := opcode >= 0x8
@@ -350,11 +368,14 @@ func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 	if !control && (payloadLen > uint64(p.maxMessageBytes) || current > p.maxMessageBytes-int64(payloadLen)) {
 		return Event{}, false, false, ErrMessageTooBig
 	}
-	if len(p.buffer) < offset+4 {
-		return Event{}, false, false, nil
+	var mask []byte
+	if masked {
+		if len(p.buffer) < offset+4 {
+			return Event{}, false, false, nil
+		}
+		mask = p.buffer[offset : offset+4]
+		offset += 4
 	}
-	mask := p.buffer[offset : offset+4]
-	offset += 4
 	if payloadLen > uint64(len(p.buffer)-offset) {
 		return Event{}, false, false, nil
 	}
@@ -362,10 +383,16 @@ func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 	var payload []byte
 	if borrowPayload {
 		payload = p.buffer[offset:frameEnd]
-		applyMask(payload, payload, mask)
+		if masked {
+			applyMask(payload, payload, mask)
+		}
 	} else {
 		payload = make([]byte, int(payloadLen))
-		applyMask(payload, p.buffer[offset:frameEnd], mask)
+		if masked {
+			applyMask(payload, p.buffer[offset:frameEnd], mask)
+		} else {
+			copy(payload, p.buffer[offset:frameEnd])
+		}
 	}
 
 	if control {
