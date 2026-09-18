@@ -82,8 +82,14 @@ jobs:
         shell: bash
         run: |
           set +e
-          go test -race -count=1 -timeout 10m ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
-          status=${PIPESTATUS[0]}
+          go test -race -count=1 -timeout 10m -v ./... > "$RUNNER_TEMP/test.log" 2>&1
+          status=$?
+          grep -v -E '^(=== (RUN|PAUSE|CONT)|\s*--- PASS)' "$RUNNER_TEMP/test.log"
+          skipped=$(grep -E -A1 -- '--- SKIP' "$RUNNER_TEMP/test.log")
+          if [ -n "$skipped" ]; then
+            skipped=${skipped//$'\n'/'%0A'}
+            echo "::notice title=skipped tests::$skipped"
+          fi
           if [ "$status" -ne 0 ]; then
             # Surface the failures as an annotation so they are readable
             # without opening the full log.

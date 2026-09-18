@@ -131,13 +131,22 @@ func TestReadsDeferredWhileOutputQueued(t *testing.T) {
 			// the process ordering stands between queued output and a read.
 			config.WriteBufferHighWatermark = -1
 			var first sync.Once
+			var sender atomic.Pointer[Connection]
 			server, err := Bind(config, HandlerFuncs{
 				Data: func(c *Connection, data []byte) {
 					started := false
 					first.Do(func() {
 						started = true
-						if err := c.SendOwned(payload); err != nil {
-							t.Error(err)
+						sender.Store(c)
+						// Send in chunks: Windows accepts one send of any size
+						// while its send backlog is below SO_SNDBUF, so a single
+						// call could leave nothing queued. Later chunks queue
+						// once the backlog is full, on every platform.
+						for offset := 0; offset < len(payload); offset += 1 << 20 {
+							if err := c.SendOwned(payload[offset : offset+1<<20]); err != nil {
+								t.Error(err)
+								return
+							}
 						}
 					})
 					if !started {
@@ -176,6 +185,9 @@ func TestReadsDeferredWhileOutputQueued(t *testing.T) {
 			// Let the server block on the peer's full receive window before
 			// the second message arrives.
 			time.Sleep(300 * time.Millisecond)
+			if c := sender.Load(); c == nil || !c.hasQueuedOutput() {
+				t.Skip("the kernel accepted the whole payload; no output is queued to defer reads behind")
+			}
 			if _, err := conn.Write([]byte("ping")); err != nil {
 				t.Fatal(err)
 			}
