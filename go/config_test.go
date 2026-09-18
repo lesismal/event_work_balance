@@ -77,6 +77,20 @@ func TestDefaultPoolSizingDiffersByMode(t *testing.T) {
 	}
 }
 
+// The elastic floor follows the cores, so a GOMAXPROCS lowered below them
+// still leaves each core its share of workers, and a small machine is not
+// handed a floor sized for a large one.
+func TestElasticFloorFollowsCores(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	floor := runtime.NumCPU() * elasticMinWorkersPerCPU
+	want := max(elasticWorkersPerCPU, floor)
+	for _, mode := range []taskpool.Mode{taskpool.ModeElastic, taskpool.ModeAdaptive} {
+		if got := DefaultPoolSizing(mode).WorkerCount; got != want {
+			t.Fatalf("%v WorkerCount at GOMAXPROCS 1 = %d, want %d", mode, got, want)
+		}
+	}
+}
+
 // Switching the mode has to carry the sizing with it, or a config keeps numbers
 // tuned for the mode it no longer runs.
 func TestSetTaskPoolModeMovesSizing(t *testing.T) {

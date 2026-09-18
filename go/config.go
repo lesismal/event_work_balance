@@ -53,6 +53,14 @@ type PoolSizing struct {
 // and lowering it throttles a burst that the cores could have absorbed. Its
 // default is therefore an order of magnitude higher than the cond one.
 //
+// Its floor follows the cores rather than GOMAXPROCS, since the ceiling is
+// sized from GOMAXPROCS and the floor is what keeps a lowered GOMAXPROCS from
+// throttling the pool below what the machine's cores can keep busy. It is
+// elasticMinWorkersPerCPU workers per core, the density at which the
+// measurements above peaked: enough workers in flight to cover each core's
+// syscall time, where a fixed floor would hand a two-core machine 5000
+// workers per core.
+//
 // ModeAdaptive parks its workers the way ModeCond does but grows and shrinks
 // the population with the load, so its count is a ceiling as under
 // ModeElastic, and it takes the same default. The floor it retires down to is
@@ -66,7 +74,8 @@ const (
 	condWorkersPerCPU    = 100
 	condMinWorkers       = 256
 	elasticWorkersPerCPU = 1000
-	elasticMinWorkers    = 10000
+	// elasticMinWorkersPerCPU is the floor per core; see above.
+	elasticMinWorkersPerCPU = 100
 
 	// The queue holds connections the loop has made runnable but no worker has
 	// picked up yet, so it is sized from the pool rather than independently,
@@ -85,7 +94,7 @@ func DefaultPoolSizing(mode taskpool.Mode) PoolSizing {
 	minWorkers := condMinWorkers
 	if mode == taskpool.ModeElastic || mode == taskpool.ModeAdaptive {
 		workerCount = cpuCount * elasticWorkersPerCPU
-		minWorkers = elasticMinWorkers
+		minWorkers = runtime.NumCPU() * elasticMinWorkersPerCPU
 	}
 	if workerCount < minWorkers {
 		workerCount = minWorkers
