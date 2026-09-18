@@ -53,7 +53,12 @@ type PoolSizing struct {
 // and lowering it throttles a burst that the cores could have absorbed. Its
 // default is therefore an order of magnitude higher than the cond one.
 //
-// Note that either pool needs a GOMAXPROCS above the core count to pay off,
+// ModeAdaptive parks its workers the way ModeCond does but grows and shrinks
+// the population with the load, so its count is a ceiling as under
+// ModeElastic, and it takes the same default. The floor it retires down to is
+// Config.MinWorkerCount.
+//
+// Note that every pool needs a GOMAXPROCS above the core count to pay off,
 // since its workers hold their P while they are in a syscall. See the note on
 // GOMAXPROCS in README.zh-CN.md: the same run went from 330k to 415k echoes/s,
 // and from 55k to 71k accepted connections/s, on GOMAXPROCS alone.
@@ -78,7 +83,7 @@ func DefaultPoolSizing(mode taskpool.Mode) PoolSizing {
 	cpuCount := runtime.GOMAXPROCS(0)
 	workerCount := cpuCount * condWorkersPerCPU
 	minWorkers := condMinWorkers
-	if mode == taskpool.ModeElastic {
+	if mode == taskpool.ModeElastic || mode == taskpool.ModeAdaptive {
 		workerCount = cpuCount * elasticWorkersPerCPU
 		minWorkers = elasticMinWorkers
 	}
@@ -131,6 +136,10 @@ func (c *Config) validateTaskPool() error {
 	if !c.TaskPoolMode.Valid() {
 		return fmt.Errorf("invalid task pool mode %d", c.TaskPoolMode)
 	}
+	if c.TaskPoolMode == taskpool.ModeAdaptive && (c.MinWorkerCount < 0 || c.MinWorkerCount > c.WorkerCount) {
+		return fmt.Errorf("min worker count %d must be between zero and the worker count %d",
+			c.MinWorkerCount, c.WorkerCount)
+	}
 	return nil
 }
 
@@ -138,9 +147,9 @@ func (c *Config) validateTaskPool() error {
 // SetTaskPoolMode then keeps. A value that is not positive leaves that field at
 // what it already held.
 //
-// WorkerCount is a population of parked goroutines under ModeCond and a ceiling
-// on forked ones under ModeElastic; DefaultPoolSizing documents what each mode
-// does with it.
+// WorkerCount is a population of parked goroutines under ModeCond, a ceiling
+// on forked ones under ModeElastic, and a ceiling on parked ones under
+// ModeAdaptive; DefaultPoolSizing documents what each mode does with it.
 func (c *Config) SetPoolSizing(workerCount, maxEvents int) *Config {
 	if workerCount > 0 {
 		c.WorkerCount = workerCount

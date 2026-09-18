@@ -35,6 +35,14 @@ func (p *shardedPool) submit(task Task) bool { return p.pick().submit(task) }
 
 func (p *shardedPool) submitBatch(tasks []Task) int { return p.pick().submitBatch(tasks) }
 
+func (p *shardedPool) workerCount() int {
+	total := 0
+	for _, shard := range p.shards {
+		total += shard.workerCount()
+	}
+	return total
+}
+
 func (p *shardedPool) stop() {
 	for _, shard := range p.shards {
 		shard.stop()

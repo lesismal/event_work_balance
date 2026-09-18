@@ -23,7 +23,11 @@ type Config struct {
 	// TaskPoolMode picks the scheduler the workers run under. Prefer
 	// SetTaskPoolMode over assigning it, so that WorkerCount and MaxEvents
 	// follow the mode rather than staying at numbers tuned for the other one.
-	TaskPoolMode   taskpool.Mode
+	TaskPoolMode taskpool.Mode
+	// MinWorkerCount is the resident floor a ModeAdaptive pool retires down
+	// to, with WorkerCount as the ceiling it grows to. Zero means one worker
+	// per P. The other modes ignore it.
+	MinWorkerCount int
 	SharedTaskPool bool
 	// TaskPool, when set, runs the engine's connections instead of a pool the
 	// engine builds from the fields above. See SetTaskPool.

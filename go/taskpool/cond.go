@@ -17,6 +17,7 @@ type condPool struct {
 	waiters     int
 	fullWaiters int
 	stopped     bool
+	workerTotal int
 	stopOnce    sync.Once
 	pending     sync.WaitGroup
 	workers     sync.WaitGroup
@@ -26,7 +27,7 @@ func newCondPool(executor *executor, workerCount, queueSize int) *condPool {
 	if queueSize == 0 {
 		queueSize = 1
 	}
-	p := &condPool{executor: executor, queue: make([]Task, queueSize)}
+	p := &condPool{executor: executor, queue: make([]Task, queueSize), workerTotal: workerCount}
 	p.notEmpty = sync.NewCond(&p.mu)
 	p.notFull = sync.NewCond(&p.mu)
 	p.workers.Add(workerCount)
@@ -145,6 +146,8 @@ func (p *condPool) stop() {
 		p.workers.Wait()
 	})
 }
+
+func (p *condPool) workerCount() int { return p.workerTotal }
 
 func (p *condPool) worker() {
 	defer p.workers.Done()

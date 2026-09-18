@@ -17,6 +17,11 @@ const (
 	// idle ones linger briefly, and retires them after that. The worker count
 	// is a ceiling rather than a population.
 	ModeElastic
+	// ModeAdaptive parks its workers on a condition variable as ModeCond does,
+	// but grows the population when tasks arrive with no idle worker to take
+	// them and retires workers that stay idle, between a floor and a ceiling
+	// that Resize can move while the pool runs. See NewAdaptive.
+	ModeAdaptive
 )
 
 func (m Mode) String() string {
@@ -25,12 +30,14 @@ func (m Mode) String() string {
 		return "elastic"
 	case ModeCond:
 		return "cond"
+	case ModeAdaptive:
+		return "adaptive"
 	default:
 		return fmt.Sprintf("Mode(%d)", m)
 	}
 }
 
-func (m Mode) Valid() bool { return m == ModeElastic || m == ModeCond }
+func (m Mode) Valid() bool { return m == ModeElastic || m == ModeCond || m == ModeAdaptive }
 
 type Task interface{ RunTask() }
 
@@ -42,6 +49,7 @@ type backend interface {
 	submit(Task) bool
 	submitBatch([]Task) int
 	stop()
+	workerCount() int
 }
 
 type executor struct {
@@ -78,6 +86,9 @@ func New(maxConcurrent, queueSize int) *TaskPool {
 	return NewWithMode(ModeCond, maxConcurrent, queueSize)
 }
 
+// NewWithMode creates a pool of the given mode. For ModeAdaptive,
+// maxConcurrent is the ceiling and the floor is one worker per P; NewAdaptive
+// sets both.
 func NewWithMode(mode Mode, maxConcurrent, queueSize int) *TaskPool {
 	if maxConcurrent <= 0 {
 		panic("taskpool: maxConcurrent must be greater than zero")
@@ -92,6 +103,10 @@ func NewWithMode(mode Mode, maxConcurrent, queueSize int) *TaskPool {
 		pool.backend = newElasticPool(executor, maxConcurrent, queueSize)
 	case ModeCond:
 		pool.backend = newCondBackend(executor, maxConcurrent, queueSize)
+	case ModeAdaptive:
+		pool.backend = newAdaptiveBackend(executor, AdaptiveConfig{
+			MinWorkers: defaultMinWorkers(maxConcurrent), MaxWorkers: maxConcurrent, QueueSize: queueSize,
+		})
 	default:
 		panic("taskpool: invalid mode")
 	}
@@ -129,3 +144,24 @@ func (tp *TaskPool) GoTasks(tasks []Task) int {
 func (tp *TaskPool) Call(f func()) { tp.executor.call(taskFunc(f)) }
 
 func (tp *TaskPool) Stop() { tp.backend.stop() }
+
+// Workers reports how many workers the pool is running: the fixed count under
+// ModeCond, the forked workers under ModeElastic, and the current population
+// under ModeAdaptive.
+func (tp *TaskPool) Workers() int { return tp.backend.workerCount() }
+
+// Resize moves a ModeAdaptive pool's floor and ceiling while it runs. Raising
+// the floor starts workers at once, and lowering the ceiling retires the
+// workers over it: idle ones at once, busy ones as they finish their task.
+// It reports false, and changes nothing, for a pool of any other mode. It
+// panics if maxWorkers is not positive or minWorkers is not between zero and
+// maxWorkers.
+func (tp *TaskPool) Resize(minWorkers, maxWorkers int) bool {
+	adaptive, ok := tp.backend.(*adaptiveBackend)
+	if !ok {
+		return false
+	}
+	validateAdaptiveRange(minWorkers, maxWorkers)
+	adaptive.resize(minWorkers, maxWorkers)
+	return true
+}

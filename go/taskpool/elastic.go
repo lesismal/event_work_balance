@@ -90,6 +90,8 @@ func (p *elasticPool) stop() {
 	})
 }
 
+func (p *elasticPool) workerCount() int { return int(p.active.Load()) }
+
 func (p *elasticPool) fork(first Task) bool {
 	for {
 		active := p.active.Load()

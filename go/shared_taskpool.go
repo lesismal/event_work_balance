@@ -7,9 +7,20 @@ import (
 )
 
 type taskPoolKey struct {
-	mode      taskpool.Mode
-	workers   int
-	queueSize int
+	mode       taskpool.Mode
+	minWorkers int
+	workers    int
+	queueSize  int
+}
+
+// newTaskPool builds the pool a key describes.
+func newTaskPool(key taskPoolKey) *taskpool.TaskPool {
+	if key.mode == taskpool.ModeAdaptive && key.minWorkers > 0 {
+		return taskpool.NewAdaptive(taskpool.AdaptiveConfig{
+			MinWorkers: key.minWorkers, MaxWorkers: key.workers, QueueSize: key.queueSize,
+		})
+	}
+	return taskpool.NewWithMode(key.mode, key.workers, key.queueSize)
 }
 
 type sharedTaskPoolEntry struct {
@@ -27,15 +38,18 @@ func acquireTaskPool(config Config) (TaskPool, func()) {
 		// The caller owns a pool it supplied, so releasing it is a no-op.
 		return config.TaskPool, func() {}
 	}
+	key := taskPoolKey{mode: config.TaskPoolMode, workers: config.WorkerCount, queueSize: config.MaxEvents}
+	if key.mode == taskpool.ModeAdaptive {
+		key.minWorkers = config.MinWorkerCount
+	}
 	if !config.SharedTaskPool {
-		pool := taskpool.NewWithMode(config.TaskPoolMode, config.WorkerCount, config.MaxEvents)
+		pool := newTaskPool(key)
 		return pool, pool.Stop
 	}
-	key := taskPoolKey{mode: config.TaskPoolMode, workers: config.WorkerCount, queueSize: config.MaxEvents}
 	sharedTaskPools.Lock()
 	entry := sharedTaskPools.entries[key]
 	if entry == nil {
-		entry = &sharedTaskPoolEntry{pool: taskpool.NewWithMode(key.mode, key.workers, key.queueSize)}
+		entry = &sharedTaskPoolEntry{pool: newTaskPool(key)}
 		sharedTaskPools.entries[key] = entry
 	}
 	entry.refs++

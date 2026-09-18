@@ -84,7 +84,7 @@ func TestEachTaskRunsOnce(t *testing.T) {
 }
 
 func TestGoTasksRunsBatchesOnce(t *testing.T) {
-	for _, mode := range []Mode{ModeElastic, ModeCond} {
+	for _, mode := range []Mode{ModeElastic, ModeCond, ModeAdaptive} {
 		t.Run(mode.String(), func(t *testing.T) {
 			// A queue smaller than the batch forces submitBatch through its
 			// queue-full wait path.
@@ -112,7 +112,7 @@ func TestGoTasksRunsBatchesOnce(t *testing.T) {
 }
 
 func TestAllModesExecuteAndStop(t *testing.T) {
-	for _, mode := range []Mode{ModeElastic, ModeCond} {
+	for _, mode := range []Mode{ModeElastic, ModeCond, ModeAdaptive} {
 		t.Run(mode.String(), func(t *testing.T) {
 			tp := NewWithMode(mode, 4, 16)
 			var count atomic.Int64
