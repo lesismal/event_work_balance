@@ -73,7 +73,7 @@ const (
 	condMinWorkers       = 256
 	elasticWorkersPerCPU = 1000
 	// elasticMinWorkersPerCPU is the floor per core; see above.
-	elasticMinWorkersPerCPU = 10
+	elasticMinWorkersPerCPU = 20
 
 	// The queue holds connections the loop has made runnable but no worker has
 	// picked up yet, so it is sized from the pool rather than independently,
