@@ -558,10 +558,15 @@ type Server struct {
 	stopping           atomic.Bool
 	nextGeneration     atomic.Uint64
 	pendingTotal       atomic.Int64
-	commandMu          sync.Mutex
-	commands           *commandBatch
-	commandPool        sync.Pool
-	wakePending        atomic.Bool
+	// Backpressure counters, reported by Stats. They move only when a
+	// connection's read interest actually changes, which is rare by design.
+	readsPausedByWatermark atomic.Uint64
+	readsPausedByBudget    atomic.Uint64
+	readsResumed           atomic.Uint64
+	commandMu              sync.Mutex
+	commands               *commandBatch
+	commandPool            sync.Pool
+	wakePending            atomic.Bool
 	// connections is a paged table indexed by file descriptor: a descriptor is
 	// a small dense integer the kernel already allocates, so the lookup on
 	// every epoll event is two bounds checks rather than a hash.
@@ -772,6 +777,36 @@ func (s *Server) LocalAddrs() ([]*net.TCPAddr, error) {
 		}
 	}
 	return addrs, nil
+}
+
+// Stats reports what backpressure this server has applied. It answers the
+// question the counters exist for: whether reads were ever paused, and which
+// of the two bounds did it, since the two have very different causes.
+type Stats struct {
+	// ReadsPausedByWatermark counts the times a connection's reads were paused
+	// because that connection's own queued output reached
+	// WriteBufferHighWatermark. Its peer is not keeping up with its replies.
+	ReadsPausedByWatermark uint64
+	// ReadsPausedByBudget counts the times a connection's reads were paused
+	// because MaxPendingBytes was exhausted across the whole server. Such a
+	// connection may be holding almost nothing itself: it is paying for what
+	// the others have queued, so a connection well under its own watermark can
+	// still be stopped this way.
+	ReadsPausedByBudget uint64
+	// ReadsResumed counts the pauses that have since been lifted.
+	ReadsResumed uint64
+	// PendingBytes is the outbound total queued across this server's
+	// connections right now, which is what MaxPendingBytes bounds.
+	PendingBytes int64
+}
+
+func (s *Server) Stats() Stats {
+	return Stats{
+		ReadsPausedByWatermark: s.readsPausedByWatermark.Load(),
+		ReadsPausedByBudget:    s.readsPausedByBudget.Load(),
+		ReadsResumed:           s.readsResumed.Load(),
+		PendingBytes:           s.pendingTotal.Load(),
+	}
 }
 
 func (s *Server) Run() error {
@@ -1065,6 +1100,16 @@ func (s *Server) refreshConnection(c *Connection) {
 		// nothing of its own left to flush, so no later event of its own would
 		// re-evaluate it. The loop resumes it when the budget recovers.
 		s.budgetPaused = append(s.budgetPaused, c)
+	}
+	if changed {
+		switch {
+		case !pauseReads:
+			s.readsResumed.Add(1)
+		case byBudget:
+			s.readsPausedByBudget.Add(1)
+		default:
+			s.readsPausedByWatermark.Add(1)
+		}
 	}
 	if usable && changed {
 		// Write interest is permanent, so registration only tracks whether

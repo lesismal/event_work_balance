@@ -276,6 +276,20 @@ func (s *Server) submit(c *Connection) bool {
 	return true
 }
 
+// Stats reports what backpressure this server has applied. This backend leaves
+// socket I/O to the runtime's own poller, which applies the pushback itself, so
+// there is no read interest for the server to pause and the counters stay at
+// zero. The method exists so that code written against either backend compiles
+// and runs on both.
+type Stats struct {
+	ReadsPausedByWatermark uint64
+	ReadsPausedByBudget    uint64
+	ReadsResumed           uint64
+	PendingBytes           int64
+}
+
+func (s *Server) Stats() Stats { return Stats{} }
+
 // LocalAddr returns the address of the server's first listener.
 func (s *Server) LocalAddr() (*net.TCPAddr, error) {
 	addrs, err := s.LocalAddrs()

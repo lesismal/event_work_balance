@@ -477,3 +477,126 @@ func TestPausedReadsPreserveStreamIntegrity(t *testing.T) {
 		}
 	}
 }
+
+// A strict ping-pong peer holds one reply at a time, so a watermark set above
+// one reply must not pause its reads however long it runs. This is the shape of
+// the echo benchmark, and the property is easy to lose: the reply is queued
+// rather than written while the read round is corked, so it passes through the
+// pending counter that the watermark is compared against even when the socket
+// could have taken it immediately.
+func TestPingPongUnderWatermarkNeverPausesReads(t *testing.T) {
+	const (
+		watermark = 8 << 10
+		message   = 1 << 10
+		header    = 6
+		rounds    = 200
+	)
+	for _, useWritev := range []bool{true, false} {
+		t.Run(map[bool]string{false: "write", true: "writev"}[useWritev], func(t *testing.T) {
+			config := DefaultConfig()
+			config.WriteBufferHighWatermark = watermark
+			// Leave the server-wide budget off: one connection cannot exhaust
+			// it, and it would pause reads for reasons this test is not about.
+			config.MaxPendingBytes = 0
+			config.UseWritev = useWritev
+			server, addr := startEchoServer(t, config, HandlerFuncs{Data: func(c *Connection, b []byte) {
+				// Reply in two parts, as a framed protocol does.
+				if err := c.SendParts(bytes.Repeat([]byte{'h'}, header), b); err != nil {
+					c.Close()
+				}
+			}})
+
+			conn, err := net.DialTimeout("tcp4", addr, 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			payload := bytes.Repeat([]byte{'x'}, message)
+			reply := make([]byte, header+message)
+			for round := 0; round < rounds; round++ {
+				if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := conn.Write(payload); err != nil {
+					t.Fatalf("round %d: %v", round, err)
+				}
+				if _, err := io.ReadFull(conn, reply); err != nil {
+					t.Fatalf("round %d: %v", round, err)
+				}
+			}
+
+			stats := server.Stats()
+			if stats.ReadsPausedByWatermark != 0 || stats.ReadsPausedByBudget != 0 {
+				t.Fatalf("reads were paused %d times by the watermark and %d by the budget over %d ping-pong rounds "+
+					"of %d-byte replies under a %d-byte watermark, want none",
+					stats.ReadsPausedByWatermark, stats.ReadsPausedByBudget, rounds, header+message, watermark)
+			}
+			// Nothing may be left owing either, or the counter would creep up
+			// across rounds and trip the watermark on a later one.
+			if stats.PendingBytes != 0 {
+				t.Fatalf("pending = %d bytes after %d drained rounds, want 0", stats.PendingBytes, rounds)
+			}
+		})
+	}
+}
+
+// The other half of the same story: a connection far below its own watermark is
+// still stopped when the server-wide budget is gone, because that budget is
+// shared. Stats has to attribute the pause to the budget rather than the
+// watermark, since that is the only way to tell the two apart from outside.
+func TestStatsAttributesBudgetPausesToTheBudget(t *testing.T) {
+	const (
+		watermark = 1 << 20 // far above anything one connection here will hold
+		budget    = 128 << 10
+		peers     = 8
+		payload   = 32 << 10
+	)
+	config := DefaultConfig()
+	config.WriteBufferHighWatermark = watermark
+	config.MaxPendingBytes = budget
+	server, addr := startEchoServer(t, config, HandlerFuncs{Data: func(c *Connection, b []byte) {
+		if err := c.Send(b); err != nil {
+			c.Close()
+		}
+	}})
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < peers; i++ {
+		conn, err := net.DialTimeout("tcp4", addr, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Never read, so the replies pile into the shared budget.
+			data := bytes.Repeat([]byte{'x'}, payload)
+			// Short enough that a writer blocked by the pause this test is
+			// waiting for gives up promptly once stop is closed.
+			_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if _, err := conn.Write(data); err != nil {
+					return
+				}
+			}
+		}()
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for server.Stats().ReadsPausedByBudget == 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	close(stop)
+	wg.Wait()
+
+	stats := server.Stats()
+	if stats.ReadsPausedByBudget == 0 {
+		t.Fatalf("no pause was attributed to the budget; stats = %+v", stats)
+	}
+}

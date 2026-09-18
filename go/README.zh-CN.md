@@ -29,6 +29,18 @@
   config.SetTaskPoolMode(taskpool.ModeCond)  // 容量随之切到 cond 的默认值
   config.SetPoolSizing(500, 10000)           // 固定成自己的取值
   ```
+- 背压有两道界，暂停读的原因只能是其中之一，`Server.Stats()` 会分别计数
+  （`ReadsPausedByWatermark`、`ReadsPausedByBudget`、`ReadsResumed`、
+  `PendingBytes`）：
+  - `WriteBufferHighWatermark` 只看这条连接自己积压了多少，是对端跟不上；
+  - `MaxPendingBytes` 是整个 server 共享的总量，被别的连接耗尽时，**一条自己
+    几乎没有积压的连接也会被暂停读**。排查「水位线明明远大于单条消息却触发了
+    背压」时，先看这两个计数哪个在涨。
+- 注意水位线要比**一轮读取**产生的回包总量大，而不只是比单条消息大：一轮读取
+  是 corked 的，这一轮内所有回包先进队列、轮末一次性 flush，所以即使 TCP 发送
+  缓冲区是空的，队列里也会短暂地存在这一轮的全部回包；一轮最多读
+  `ReadBufferSize` 字节。严格一问一答、单条 1KiB、水位线 8KiB 这种配置有 8 倍
+  余量，不会触发背压（`TestPingPongUnderWatermarkNeverPausesReads` 固定了这一点）。
 - `SharedTaskPool` 默认开启；同一进程内配置相同的多个 Server 共享 worker
   和任务队列，避免多监听端口重复创建大量 goroutine 与队列。需要完全隔离时
   可显式设为 `false`。
