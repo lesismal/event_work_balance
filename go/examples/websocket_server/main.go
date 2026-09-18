@@ -7,7 +7,7 @@ import (
 	stdhttp "net/http"
 
 	fib "github.com/lesismal/fib/go"
-	"github.com/lesismal/fib/go/http/websocket"
+	"github.com/lesismal/fib/go/websocket"
 )
 
 func main() {

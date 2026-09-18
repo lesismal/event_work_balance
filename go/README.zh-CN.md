@@ -237,7 +237,7 @@ resp, err := client.Go(req).Wait() // Future：Wait 阻塞，Done() 可用于 se
 
 ## WebSocket 子 package
 
-`http/websocket` package 实现 RFC 6455 Upgrade 握手、增量帧解析、
+`websocket` package 实现 RFC 6455 Upgrade 握手、增量帧解析、
 分片消息重组、客户端掩码校验、Ping/Pong、Close 握手、子协议协商和消息大小限制：
 
 ```go
