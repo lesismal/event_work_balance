@@ -3,7 +3,7 @@ package epoll
 import (
 	"sync"
 
-	"github.com/lesismal/auto-balance-epoll/go/taskpool"
+	"github.com/lesismal/fib/go/taskpool"
 )
 
 type taskPoolKey struct {

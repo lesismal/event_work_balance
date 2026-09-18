@@ -3,7 +3,7 @@ package websocket
 import (
 	"testing"
 
-	epollhttp "github.com/lesismal/auto-balance-epoll/go/http"
+	epollhttp "github.com/lesismal/fib/go/http"
 )
 
 var benchmarkHandshakeRequest = []byte("GET /chat?id=1 HTTP/1.1\r\nHost: example.test\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: MDEyMzQ1Njc4OWFiY2RlZg==\r\nOrigin: https://example.test\r\n\r\n")

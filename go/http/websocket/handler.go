@@ -14,8 +14,8 @@ import (
 	"sync/atomic"
 	"unicode/utf8"
 
-	epoll "github.com/lesismal/auto-balance-epoll/go"
-	epollhttp "github.com/lesismal/auto-balance-epoll/go/http"
+	epoll "github.com/lesismal/fib/go"
+	epollhttp "github.com/lesismal/fib/go/http"
 )
 
 const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"

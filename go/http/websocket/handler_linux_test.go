@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	epoll "github.com/lesismal/auto-balance-epoll/go"
+	epoll "github.com/lesismal/fib/go"
 )
 
 func TestServerHandshakeEchoPingAndClose(t *testing.T) {

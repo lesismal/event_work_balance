@@ -6,8 +6,8 @@ import (
 	"fmt"
 	stdhttp "net/http"
 
-	epoll "github.com/lesismal/auto-balance-epoll/go"
-	"github.com/lesismal/auto-balance-epoll/go/http/websocket"
+	epoll "github.com/lesismal/fib/go"
+	"github.com/lesismal/fib/go/http/websocket"
 )
 
 func main() {

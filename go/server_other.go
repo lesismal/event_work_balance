@@ -10,7 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/lesismal/auto-balance-epoll/go/taskpool"
+	"github.com/lesismal/fib/go/taskpool"
 )
 
 type Config struct {

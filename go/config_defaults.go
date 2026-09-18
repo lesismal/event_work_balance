@@ -3,7 +3,7 @@ package epoll
 import (
 	"runtime"
 
-	"github.com/lesismal/auto-balance-epoll/go/taskpool"
+	"github.com/lesismal/fib/go/taskpool"
 )
 
 // PoolSizing is how many workers a task pool may run and how many tasks it may

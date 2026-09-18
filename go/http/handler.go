@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"strings"
 
-	epoll "github.com/lesismal/auto-balance-epoll/go"
+	epoll "github.com/lesismal/fib/go"
 )
 
 type Handler interface {

@@ -1,3 +1,3 @@
-module github.com/lesismal/auto-balance-epoll/go
+module github.com/lesismal/fib/go
 
 go 1.22

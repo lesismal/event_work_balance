@@ -18,7 +18,7 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/lesismal/auto-balance-epoll/go/taskpool"
+	"github.com/lesismal/fib/go/taskpool"
 )
 
 const (
