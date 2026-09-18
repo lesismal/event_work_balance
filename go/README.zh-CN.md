@@ -29,8 +29,8 @@
     `TaskPool.Workers()` 返回当前 worker 数（其他 Mode 调 `Resize` 返回 false）。
   - 直接使用：`taskpool.NewAdaptive(taskpool.AdaptiveConfig{MinWorkers: 16,
     MaxWorkers: 4096, QueueSize: 10000})`；`NewWithMode(ModeAdaptive, max, queue)`
-    的下限默认为每个 P 一个 worker。在 fib 里，`WorkerCount` 是上限，
-    `Config.MinWorkerCount` 是下限（0 表示每个 P 一个）。
+    的下限默认为每个 P 十个 worker。在 fib 里，`WorkerCount` 是上限，
+    `Config.MinWorkerCount` 是下限（0 表示每个 P 十个）。
 - 池容量按 Mode 分别给默认值，因为 `WorkerCount` 在不同 Mode 下含义不同
   （ModeAdaptive 与 ModeElastic 一样是上限，默认值也相同）：
   ModeCond 会预先创建这么多协程并让它们挂在条件变量上，这个数就是实际存在的

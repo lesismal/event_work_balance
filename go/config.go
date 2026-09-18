@@ -56,10 +56,8 @@ type PoolSizing struct {
 // Its floor follows the cores rather than GOMAXPROCS, since the ceiling is
 // sized from GOMAXPROCS and the floor is what keeps a lowered GOMAXPROCS from
 // throttling the pool below what the machine's cores can keep busy. It is
-// elasticMinWorkersPerCPU workers per core, the density at which the
-// measurements above peaked: enough workers in flight to cover each core's
-// syscall time, where a fixed floor would hand a two-core machine 5000
-// workers per core.
+// elasticMinWorkersPerCPU workers per core, where a fixed floor would hand a
+// two-core machine 5000 workers per core.
 //
 // ModeAdaptive parks its workers the way ModeCond does but grows and shrinks
 // the population with the load, so its count is a ceiling as under
@@ -75,7 +73,7 @@ const (
 	condMinWorkers       = 256
 	elasticWorkersPerCPU = 1000
 	// elasticMinWorkersPerCPU is the floor per core; see above.
-	elasticMinWorkersPerCPU = 100
+	elasticMinWorkersPerCPU = 10
 
 	// The queue holds connections the loop has made runnable but no worker has
 	// picked up yet, so it is sized from the pool rather than independently,
