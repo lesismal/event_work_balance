@@ -158,6 +158,49 @@ func TestFeedOneBorrowedCompletesOwnedFrameWithoutRetainingTail(t *testing.T) {
 	}
 }
 
+// TestFeedOneBorrowedFragmentsAcrossReads feeds a fragmented message in reads
+// that end mid-frame, as TCP delivers it. When a read completes a fragment and
+// also carries the start of the next frame, those extra bytes must not be lost.
+func TestFeedOneBorrowedFragmentsAcrossReads(t *testing.T) {
+	message := bytes.Repeat([]byte("*"), 65536)
+	for _, fragmentSize := range []int{64, 1300, 4096} {
+		var wire []byte
+		for offset := 0; offset < len(message); offset += fragmentSize {
+			end := min(offset+fragmentSize, len(message))
+			opcode := Continuation
+			if offset == 0 {
+				opcode = Text
+			}
+			wire = append(wire, clientFrame(opcode, end == len(message), message[offset:end])...)
+		}
+		for _, readSize := range []int{1, 100, 1300, 4096, len(wire)} {
+			parser := NewParser(1 << 20)
+			messages := 0
+			for offset := 0; offset < len(wire); offset += readSize {
+				data := append([]byte(nil), wire[offset:min(offset+readSize, len(wire))]...)
+				for {
+					event, complete, err := parser.FeedOneBorrowed(data)
+					data = nil
+					if err != nil {
+						t.Fatalf("fragment=%d read=%d offset=%d: %v", fragmentSize, readSize, offset, err)
+					}
+					if !complete {
+						break
+					}
+					if !bytes.Equal(event.Payload, message) {
+						t.Fatalf("fragment=%d read=%d: payload mismatch", fragmentSize, readSize)
+					}
+					messages++
+				}
+				parser.ReleaseBorrowed()
+			}
+			if messages != 1 {
+				t.Fatalf("fragment=%d read=%d: got %d messages, want 1", fragmentSize, readSize, messages)
+			}
+		}
+	}
+}
+
 // TestPooledBufferNotSharedWhileFrameIsPartial guards the recycling of adopted
 // frame buffers. A parser holding half a frame must keep its array until the
 // rest arrives; handing that array back while it is still in use would let a

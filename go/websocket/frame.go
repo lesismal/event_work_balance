@@ -204,6 +204,14 @@ func (p *Parser) feedOne(data []byte, borrowPayload bool) (Event, bool, error) {
 			return Event{}, false, err
 		}
 		if !complete {
+			// A fragment emits nothing, so the bytes that followed it in the
+			// same read must be picked up here rather than on the next call.
+			if len(p.buffer) == 0 && len(p.borrowedTail) != 0 {
+				p.buffer = p.borrowedTail
+				p.borrowedTail = nil
+				p.borrowedBuffer = true
+				continue
+			}
 			if p.borrowedBuffer && len(p.buffer) != 0 {
 				p.adopt()
 			}
