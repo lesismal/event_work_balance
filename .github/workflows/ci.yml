@@ -22,8 +22,8 @@ jobs:
       run:
         working-directory: go
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: stable
           cache-dependency-path: go/go.mod
@@ -66,22 +66,41 @@ jobs:
       run:
         working-directory: go
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go }}
           cache-dependency-path: go/go.mod
+      # Go 1.22's internal linker omits LC_UUID, which current macOS dyld
+      # refuses to load; the external linker adds it.
+      - name: Use external linker for Go 1.22 on macOS
+        if: runner.os == 'macOS' && matrix.go == '1.22.x'
+        run: echo "GOFLAGS=-ldflags=-linkmode=external" >> "$GITHUB_ENV"
       - name: Build
         run: go build ./...
       - name: Test
-        run: go test -race -count=1 -timeout 10m ./...
+        shell: bash
+        run: |
+          set +e
+          go test -race -count=1 -timeout 10m ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            # Surface the failures as an annotation so they are readable
+            # without opening the full log.
+            summary=$(grep -E -B2 -A20 -- '--- FAIL|^panic:|^FAIL|fatal error:' "$RUNNER_TEMP/test.log" | head -c 60000)
+            summary=${summary//'%'/'%25'}
+            summary=${summary//$'\r'/'%0D'}
+            summary=${summary//$'\n'/'%0A'}
+            echo "::error title=go test failed::$summary"
+          fi
+          exit "$status"
 
   cross-build:
     name: Cross build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: stable
           cache-dependency-path: go/go.mod
@@ -106,7 +125,7 @@ jobs:
       matrix:
         cc: [gcc, clang]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build
         run: make -C c CC=${{ matrix.cc }} CFLAGS="-O2 -g -std=c11 -Wall -Wextra -Wpedantic -Werror"
       - name: Integration test
@@ -117,8 +136,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: stable
           cache-dependency-path: go/go.mod
@@ -149,7 +168,7 @@ jobs:
         run: python3 .github/autobahn/check_report.py reports/servers/index.json
       - name: Upload report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: autobahn-report
           path: reports/servers
