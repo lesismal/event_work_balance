@@ -18,14 +18,32 @@ type Engine struct {
 	releaseTaskPool func()
 	taskWG          sync.WaitGroup
 	stopping        atomic.Bool
-	closeOnce       sync.Once
-	mu              sync.Mutex
-	connections     map[*Connection]struct{}
-	readers         sync.WaitGroup
-	readBufferPool  sync.Pool
+	// stopped closes when Stop is called, which is what Run waits on when
+	// there is no listener to serve.
+	stopped        chan struct{}
+	closeOnce      sync.Once
+	mu             sync.Mutex
+	connections    map[*Connection]struct{}
+	readers        sync.WaitGroup
+	readBufferPool sync.Pool
 }
 
+// Bind creates an engine that listens on config.Addr, or on every address in
+// config.Addrs, and serves the connections it accepts with handler.
 func Bind(config Config, handler Handler) (*Engine, error) {
+	addrs := config.Addrs
+	if len(addrs) == 0 {
+		addrs = []string{config.Addr}
+	}
+	return newEngine(config, handler, addrs)
+}
+
+// NewEngine creates an engine with no listeners, for connections it dials.
+func NewEngine(config Config, handler Handler) (*Engine, error) {
+	return newEngine(config, handler, nil)
+}
+
+func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) {
 	if err := config.validateTaskPool(); err != nil {
 		return nil, err
 	}
@@ -42,10 +60,6 @@ func Bind(config Config, handler Handler) (*Engine, error) {
 	if network == "" {
 		network = "tcp"
 	}
-	addrs := config.Addrs
-	if len(addrs) == 0 {
-		addrs = []string{config.Addr}
-	}
 	listeners := make([]net.Listener, 0, len(addrs))
 	for _, addr := range addrs {
 		if addr == "" {
@@ -61,7 +75,8 @@ func Bind(config Config, handler Handler) (*Engine, error) {
 		listeners = append(listeners, listener)
 	}
 	pool, releasePool := acquireTaskPool(config)
-	e := &Engine{listeners: listeners, handler: handler, taskPool: pool, releaseTaskPool: releasePool, connections: make(map[*Connection]struct{})}
+	e := &Engine{listeners: listeners, handler: handler, taskPool: pool, releaseTaskPool: releasePool,
+		connections: make(map[*Connection]struct{}), stopped: make(chan struct{})}
 	e.readBufferPool.New = func() any { return &readBuffer{data: make([]byte, config.ReadBufferSize)} }
 	return e, nil
 }
@@ -95,6 +110,9 @@ func (e *Engine) LocalAddr() (*net.TCPAddr, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(addrs) == 0 {
+		return nil, errors.New("fib: engine has no listener")
+	}
 	return addrs[0], nil
 }
 
@@ -114,6 +132,12 @@ func (e *Engine) LocalAddrs() ([]*net.TCPAddr, error) {
 // Run serves every listener until the server is stopped. It returns the first
 // error any of them reported.
 func (e *Engine) Run() error {
+	if len(e.listeners) == 0 {
+		// A client engine's connections are served by their own readers, so
+		// Run only has to last as long as the engine does.
+		<-e.stopped
+		return nil
+	}
 	if len(e.listeners) == 1 {
 		return e.serve(e.listeners[0])
 	}
@@ -145,15 +169,15 @@ func (e *Engine) serve(listener net.Listener) error {
 			}
 			return err
 		}
-		e.adopt(conn, nil)
+		e.adopt(conn, e.handler, nil)
 	}
 }
 
 // adopt starts serving an established connection: OnOpen, then done if the
 // connection was dialed, then its reader. It reports false, and closes conn,
 // if the engine has stopped in the meantime.
-func (e *Engine) adopt(conn net.Conn, done func(*Connection, error)) bool {
-	c := &Connection{engine: e, conn: conn}
+func (e *Engine) adopt(conn net.Conn, handler Handler, done func(*Connection, error)) bool {
+	c := &Connection{engine: e, handler: handler, conn: conn}
 	c.fd.Store(-1)
 	e.mu.Lock()
 	if e.stopping.Load() {
@@ -164,7 +188,7 @@ func (e *Engine) adopt(conn net.Conn, done func(*Connection, error)) bool {
 	e.connections[c] = struct{}{}
 	e.readers.Add(1)
 	e.mu.Unlock()
-	e.handler.OnOpen(c)
+	c.handler.OnOpen(c)
 	if done != nil {
 		done(c, nil)
 	}
@@ -180,6 +204,15 @@ func (e *Engine) adopt(conn net.Conn, done func(*Connection, error)) bool {
 // error on failure, and an error from Dial itself, with done never called,
 // only when the dial cannot start at all.
 func (e *Engine) Dial(network, addr string, timeout time.Duration, done func(*Connection, error)) error {
+	return e.DialWithHandler(network, addr, timeout, nil, done)
+}
+
+// DialWithHandler is Dial with a handler of the connection's own. A nil
+// handler means the engine's.
+func (e *Engine) DialWithHandler(network, addr string, timeout time.Duration, handler Handler, done func(*Connection, error)) error {
+	if handler == nil {
+		handler = e.handler
+	}
 	switch network {
 	case "":
 		network = "tcp"
@@ -192,7 +225,7 @@ func (e *Engine) Dial(network, addr string, timeout time.Duration, done func(*Co
 	}
 	go func() {
 		conn, err := net.DialTimeout(network, addr, timeout)
-		if err == nil && !e.adopt(conn, done) {
+		if err == nil && !e.adopt(conn, handler, done) {
 			err = &net.OpError{Op: "dial", Net: network, Addr: conn.RemoteAddr(), Err: net.ErrClosed}
 		}
 		if err != nil && done != nil {
@@ -233,10 +266,11 @@ func (e *Engine) finishConnection(c *Connection, err error) {
 	e.mu.Lock()
 	delete(e.connections, c)
 	e.mu.Unlock()
-	e.handler.OnClose(c, err)
+	c.handler.OnClose(c, err)
 }
 func (e *Engine) Stop() {
 	if e.stopping.CompareAndSwap(false, true) {
+		close(e.stopped)
 		for _, listener := range e.listeners {
 			_ = listener.Close()
 		}

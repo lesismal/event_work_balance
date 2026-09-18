@@ -162,6 +162,11 @@ err := server.Dial("tcp", "127.0.0.1:9001", 3*time.Second, func(c *fib.Connectio
 - Engine 关闭时，尚未完成的 Dial 都会以 `net.ErrClosed` 通知 done。
 - 兼容后端（如 FreeBSD）用 `net.DialTimeout` 在 goroutine 里连接，done 在该
   goroutine 上执行。
+- `DialWithHandler` 让这条连接使用自己的 handler，`OnOpen`、`OnData`、`OnClose`
+  都只交给它，Engine 的 handler 收不到；同一个 Engine 因此可以同时承载 server 和
+  使用不同协议的 client 连接。`Dial` 等价于 handler 传 nil，即使用 Engine 的。
+- `fib.NewEngine(config, handler)` 创建不监听任何地址的 Engine，只用于 Dial 出去
+  的连接；它的 `LocalAddr` 返回错误。
 
 运行示例和测试：
 
@@ -192,6 +197,43 @@ server, err := fib.Bind(config, handler)
 cd go
 go run ./examples/http_server
 ```
+
+### 异步 HTTP client
+
+`http.Client` 在 Engine 上发送 HTTP/1.1 请求，调用方不会阻塞。响应由 Engine 的
+worker 读取，body 完整缓存后再交给回调；也可以用 `Go` 拿到 Future 等待结果：
+
+```go
+engine, _ := fib.NewEngine(fib.DefaultConfig(), nil) // 或直接复用 server 的 Engine
+go engine.Run()
+client := fibhttp.NewClient(engine, fibhttp.DefaultClientConfig())
+
+req, _ := http.NewRequest("GET", "http://127.0.0.1:8080/hello", nil)
+client.Do(req, func(resp *http.Response, err error) {
+    // 响应、错误、超时或取消，恰好回调一次
+})
+
+resp, err := client.Go(req).Wait() // Future：Wait 阻塞，Done() 可用于 select
+```
+
+- 只支持 `http://`；`https://` 返回 `ErrUnsupportedScheme`。
+- 每个 host:port 维护连接池：keep-alive 复用，`MaxConnsPerHost` 限制同时打开或正在
+  建立的连接数，超出的请求排队；`MaxIdleConnsPerHost`、`IdleConnTimeout` 控制空闲
+  连接的保留。每条连接同时只跑一个请求，不做 pipelining。
+- 支持 `Content-Length`、chunked（含 trailer）、以关闭连接为结束的 body，HEAD、
+  204、304 不读 body，1xx 中间响应自动跳过。`MaxResponseHeaderBytes`、
+  `MaxResponseBodyBytes` 限制单个响应大小。
+- `Timeout` 覆盖从 `Do` 到响应完整的全过程（排队、建连、发送、读取），超时错误满足
+  `errors.Is(err, os.ErrDeadlineExceeded)`；取消请求的 context 同样会结束请求。被
+  放弃的请求所在连接会被关闭。
+- 复用的空闲连接如果已被服务端关闭、且没有收到任何响应字节，GET/HEAD/OPTIONS/TRACE
+  会在新连接上自动重试一次；其他方法直接返回错误。
+- 回调可能在任意 goroutine 上执行：成功的响应在读取它的 worker 上回调，超时和取消在
+  定时器 goroutine 上，连接失败在单独的 goroutine 上，`Do` 立即拒绝的请求在调用方
+  goroutine 上。回调不要长时间阻塞；开启 `InlineHandlers` 时成功回调会在事件循环上执行。
+- `Do` 会在调用方 goroutine 里读完 `req.Body`。
+- 先 `client.Close()` 再关闭 Engine：`Close` 让排队中的请求以 `ErrClientClosed` 失败，
+  已发出的请求照常完成；直接关闭 Engine 不会通知 client，已发出的请求只能等超时。
 
 ## WebSocket 子 package
 

@@ -17,6 +17,8 @@ type dialRequest struct {
 	addr    string
 	timeout time.Duration
 	done    func(*Connection, error)
+	// handler serves the connection once it is established.
+	handler Handler
 	// family and sa are the resolved address to connect to, and raddr the same
 	// address as the net package reports it. err is set instead when resolving
 	// failed, and the loop only has to report it.
@@ -47,7 +49,19 @@ type dialRequest struct {
 // that the dial cannot start: an unknown network, a malformed or unresolvable
 // literal address, or an engine that has been stopped.
 func (e *Engine) Dial(network, addr string, timeout time.Duration, done func(*Connection, error)) error {
-	d := &dialRequest{network: network, addr: addr, timeout: timeout, done: done}
+	return e.DialWithHandler(network, addr, timeout, nil, done)
+}
+
+// DialWithHandler is Dial with a handler of the connection's own: OnOpen,
+// OnData, OnPriorityData and OnClose for this connection go to handler rather
+// than to the engine's. This is what lets one engine carry a server and the
+// clients it talks to, each with its own protocol. A nil handler means the
+// engine's.
+func (e *Engine) DialWithHandler(network, addr string, timeout time.Duration, handler Handler, done func(*Connection, error)) error {
+	if handler == nil {
+		handler = e.handler
+	}
+	d := &dialRequest{network: network, addr: addr, timeout: timeout, done: done, handler: handler}
 	if network == "" {
 		d.network = "tcp"
 	}
@@ -158,7 +172,7 @@ func (e *Engine) completeDial(c *Connection) {
 	if d.timer != nil {
 		d.timer.Stop()
 	}
-	e.handler.OnOpen(c)
+	c.handler.OnOpen(c)
 	if d.done != nil {
 		d.done(c, nil)
 	}

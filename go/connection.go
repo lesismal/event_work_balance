@@ -29,7 +29,10 @@ type connectionAttachment struct{ value any }
 // Connection is safe to use from callback and application goroutines.
 type Connection struct {
 	connPlatform
-	engine        *Engine
+	engine *Engine
+	// handler receives this connection's callbacks: the engine's handler for
+	// an accepted connection, or the one DialWithHandler was given.
+	handler       Handler
 	mu            sync.Mutex
 	pendingEvents uint32
 	sends         []sendItem
@@ -506,7 +509,7 @@ func (c *Connection) readLoop() error {
 	for {
 		n, err := c.sysRead(buf)
 		if n > 0 {
-			c.engine.handler.OnData(c, buf[:n])
+			c.handler.OnData(c, buf[:n])
 			if c.overWriteWatermark() {
 				// The replies queued so far already fill the write budget.
 				// Hand them to the socket before reading on rather than
@@ -562,7 +565,7 @@ func (c *Connection) drainPriorityInput() error {
 	for {
 		n, err := c.sysRecvOOB(buf)
 		if n > 0 {
-			c.engine.handler.OnPriorityData(c, buf[:n])
+			c.handler.OnPriorityData(c, buf[:n])
 			continue
 		}
 		if n == 0 && err == nil {

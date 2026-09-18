@@ -168,7 +168,7 @@ func (e *Engine) acceptConnections(listenFD int) {
 		// indexes the table, and the generation makes an event left over from a
 		// previous owner of the same descriptor resolve to nothing.
 		token := uint64(uint32(fd)) | e.nextGeneration.Add(1)<<32
-		c := &Connection{engine: e}
+		c := &Connection{engine: e, handler: e.handler}
 		c.token = token
 		c.fd.Store(int32(fd))
 		// Write interest is registered up front and never modified again. The
@@ -180,7 +180,7 @@ func (e *Engine) acceptConnections(listenFD int) {
 			continue
 		}
 		e.trackConnection(fd, c)
-		e.handler.OnOpen(c)
+		c.handler.OnOpen(c)
 	}
 }
 

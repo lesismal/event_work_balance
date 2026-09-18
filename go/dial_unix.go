@@ -28,7 +28,7 @@ func (e *Engine) connectSocket(d *dialRequest) (c *Connection, connected bool, e
 		return nil, false, err
 	}
 	token := uint64(uint32(fd)) | e.nextGeneration.Add(1)<<32
-	c = &Connection{engine: e, dialing: d}
+	c = &Connection{engine: e, handler: d.handler, dialing: d}
 	c.token = token
 	c.fd.Store(int32(fd))
 	// Registering an unconnected socket is what makes the connect

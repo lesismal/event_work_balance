@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -251,5 +252,63 @@ func TestDialRejectsWhatCannotStart(t *testing.T) {
 	}
 	if err := closed.Dial("tcp4", "127.0.0.1:"+strconv.Itoa(80), 0, never); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Dial on a closed engine: %v, want net.ErrClosed", err)
+	}
+}
+
+// A dialed connection with a handler of its own gets every callback there, and
+// the engine's handler hears nothing of it. An engine made by NewEngine has no
+// listener at all.
+func TestDialWithHandlerOnListenerlessEngine(t *testing.T) {
+	_, addr := startEchoServer(t, DefaultConfig(), echoHandler())
+	var engineCalls atomic.Int64
+	client, err := NewEngine(DefaultConfig(), HandlerFuncs{
+		Open: func(*Connection) { engineCalls.Add(1) },
+		Data: func(*Connection, []byte) { engineCalls.Add(1) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.LocalAddr(); err == nil {
+		t.Fatal("LocalAddr on an engine without listeners reported an address")
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- client.Run() }()
+	defer func() {
+		client.Stop()
+		if err := <-runDone; err != nil {
+			t.Error(err)
+		}
+		_ = client.Close()
+	}()
+
+	opened := make(chan struct{})
+	echoed := make(chan []byte, 1)
+	closed := make(chan error, 1)
+	own := HandlerFuncs{
+		Open:  func(*Connection) { close(opened) },
+		Data:  func(_ *Connection, b []byte) { echoed <- append([]byte(nil), b...) },
+		Close: func(_ *Connection, err error) { closed <- err },
+	}
+	err = client.DialWithHandler("tcp", addr, 5*time.Second, own, func(c *Connection, err error) {
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		_ = c.Send([]byte("own handler"))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-echoed:
+		if string(got) != "own handler" {
+			t.Fatalf("echo = %q", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no echo reached the dial's own handler")
+	}
+	<-opened
+	if n := engineCalls.Load(); n != 0 {
+		t.Fatalf("the engine's handler was called %d times for a connection dialed with its own", n)
 	}
 }

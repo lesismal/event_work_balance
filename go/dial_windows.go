@@ -30,7 +30,7 @@ func (e *Engine) connectSocket(d *dialRequest) (c *Connection, connected bool, e
 		syscall.Closesocket(s)
 		return nil, false, err
 	}
-	c = &Connection{engine: e, dialing: d}
+	c = &Connection{engine: e, handler: d.handler, dialing: d}
 	c.handle.Store(uintptr(s))
 	c.readOp = ioOp{kind: opRead, conn: c}
 	// The connect borrows the write operation: no write can be posted before

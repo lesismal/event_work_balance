@@ -339,12 +339,12 @@ func (e *Engine) adopt(l *winListener, s syscall.Handle) error {
 	if err != nil {
 		return err
 	}
-	c := &Connection{engine: e}
+	c := &Connection{engine: e, handler: e.handler}
 	c.handle.Store(uintptr(s))
 	c.readOp = ioOp{kind: opRead, conn: c}
 	c.writeOp = ioOp{kind: opWrite, conn: c}
 	e.conns[c] = struct{}{}
-	e.handler.OnOpen(c)
+	c.handler.OnOpen(c)
 	c.rearmRead()
 	return nil
 }

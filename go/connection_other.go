@@ -23,6 +23,7 @@ type connectionAttachment struct{ value any }
 
 type Connection struct {
 	engine                             *Engine
+	handler                            Handler
 	conn                               net.Conn
 	fd                                 atomic.Int64
 	mu                                 sync.Mutex
@@ -143,7 +144,7 @@ func (c *Connection) process() {
 			c.engine.finishConnection(c, event.closeErr)
 			return
 		}
-		c.engine.handler.OnData(c, event.data)
+		c.handler.OnData(c, event.data)
 	}
 }
 

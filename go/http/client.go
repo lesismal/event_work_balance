@@ -1,0 +1,627 @@
+//go:build linux || darwin || windows
+
+package http
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	stdhttp "net/http"
+	"os"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	fib "github.com/lesismal/fib/go"
+)
+
+var (
+	// ErrClientClosed is what requests still waiting for a connection get when
+	// the client is closed, and what new requests get afterwards.
+	ErrClientClosed = errors.New("http: client closed")
+	// ErrUnsupportedScheme is what a request for anything but http:// gets.
+	ErrUnsupportedScheme = errors.New("http: unsupported URL scheme")
+	// errRequestTimeout is what a request gets when ClientConfig.Timeout runs
+	// out. errors.Is matches it against os.ErrDeadlineExceeded.
+	errRequestTimeout = fmt.Errorf("http: request timed out: %w", os.ErrDeadlineExceeded)
+)
+
+// ClientConfig bounds what a Client waits for and how many connections it
+// keeps.
+type ClientConfig struct {
+	// Timeout bounds a request from Do until its response is complete:
+	// waiting for a connection, dialing, sending and reading all count. Zero
+	// means no limit beyond the request's context.
+	Timeout time.Duration
+	// DialTimeout bounds one connect. Zero leaves it to the operating system.
+	DialTimeout time.Duration
+	// MaxConnsPerHost caps the connections open or dialing to one host:port.
+	// Requests beyond it wait for one of them. Zero or less means no cap.
+	MaxConnsPerHost int
+	// MaxIdleConnsPerHost is how many finished connections to one host:port
+	// are kept for later requests. Zero or less keeps none, so every request
+	// dials afresh.
+	MaxIdleConnsPerHost int
+	// IdleConnTimeout closes a kept connection that has not been reused for
+	// this long. Zero keeps it until the server closes it.
+	IdleConnTimeout time.Duration
+	// MaxResponseHeaderBytes and MaxResponseBodyBytes bound what one response
+	// may hold. The body is buffered whole before the callback runs, so the
+	// second is also the memory one response can take.
+	MaxResponseHeaderBytes int
+	MaxResponseBodyBytes   int64
+}
+
+func DefaultClientConfig() ClientConfig {
+	return ClientConfig{
+		Timeout:                30 * time.Second,
+		DialTimeout:            10 * time.Second,
+		MaxConnsPerHost:        64,
+		MaxIdleConnsPerHost:    16,
+		IdleConnTimeout:        90 * time.Second,
+		MaxResponseHeaderBytes: 1 << 20,
+		MaxResponseBodyBytes:   64 << 20,
+	}
+}
+
+// Client sends HTTP/1.1 requests over connections an engine dials and
+// serves, without blocking the caller. Responses are read by the engine's
+// workers and handed to a callback with their body already buffered, so a
+// callback never waits on the network.
+//
+// A client keeps its connections alive between requests and sends one request
+// at a time on each; it does not pipeline. Only http:// is supported.
+//
+// The engine may be one made by fib.NewEngine for clients alone, or a server's
+// own engine: client connections carry their own handler, so the two never
+// see each other's traffic. The engine has to be running. Close the client
+// before closing the engine: closing the engine drops its connections without
+// telling the client, so requests on them are only answered by their timeout.
+type Client struct {
+	engine *fib.Engine
+	config ClientConfig
+	mu     sync.Mutex
+	hosts  map[string]*hostPool
+	closed bool
+}
+
+// NewClient returns a client that dials through engine. Zero limits in config
+// are taken as written, so start from DefaultClientConfig to change only some.
+func NewClient(engine *fib.Engine, config ClientConfig) *Client {
+	defaults := DefaultClientConfig()
+	if config.MaxResponseHeaderBytes <= 0 {
+		config.MaxResponseHeaderBytes = defaults.MaxResponseHeaderBytes
+	}
+	if config.MaxResponseBodyBytes <= 0 {
+		config.MaxResponseBodyBytes = defaults.MaxResponseBodyBytes
+	}
+	return &Client{engine: engine, config: config, hosts: make(map[string]*hostPool)}
+}
+
+// Do sends req and calls callback exactly once with its response or the
+// reason there is none. It does not wait for the network, though it does read
+// req.Body, which must therefore not block for long.
+//
+// The response body is buffered whole and may be read after the callback
+// returns; closing it is optional. Cancelling req's context abandons the
+// request, as does the client's Timeout.
+//
+// callback may run on any goroutine: an engine worker for a response, which
+// the callback then holds until it returns, a timer for a timeout or a
+// cancellation, the caller's own for a request Do rejects outright, or one of
+// its own for a connection that failed. It must not block the engine for long,
+// and when the engine runs handlers inline it runs on the event loop itself.
+func (c *Client) Do(req *stdhttp.Request, callback func(*stdhttp.Response, error)) {
+	if callback == nil {
+		callback = func(*stdhttp.Response, error) {}
+	}
+	addr, err := requestAddr(req)
+	if err != nil {
+		callback(nil, err)
+		return
+	}
+	var buf bytes.Buffer
+	if err = req.Write(&buf); err != nil {
+		callback(nil, err)
+		return
+	}
+	r := &clientRequest{req: req, data: buf.Bytes(), callback: callback}
+	// Either hook can fire before it has been stored, so both are stored under
+	// the lock finish reads them under.
+	r.mu.Lock()
+	if c.config.Timeout > 0 {
+		r.timer = time.AfterFunc(c.config.Timeout, func() { r.abort(errRequestTimeout) })
+	}
+	if ctx := req.Context(); ctx.Done() != nil {
+		r.stopContext = context.AfterFunc(ctx, func() { r.abort(ctx.Err()) })
+	}
+	r.mu.Unlock()
+	c.enqueue(addr, r, false)
+}
+
+// Future is a request in flight, for callers that would rather wait on it than
+// be called back.
+type Future struct {
+	done chan struct{}
+	resp *stdhttp.Response
+	err  error
+}
+
+// Go sends req like Do and returns a Future for its outcome.
+func (c *Client) Go(req *stdhttp.Request) *Future {
+	f := &Future{done: make(chan struct{})}
+	c.Do(req, func(resp *stdhttp.Response, err error) {
+		f.resp, f.err = resp, err
+		close(f.done)
+	})
+	return f
+}
+
+// Wait blocks until the response has arrived or the request has failed.
+func (f *Future) Wait() (*stdhttp.Response, error) {
+	<-f.done
+	return f.resp, f.err
+}
+
+// Done is closed once Wait would no longer block, for use in a select.
+func (f *Future) Done() <-chan struct{} { return f.done }
+
+// Close stops the client taking requests. Requests still waiting for a
+// connection fail with ErrClientClosed and idle connections are closed.
+// Requests already on a connection finish as they would have.
+func (c *Client) Close() {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.closed = true
+	var idle []*clientConn
+	var waiting []*clientRequest
+	for _, h := range c.hosts {
+		idle = append(idle, h.idle...)
+		h.idle = nil
+		waiting = append(waiting, h.waiting...)
+		h.waiting = nil
+	}
+	c.mu.Unlock()
+	for _, cc := range idle {
+		cc.discard()
+	}
+	for _, r := range waiting {
+		r.finish(nil, ErrClientClosed)
+	}
+}
+
+// requestAddr is the host:port to dial for req.
+func requestAddr(req *stdhttp.Request) (string, error) {
+	if req.URL == nil {
+		return "", errors.New("http: request has no URL")
+	}
+	if req.URL.Scheme != "http" {
+		return "", fmt.Errorf("%w %q", ErrUnsupportedScheme, req.URL.Scheme)
+	}
+	host := req.URL.Hostname()
+	if host == "" {
+		return "", errors.New("http: request URL has no host")
+	}
+	port := req.URL.Port()
+	if port == "" {
+		port = "80"
+	}
+	return net.JoinHostPort(host, port), nil
+}
+
+// hostPool is the client's state for one host:port. Guarded by Client.mu.
+type hostPool struct {
+	addr string
+	// open counts connections open or dialing, and dialing the second kind.
+	open    int
+	dialing int
+	idle    []*clientConn
+	waiting []*clientRequest
+}
+
+// assignment pairs a request with the connection that will carry it. They are
+// collected under the client's lock and carried out after it is released.
+type assignment struct {
+	conn *clientConn
+	req  *clientRequest
+}
+
+// enqueue queues r for addr and starts whatever that makes possible. A retried
+// request goes to the front, since it has already waited its turn once.
+func (c *Client) enqueue(addr string, r *clientRequest, retry bool) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		r.finish(nil, ErrClientClosed)
+		return
+	}
+	h := c.hosts[addr]
+	if h == nil {
+		h = &hostPool{addr: addr}
+		c.hosts[addr] = h
+	}
+	if retry {
+		h.waiting = append([]*clientRequest{r}, h.waiting...)
+	} else {
+		h.waiting = append(h.waiting, r)
+	}
+	work, dials := c.dispatchLocked(h)
+	c.mu.Unlock()
+	c.carryOut(h, work, dials)
+}
+
+// dispatchLocked matches waiting requests with idle connections, and reports
+// how many connections to dial for the requests left over.
+func (c *Client) dispatchLocked(h *hostPool) (work []assignment, dials int) {
+	for len(h.waiting) > 0 {
+		r := h.waiting[0]
+		if r.done.Load() {
+			h.waiting = h.waiting[1:]
+			continue
+		}
+		n := len(h.idle)
+		if n == 0 {
+			break
+		}
+		cc := h.idle[n-1]
+		h.idle = h.idle[:n-1]
+		if cc.idleTimer != nil {
+			cc.idleTimer.Stop()
+			cc.idleTimer = nil
+		}
+		h.waiting = h.waiting[1:]
+		work = append(work, assignment{conn: cc, req: r})
+	}
+	for need := len(h.waiting) - h.dialing; need > 0; need-- {
+		if c.config.MaxConnsPerHost > 0 && h.open >= c.config.MaxConnsPerHost {
+			break
+		}
+		h.open++
+		h.dialing++
+		dials++
+	}
+	if len(h.waiting) == 0 {
+		// Let the queue's array go instead of keeping the longest it has been.
+		h.waiting = nil
+	}
+	return work, dials
+}
+
+func (c *Client) carryOut(h *hostPool, work []assignment, dials int) {
+	for _, a := range work {
+		a.conn.send(a.req)
+	}
+	for ; dials > 0; dials-- {
+		c.dial(h)
+	}
+}
+
+func (c *Client) dial(h *hostPool) {
+	cc := &clientConn{client: c, host: h}
+	cc.parser.maxHeader = c.config.MaxResponseHeaderBytes
+	cc.parser.maxBody = c.config.MaxResponseBodyBytes
+	err := c.engine.DialWithHandler("tcp", h.addr, c.config.DialTimeout, cc, func(_ *fib.Connection, err error) {
+		c.dialed(cc, err)
+	})
+	if err != nil {
+		c.dialed(cc, err)
+	}
+}
+
+// dialed settles a dial. A new connection goes to work straight away; a failed
+// dial fails the request that has waited longest, since it is the one most
+// likely to have caused it, and the rest try again.
+func (c *Client) dialed(cc *clientConn, err error) {
+	h := cc.host
+	c.mu.Lock()
+	h.dialing--
+	if err == nil {
+		c.mu.Unlock()
+		c.release(cc)
+		return
+	}
+	h.open--
+	var failed *clientRequest
+	for len(h.waiting) > 0 && failed == nil {
+		if r := h.waiting[0]; !r.done.Load() {
+			failed = r
+		}
+		h.waiting = h.waiting[1:]
+	}
+	work, dials := c.dispatchLocked(h)
+	c.mu.Unlock()
+	if failed != nil {
+		// Dial callbacks run on the event loop, which a request's callback must
+		// never be allowed to hold up.
+		go failed.finish(nil, err)
+	}
+	c.carryOut(h, work, dials)
+}
+
+// release hands a connection with nothing in flight to the next waiting
+// request, or keeps it idle, or closes it if there is room for neither.
+func (c *Client) release(cc *clientConn) {
+	h := cc.host
+	c.mu.Lock()
+	if cc.isClosed() {
+		c.mu.Unlock()
+		return
+	}
+	for len(h.waiting) > 0 {
+		r := h.waiting[0]
+		h.waiting = h.waiting[1:]
+		if !r.done.Load() {
+			c.mu.Unlock()
+			cc.send(r)
+			return
+		}
+	}
+	keep := !c.closed && len(h.idle) < c.config.MaxIdleConnsPerHost
+	if keep {
+		h.idle = append(h.idle, cc)
+		if c.config.IdleConnTimeout > 0 {
+			cc.idleTimer = time.AfterFunc(c.config.IdleConnTimeout, func() { c.expireIdle(cc) })
+		}
+	}
+	c.mu.Unlock()
+	if !keep {
+		cc.discard()
+	}
+}
+
+// expireIdle closes a connection that sat idle for IdleConnTimeout, unless a
+// request took it in the meantime.
+func (c *Client) expireIdle(cc *clientConn) {
+	c.mu.Lock()
+	idle := removeConn(&cc.host.idle, cc)
+	c.mu.Unlock()
+	if idle {
+		cc.discard()
+	}
+}
+
+// forget drops a closed connection from its host and lets waiting requests
+// have its place.
+func (c *Client) forget(cc *clientConn) {
+	h := cc.host
+	c.mu.Lock()
+	removeConn(&h.idle, cc)
+	h.open--
+	work, dials := c.dispatchLocked(h)
+	c.mu.Unlock()
+	c.carryOut(h, work, dials)
+}
+
+func removeConn(conns *[]*clientConn, cc *clientConn) bool {
+	for i, other := range *conns {
+		if other == cc {
+			*conns = append((*conns)[:i], (*conns)[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// clientRequest is one call to Do, from the queue to its callback.
+type clientRequest struct {
+	req      *stdhttp.Request
+	data     []byte
+	callback func(*stdhttp.Response, error)
+	done     atomic.Bool
+	// retried records that the request has already been sent again once, after
+	// a reused connection turned out to be closed.
+	retried bool
+	mu      sync.Mutex
+	// conn is the connection carrying the request, so that abandoning the
+	// request can also abandon its half-finished exchange. timer and
+	// stopContext are the hooks that abandon it. Guarded by mu.
+	conn        *clientConn
+	timer       *time.Timer
+	stopContext func() bool
+}
+
+// finish reports the outcome, once: whichever of response, failure, timeout
+// and cancellation comes first is the one the callback hears.
+func (r *clientRequest) finish(resp *stdhttp.Response, err error) bool {
+	if !r.done.CompareAndSwap(false, true) {
+		return false
+	}
+	r.mu.Lock()
+	timer, stopContext := r.timer, r.stopContext
+	r.mu.Unlock()
+	if timer != nil {
+		timer.Stop()
+	}
+	if stopContext != nil {
+		stopContext()
+	}
+	r.callback(resp, err)
+	return true
+}
+
+// abort fails the request from outside the exchange. A connection left in the
+// middle of it cannot carry another request, so it is closed.
+func (r *clientRequest) abort(err error) {
+	if !r.finish(nil, err) {
+		return
+	}
+	r.mu.Lock()
+	cc := r.conn
+	r.conn = nil
+	r.mu.Unlock()
+	if cc != nil {
+		cc.discard()
+	}
+}
+
+// attach records the connection carrying the request. It reports false if the
+// request has already been settled, in which case it must not be sent.
+func (r *clientRequest) attach(cc *clientConn) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.done.Load() {
+		return false
+	}
+	r.conn = cc
+	return true
+}
+
+func (r *clientRequest) detach() {
+	r.mu.Lock()
+	r.conn = nil
+	r.mu.Unlock()
+}
+
+// retryable reports whether a request that may have reached the server can be
+// sent again without the server acting on it twice.
+func (r *clientRequest) retryable() bool {
+	switch r.req.Method {
+	case "", stdhttp.MethodGet, stdhttp.MethodHead, stdhttp.MethodOptions, stdhttp.MethodTrace:
+		return !r.retried
+	}
+	return false
+}
+
+// clientConn is one connection the client dialed. It is the connection's
+// handler, so everything the engine reports about it arrives here.
+type clientConn struct {
+	client *Client
+	host   *hostPool
+	conn   *fib.Connection
+	// parser is used only by the worker reading the connection.
+	parser responseParser
+	mu     sync.Mutex
+	// current is the request in flight, if any. sent records that the
+	// connection has carried a request before this one, and received that the
+	// server has answered this one with at least a byte.
+	current  *clientRequest
+	sent     bool
+	reused   bool
+	received bool
+	closed   bool
+	// idleTimer is armed while the connection is idle. Guarded by Client.mu.
+	idleTimer *time.Timer
+}
+
+func (cc *clientConn) isClosed() bool {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	return cc.closed
+}
+
+// send puts r on the connection. A connection that closed in the meantime
+// hands r back to the queue.
+func (cc *clientConn) send(r *clientRequest) {
+	cc.mu.Lock()
+	if cc.closed {
+		cc.mu.Unlock()
+		cc.client.enqueue(cc.host.addr, r, true)
+		return
+	}
+	cc.current = r
+	cc.reused = cc.sent
+	cc.sent = true
+	cc.received = false
+	cc.parser.reset()
+	cc.mu.Unlock()
+	if !r.attach(cc) {
+		// Settled while it waited: give the connection to the next request.
+		cc.mu.Lock()
+		cc.current = nil
+		cc.mu.Unlock()
+		cc.client.release(cc)
+		return
+	}
+	// A failed send closes the connection, and OnClose then settles r.
+	_ = cc.conn.Send(r.data)
+}
+
+// discard closes the connection without handing it back.
+func (cc *clientConn) discard() {
+	cc.mu.Lock()
+	cc.closed = true
+	cc.current = nil
+	cc.mu.Unlock()
+	cc.conn.Close()
+}
+
+func (cc *clientConn) OnOpen(conn *fib.Connection) { cc.conn = conn }
+
+func (cc *clientConn) OnPriorityData(*fib.Connection, []byte) {}
+
+func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
+	cc.mu.Lock()
+	r := cc.current
+	closed := cc.closed
+	cc.received = true
+	cc.mu.Unlock()
+	if closed {
+		return
+	}
+	if r == nil {
+		// Nothing was asked on this connection, so these bytes answer nothing
+		// and the stream can no longer be trusted.
+		cc.discard()
+		return
+	}
+	resp, err := cc.parser.feed(data, r.req)
+	if err != nil {
+		r.detach()
+		cc.discard()
+		r.finish(nil, err)
+		return
+	}
+	if resp == nil {
+		return
+	}
+	// Bytes past the response, a protocol switch, or either side asking to
+	// close all mean the connection cannot carry another request.
+	reusable := !resp.Close && !r.req.Close && !cc.parser.buffered() &&
+		resp.StatusCode != stdhttp.StatusSwitchingProtocols
+	cc.mu.Lock()
+	cc.current = nil
+	cc.mu.Unlock()
+	r.detach()
+	if reusable {
+		cc.client.release(cc)
+	} else {
+		cc.discard()
+	}
+	r.finish(resp, nil)
+}
+
+func (cc *clientConn) OnClose(_ *fib.Connection, err error) {
+	cc.mu.Lock()
+	r := cc.current
+	cc.current = nil
+	cc.closed = true
+	retry := r != nil && cc.reused && !cc.received
+	cc.mu.Unlock()
+	cc.client.forget(cc)
+	if r == nil {
+		return
+	}
+	r.detach()
+	if resp := cc.parser.finish(); resp != nil && (err == nil || err == io.EOF) {
+		go r.finish(resp, nil)
+		return
+	}
+	if retry && r.retryable() {
+		// A kept connection the server had already closed. Nothing came back,
+		// so a request that is safe to repeat is sent again on another.
+		r.retried = true
+		cc.client.enqueue(cc.host.addr, r, true)
+		return
+	}
+	if err == nil || err == io.EOF {
+		err = io.ErrUnexpectedEOF
+	}
+	// OnClose runs on the event loop, which the callback must not hold up.
+	go r.finish(nil, err)
+}

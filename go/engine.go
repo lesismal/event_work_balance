@@ -3,6 +3,7 @@
 package fib
 
 import (
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -132,7 +133,25 @@ func (e *Engine) releaseSendBuffer(b *sendBuffer) {
 	}
 }
 
+// Bind creates an engine that listens on config.Addr, or on every address in
+// config.Addrs, and serves the connections it accepts with handler.
 func Bind(config Config, handler Handler) (*Engine, error) {
+	addrs := config.Addrs
+	if len(addrs) == 0 {
+		addrs = []string{config.Addr}
+	}
+	return newEngine(config, handler, addrs)
+}
+
+// NewEngine creates an engine with no listeners. Its connections are the ones
+// it dials, which makes it a client engine; config.Addr and config.Addrs are
+// ignored. handler serves connections dialed with Dial, and may be nil when
+// every dial names its own handler through DialWithHandler.
+func NewEngine(config Config, handler Handler) (*Engine, error) {
+	return newEngine(config, handler, nil)
+}
+
+func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) {
 	if err := config.validateTaskPool(); err != nil {
 		return nil, err
 	}
@@ -150,11 +169,6 @@ func Bind(config Config, handler Handler) (*Engine, error) {
 	}
 	if handler == nil {
 		handler = HandlerFuncs{}
-	}
-
-	addrs := config.Addrs
-	if len(addrs) == 0 {
-		addrs = []string{config.Addr}
 	}
 
 	e := &Engine{maxEvents: config.MaxEvents,
@@ -200,11 +214,17 @@ func Bind(config Config, handler Handler) (*Engine, error) {
 	return e, nil
 }
 
+// errNoListener is what LocalAddr reports for an engine made by NewEngine.
+var errNoListener = errors.New("fib: engine has no listener")
+
 // LocalAddr returns the address of the server's first listener.
 func (e *Engine) LocalAddr() (*net.TCPAddr, error) {
 	addrs, err := e.LocalAddrs()
 	if err != nil {
 		return nil, err
+	}
+	if len(addrs) == 0 {
+		return nil, errNoListener
 	}
 	return addrs[0], nil
 }
@@ -506,7 +526,7 @@ func (e *Engine) closeConnection(c *Connection, closeErr error, callback bool) {
 	c.mu.Unlock()
 	e.detach(c)
 	if callback {
-		e.handler.OnClose(c, closeErr)
+		c.handler.OnClose(c, closeErr)
 	}
 }
 
