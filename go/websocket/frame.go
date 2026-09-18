@@ -63,11 +63,16 @@ type Parser struct {
 	// fromServer makes the parser read the frames a server sends, which are
 	// unmasked, instead of the masked frames a client sends. Either side must
 	// reject a frame masked the other way (RFC 6455 section 5.1).
-	fromServer     bool
-	buffer         []byte
-	owned          *frameBuffer
-	borrowedTail   []byte
-	fragment       *fragmentedMessage
+	fromServer   bool
+	buffer       []byte
+	owned        *frameBuffer
+	borrowedTail []byte
+	fragment     *fragmentedMessage
+	// text validates the UTF-8 of the text message being received, and
+	// textChecked counts the payload bytes of the frame at the head of buffer
+	// that it has already seen while that frame was incomplete.
+	text           utf8Validator
+	textChecked    int
 	pendingConsume int
 	borrowedBuffer bool
 }
@@ -101,6 +106,8 @@ func (p *Parser) Reset() {
 			p.fragment.data = p.fragment.data[:0]
 		}
 	}
+	p.text.reset()
+	p.textChecked = 0
 	p.pendingConsume = 0
 	p.borrowedBuffer = false
 	p.borrowedTail = nil
@@ -201,6 +208,8 @@ func (p *Parser) feedOne(data []byte, borrowPayload bool) (Event, bool, error) {
 			p.borrowedBuffer = false
 			p.borrowedTail = nil
 			p.fragment = nil
+			p.text.reset()
+			p.textChecked = 0
 			return Event{}, false, err
 		}
 		if !complete {
@@ -384,10 +393,16 @@ func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 		mask = p.buffer[offset : offset+4]
 		offset += 4
 	}
+	text := opcode == Text || (opcode == Continuation && p.fragment.opcode == Text)
 	if payloadLen > uint64(len(p.buffer)-offset) {
+		if text && !p.checkPartialText(p.buffer[offset:], mask) {
+			return Event{}, false, false, ErrInvalidPayload
+		}
 		return Event{}, false, false, nil
 	}
 	frameEnd := offset + int(payloadLen)
+	checked := p.textChecked
+	p.textChecked = 0
 	var payload []byte
 	if borrowPayload {
 		payload = p.buffer[offset:frameEnd]
@@ -417,15 +432,28 @@ func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 	}
 	if opcode == Text || opcode == Binary {
 		if fin {
-			if opcode == Text && !utf8.Valid(payload) {
-				return Event{}, false, false, ErrInvalidPayload
+			if text {
+				if checked == 0 {
+					if !utf8.Valid(payload) {
+						return Event{}, false, false, ErrInvalidPayload
+					}
+				} else if !p.text.write(payload[checked:]) || !p.text.complete() {
+					return Event{}, false, false, ErrInvalidPayload
+				}
+				p.text.reset()
 			}
 			p.finishFrame(frameEnd, borrowPayload)
 			return Event{Opcode: opcode, Payload: payload}, true, true, nil
 		}
+		if text && !p.text.write(payload[checked:]) {
+			return Event{}, false, false, ErrInvalidPayload
+		}
 		p.fragment = &fragmentedMessage{opcode: opcode, data: append([]byte(nil), payload...)}
 		p.consume(frameEnd)
 		return Event{}, false, true, nil
+	}
+	if text && (!p.text.write(payload[checked:]) || (fin && !p.text.complete())) {
+		return Event{}, false, false, ErrInvalidPayload
 	}
 	p.fragment.data = append(p.fragment.data, payload...)
 	p.consume(frameEnd)
@@ -433,11 +461,38 @@ func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 		return Event{}, false, true, nil
 	}
 	event := Event{Opcode: p.fragment.opcode, Payload: p.fragment.data}
-	if event.Opcode == Text && !utf8.Valid(event.Payload) {
-		return Event{}, false, false, ErrInvalidPayload
-	}
+	p.text.reset()
 	p.fragment = nil
 	return event, true, true, nil
+}
+
+// checkPartialText validates the payload bytes of an incomplete text frame
+// that arrived since the last call, so invalid UTF-8 fails the connection
+// without waiting for the rest of the frame. available is the payload received
+// so far, still masked when mask is set.
+func (p *Parser) checkPartialText(available, mask []byte) bool {
+	if len(available) <= p.textChecked {
+		return true
+	}
+	if mask == nil {
+		if !p.text.write(available[p.textChecked:]) {
+			return false
+		}
+	} else {
+		var chunk [512]byte
+		for i := p.textChecked; i < len(available); {
+			n := copy(chunk[:], available[i:])
+			for j := 0; j < n; j++ {
+				chunk[j] ^= mask[(i+j)&3]
+			}
+			if !p.text.write(chunk[:n]) {
+				return false
+			}
+			i += n
+		}
+	}
+	p.textChecked = len(available)
+	return true
 }
 
 func applyMask(dst, src, mask []byte) {
