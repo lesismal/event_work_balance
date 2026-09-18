@@ -1,10 +1,27 @@
 package fib
 
 import (
+	"errors"
+	"fmt"
 	"runtime"
 
 	"github.com/lesismal/fib/go/taskpool"
 )
+
+// TaskPool runs the rounds the event loop schedules. *taskpool.TaskPool
+// implements it; set Config.TaskPool to supply a different one.
+//
+// Each task must eventually run exactly once. GoTasks accepts a prefix of its
+// argument and reports how long that prefix is; the engine closes the
+// connections of the tasks it did not accept, so a pool that is stopping may
+// refuse work, but one that is merely busy should queue it rather than refuse.
+// A task may block for as long as the handler it calls does, so a pool that
+// runs tasks on a fixed set of goroutines bounds how many connections progress
+// at once.
+type TaskPool interface {
+	GoTask(task taskpool.Task) bool
+	GoTasks(tasks []taskpool.Task) int
+}
 
 // PoolSizing is how many workers a task pool may run and how many tasks it may
 // hold waiting for them. MaxEvents also sizes the epoll batch the event loop
@@ -89,6 +106,32 @@ func (c *Config) SetTaskPoolMode(mode taskpool.Mode) *Config {
 		c.MaxEvents = sizing.MaxEvents
 	}
 	return c
+}
+
+// SetTaskPool makes the engine run its connections on pool instead of a pool
+// of its own. The engine never stops a pool supplied this way: the caller owns
+// it, may share it between engines and with other work, and stops it after
+// every engine using it has been closed. TaskPoolMode, WorkerCount,
+// SharedTaskPool and the pool sizing no longer apply. Passing nil goes back
+// to the built-in pool.
+func (c *Config) SetTaskPool(pool TaskPool) *Config {
+	c.TaskPool = pool
+	return c
+}
+
+// validateTaskPool checks the settings that describe the built-in pool, which
+// mean nothing when the caller supplies one.
+func (c *Config) validateTaskPool() error {
+	if c.TaskPool != nil {
+		return nil
+	}
+	if c.WorkerCount <= 0 {
+		return errors.New("worker count must be greater than zero")
+	}
+	if !c.TaskPoolMode.Valid() {
+		return fmt.Errorf("invalid task pool mode %d", c.TaskPoolMode)
+	}
+	return nil
 }
 
 // SetPoolSizing pins the pool sizing to the caller's own numbers, which a later

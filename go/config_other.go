@@ -25,6 +25,9 @@ type Config struct {
 	// follow the mode rather than staying at numbers tuned for the other one.
 	TaskPoolMode   taskpool.Mode
 	SharedTaskPool bool
+	// TaskPool, when set, runs the engine's connections instead of a pool the
+	// engine builds from the fields above. See SetTaskPool.
+	TaskPool TaskPool
 	// customPoolSizing records that SetPoolSizing pinned the sizing, so that a
 	// later SetTaskPoolMode does not overwrite it.
 	customPoolSizing bool

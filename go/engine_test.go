@@ -9,8 +9,11 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/lesismal/fib/go/taskpool"
 )
 
 func TestConcurrentBackpressuredEcho(t *testing.T) {
@@ -534,4 +537,80 @@ func TestListenRejectsUnknownNetwork(t *testing.T) {
 	if !errors.As(err, &unknown) {
 		t.Fatalf("Bind error = %v, want net.UnknownNetworkError", err)
 	}
+}
+
+// countingPool runs tasks on a real pool and counts what it was handed, so a
+// test can tell the engine used it.
+type countingPool struct {
+	*taskpool.TaskPool
+	tasks atomic.Int64
+}
+
+func (p *countingPool) GoTask(task taskpool.Task) bool {
+	p.tasks.Add(1)
+	return p.TaskPool.GoTask(task)
+}
+
+func (p *countingPool) GoTasks(tasks []taskpool.Task) int {
+	p.tasks.Add(int64(len(tasks)))
+	return p.TaskPool.GoTasks(tasks)
+}
+
+// A pool the caller supplies has to carry the connections, make the built-in
+// pool's settings irrelevant, and survive the engine: the caller owns it and
+// may be sharing it.
+func TestCustomTaskPoolRunsConnectionsAndOutlivesEngine(t *testing.T) {
+	pool := &countingPool{TaskPool: taskpool.NewWithMode(taskpool.ModeCond, 4, 64)}
+	defer pool.Stop()
+	config := DefaultConfig()
+	config.Addr = "127.0.0.1:0"
+	// Invalid for the built-in pool, and ignored once a pool is supplied.
+	config.WorkerCount = 0
+	config.SetTaskPool(pool)
+	server, err := Bind(config, HandlerFuncs{Data: func(c *Connection, b []byte) {
+		if err := c.Send(b); err != nil {
+			c.Close()
+		}
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := server.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- server.Run() }()
+	conn, err := net.DialTimeout("tcp4", addr.String(), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	payload := []byte("custom pool")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	reply := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(reply, payload) {
+		t.Fatalf("echo = %q, want %q", reply, payload)
+	}
+	_ = conn.Close()
+	server.Stop()
+	if err := <-runDone; err != nil {
+		t.Error(err)
+	}
+	if err := server.Close(); err != nil {
+		t.Error(err)
+	}
+	if pool.tasks.Load() == 0 {
+		t.Fatal("the engine never handed a task to the supplied pool")
+	}
+	done := make(chan struct{})
+	if !pool.Go(func() { close(done) }) {
+		t.Fatal("closing the engine stopped a pool it does not own")
+	}
+	<-done
 }

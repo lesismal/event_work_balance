@@ -45,6 +45,12 @@
 - `SharedTaskPool` 默认开启；同一进程内配置相同的多个 Engine 共享 worker
   和任务队列，避免多监听端口重复创建大量 goroutine 与队列。需要完全隔离时
   可显式设为 `false`。
+- `config.SetTaskPool(pool)` 让 Engine 使用外部提供的任务池（实现 `fib.TaskPool`
+  接口，`*taskpool.TaskPool` 本身即满足）。设置后 `TaskPoolMode`、
+  `WorkerCount`、`SharedTaskPool` 和池容量配置都不再生效；Engine 关闭时不会
+  停止该池，由调用方在所有使用它的 Engine 关闭后自行停止。`GoTasks` 返回接受的
+  前缀长度，未被接受的任务对应的连接会被关闭，所以池只应在停止时拒绝任务。
+- 默认 `WriteBufferHighWatermark` 为 64 KiB，`MaxPendingBytes` 为 1 GiB。
 - `Send` 先直接发送，余量复制进发送队列。默认启用自适应 writev：单缓冲走
   write，`SendParts` 的两段数据和包含多个缓冲的发送队列走 writev；仅在背压
   时复制未发送部分。

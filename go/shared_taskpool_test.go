@@ -15,7 +15,7 @@ func TestSharedTaskPoolReferenceLifecycle(t *testing.T) {
 	}
 	releaseFirst()
 	done := make(chan struct{}, 1)
-	if !second.Go(func() { done <- struct{}{} }) {
+	if !second.(*taskpool.TaskPool).Go(func() { done <- struct{}{} }) {
 		t.Fatal("shared pool stopped before its final owner released it")
 	}
 	<-done

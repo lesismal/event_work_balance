@@ -4,19 +4,16 @@ package fib
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"sync"
 	"sync/atomic"
-
-	"github.com/lesismal/fib/go/taskpool"
 )
 
 type Engine struct {
 	listeners       []net.Listener
 	handler         Handler
-	taskPool        *taskpool.TaskPool
+	taskPool        TaskPool
 	releaseTaskPool func()
 	taskWG          sync.WaitGroup
 	stopping        atomic.Bool
@@ -28,11 +25,8 @@ type Engine struct {
 }
 
 func Bind(config Config, handler Handler) (*Engine, error) {
-	if config.WorkerCount <= 0 {
-		return nil, errors.New("worker count must be greater than zero")
-	}
-	if !config.TaskPoolMode.Valid() {
-		return nil, fmt.Errorf("invalid task pool mode %d", config.TaskPoolMode)
+	if err := config.validateTaskPool(); err != nil {
+		return nil, err
 	}
 	if config.MaxEvents <= 0 {
 		config.MaxEvents = 256

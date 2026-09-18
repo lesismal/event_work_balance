@@ -51,6 +51,9 @@ type Config struct {
 	// follow the mode rather than staying at numbers tuned for the other one.
 	TaskPoolMode   taskpool.Mode
 	SharedTaskPool bool
+	// TaskPool, when set, runs the engine's connections instead of a pool the
+	// engine builds from the fields above. See SetTaskPool.
+	TaskPool TaskPool
 	// InlineHandlers runs a ready connection's round on the event loop instead
 	// of handing it to a worker.
 	//

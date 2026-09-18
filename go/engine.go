@@ -3,8 +3,6 @@
 package fib
 
 import (
-	"errors"
-	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -19,19 +17,21 @@ const (
 	// sizing the task queue; beyond this many events per wait the loop just
 	// waits again, so a larger buffer only costs memory per server.
 	maxWaitBatch = 1024
-	// defaultWriteHighWatermark is the per-connection outbound budget. It is
-	// one read round's worth of replies, which is the size that balances the
-	// two costs either side of it. Lower, and ordinary traffic crosses it on
+	// defaultWriteHighWatermark is the per-connection outbound budget. Two
+	// costs sit either side of it. Lower, and ordinary traffic crosses it on
 	// every reply, and each crossing costs an eventfd write and an epoll_ctl:
-	// at 4KB that churn was 16% of a 100k-connection profile. Higher, and the
-	// buffer holding those bytes grows past what the pool will retain, so it is
-	// dropped and reallocated every round: at 64KB that treadmill allocated
-	// 13.7GB across a 15-second rate test against the same run's 254MB live.
-	defaultWriteHighWatermark = 16 << 10
+	// at 4KB that churn was 16% of a 100k-connection profile. Higher, and a
+	// backlog grows past the buffer size the pool retains: at 64KB against the
+	// default 16KB read buffer, a 15-second rate test allocated 13.7GB against
+	// the same run's 254MB live. The default sits at that upper end, favouring
+	// fewer pauses for bursty peers over allocation under sustained backlog;
+	// memory-sensitive deployments with many connections should lower it.
+	defaultWriteHighWatermark = 64 << 10
 	// defaultMaxPendingBytes is the server-wide outbound budget. It is the
 	// bound that actually holds at high connection counts, where the
-	// per-connection watermark alone would admit gigabytes in aggregate.
-	defaultMaxPendingBytes = 64 << 20
+	// per-connection watermark alone would admit its own limit times the
+	// connection count.
+	defaultMaxPendingBytes = 1 << 30
 )
 
 // Readiness a connection accumulates between rounds. The values are epoll's,
@@ -95,7 +95,7 @@ type Engine struct {
 	// redeliver holds stalled connections whose read the loop is handing back
 	// directly, to be scheduled at the end of the round. Event-loop ownership.
 	redeliver       []*Connection
-	taskPool        *taskpool.TaskPool
+	taskPool        TaskPool
 	releaseTaskPool func()
 	taskWG          sync.WaitGroup
 	readBufferPool  sync.Pool
@@ -126,11 +126,8 @@ func (e *Engine) releaseSendBuffer(b *sendBuffer) {
 }
 
 func Bind(config Config, handler Handler) (*Engine, error) {
-	if config.WorkerCount <= 0 {
-		return nil, errors.New("worker count must be greater than zero")
-	}
-	if !config.TaskPoolMode.Valid() {
-		return nil, fmt.Errorf("invalid task pool mode %d", config.TaskPoolMode)
+	if err := config.validateTaskPool(); err != nil {
+		return nil, err
 	}
 	if config.MaxEvents <= 0 {
 		config.MaxEvents = 256

@@ -22,7 +22,11 @@ var sharedTaskPools = struct {
 	entries map[taskPoolKey]*sharedTaskPoolEntry
 }{entries: make(map[taskPoolKey]*sharedTaskPoolEntry)}
 
-func acquireTaskPool(config Config) (*taskpool.TaskPool, func()) {
+func acquireTaskPool(config Config) (TaskPool, func()) {
+	if config.TaskPool != nil {
+		// The caller owns a pool it supplied, so releasing it is a no-op.
+		return config.TaskPool, func() {}
+	}
 	if !config.SharedTaskPool {
 		pool := taskpool.NewWithMode(config.TaskPoolMode, config.WorkerCount, config.MaxEvents)
 		return pool, pool.Stop
