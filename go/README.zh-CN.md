@@ -9,7 +9,7 @@
 - 每个 connection 有 FIFO 事件队列；同一 connection 串行执行，不同 connection 动态负载均衡。
 - ET 读写均排空到 `EAGAIN`；仅发送队列非空时关注 `EPOLLOUT`。
 - 每轮事件处理先 flush 发送队列，再读 OOB，再读普通数据；发送队列仍有数据时跳过读取，并把可读状态保留到下一轮，待可写事件清空队列后再读，既限制用户态缓冲又不会漏读。
-- 读 buffer 由 Server 级 `sync.Pool` 复用，大小通过 `Config.ReadBufferSize`
+- 读 buffer 由 Engine 级 `sync.Pool` 复用，大小通过 `Config.ReadBufferSize`
   设置，默认 16 KiB。
 - `Config.TaskPoolMode` 可选 `taskpool.ModeCond`（基于 `sync.Cond` 的有界环形
   队列，按 worker 数分片）或 `taskpool.ModeElastic`（nbio 风格的弹性
@@ -25,11 +25,11 @@
   该项保持不变：
 
   ```go
-  config := epoll.DefaultConfig()
+  config := fib.DefaultConfig()
   config.SetTaskPoolMode(taskpool.ModeCond)  // 容量随之切到 cond 的默认值
   config.SetPoolSizing(500, 10000)           // 固定成自己的取值
   ```
-- 背压有两道界，暂停读的原因只能是其中之一，`Server.Stats()` 会分别计数
+- 背压有两道界，暂停读的原因只能是其中之一，`Engine.Stats()` 会分别计数
   （`ReadsPausedByWatermark`、`ReadsPausedByBudget`、`ReadsResumed`、
   `PendingBytes`）：
   - `WriteBufferHighWatermark` 只看这条连接自己积压了多少，是对端跟不上；
@@ -41,7 +41,7 @@
   缓冲区是空的，队列里也会短暂地存在这一轮的全部回包；一轮最多读
   `ReadBufferSize` 字节。严格一问一答、单条 1KiB、水位线 8KiB 这种配置有 8 倍
   余量，不会触发背压（`TestPingPongUnderWatermarkNeverPausesReads` 固定了这一点）。
-- `SharedTaskPool` 默认开启；同一进程内配置相同的多个 Server 共享 worker
+- `SharedTaskPool` 默认开启；同一进程内配置相同的多个 Engine 共享 worker
   和任务队列，避免多监听端口重复创建大量 goroutine 与队列。需要完全隔离时
   可显式设为 `false`。
 - `Send` 先直接发送，余量复制进发送队列。默认启用自适应 writev：单缓冲走
@@ -62,21 +62,23 @@
 ## API
 
 ```go
-config := epoll.DefaultConfig()
+import fib "github.com/lesismal/fib/go"
+
+config := fib.DefaultConfig()
 // Network、Addr 与标准库 net.Listen 的参数含义一致：
 // Network 取 "tcp"、"tcp4"、"tcp6"，Addr 形如 ":9000"、"127.0.0.1:9000"、"[::1]:9000"，
 // 端口为 0 时由内核分配。Network 为空按 "tcp" 处理，Addr 为空按 ":0" 处理。
 config.Network = "tcp"
 config.Addr = "127.0.0.1:9000"
 config.ReadBufferSize = 32 * 1024
-server, err := epoll.Bind(config, epoll.HandlerFuncs{
-    Data: func(c *epoll.Connection, data []byte) {
+server, err := fib.Bind(config, fib.HandlerFuncs{
+    Data: func(c *fib.Connection, data []byte) {
         if c.Send(data) != nil { c.Close() }
     },
-	PriorityData: func(c *epoll.Connection, data []byte) {
+	PriorityData: func(c *fib.Connection, data []byte) {
 		// 处理由 EPOLLPRI 触发并通过 MSG_OOB 读取的带外数据。
 	},
-	Close: func(c *epoll.Connection, err error) {
+	Close: func(c *fib.Connection, err error) {
 		// 主动 Close 时 err 为 nil；对端正常关闭时为 io.EOF；
 		// 网络或系统调用失败时为对应的原始错误。
 	},
@@ -114,7 +116,7 @@ handler := epollhttp.NewHandler(epollhttp.HandlerFunc(
         _ = c.Respond(http.StatusOK, "text/plain; charset=utf-8", []byte("hello\n"))
     },
 ))
-server, err := epoll.Bind(config, handler)
+server, err := fib.Bind(config, handler)
 ```
 
 完整示例：
@@ -135,7 +137,7 @@ handler := websocket.NewHandler(websocket.HandlerFuncs{
         _ = c.WriteMessage(opcode, data)
     },
 })
-server, err := epoll.Bind(config, handler)
+server, err := fib.Bind(config, handler)
 ```
 
 运行 WebSocket echo 示例：

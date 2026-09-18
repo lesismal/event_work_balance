@@ -11,16 +11,16 @@ import (
 	"testing"
 	"time"
 
-	epoll "github.com/lesismal/fib/go"
+	fib "github.com/lesismal/fib/go"
 )
 
 func TestServerHandlerKeepAliveAndClose(t *testing.T) {
 	handler := NewHandler(HandlerFunc(func(c *Context, request *stdhttp.Request) {
 		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(request.URL.Path))
 	}))
-	config := epoll.DefaultConfig()
+	config := fib.DefaultConfig()
 	config.Addr = "127.0.0.1:0"
-	server, err := epoll.Bind(config, handler)
+	server, err := fib.Bind(config, handler)
 	if err != nil {
 		t.Fatal(err)
 	}

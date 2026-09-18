@@ -1,6 +1,6 @@
 //go:build linux
 
-package epoll
+package fib
 
 import (
 	"bytes"
@@ -437,11 +437,11 @@ func TestInlineHandlersServeConcurrentConnections(t *testing.T) {
 	}
 }
 
-// TestMultipleListenersShareOneServer covers a server carrying several
+// TestMultipleListenersShareOneEngine covers a server carrying several
 // listeners: every port must accept, and the connections from all of them must
 // land in the one descriptor table, event loop and worker pool rather than
 // needing a server each.
-func TestMultipleListenersShareOneServer(t *testing.T) {
+func TestMultipleListenersShareOneEngine(t *testing.T) {
 	const listeners = 4
 	config := DefaultConfig()
 	config.Addr = "127.0.0.1:9999" // ignored once Addrs is set

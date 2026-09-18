@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	epoll "github.com/lesismal/fib/go"
+	fib "github.com/lesismal/fib/go"
 )
 
 func TestServerHandshakeEchoPingAndClose(t *testing.T) {
@@ -27,9 +27,9 @@ func TestServerHandshakeEchoPingAndClose(t *testing.T) {
 			}
 		},
 	})
-	config := epoll.DefaultConfig()
+	config := fib.DefaultConfig()
 	config.Addr = "127.0.0.1:0"
-	server, err := epoll.Bind(config, handler)
+	server, err := fib.Bind(config, handler)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,9 +163,9 @@ func BenchmarkServerEcho1KiB(b *testing.B) {
 			_ = c.WriteMessage(opcode, payload)
 		},
 	})
-	config := epoll.DefaultConfig()
+	config := fib.DefaultConfig()
 	config.Addr = "127.0.0.1:0"
-	server, err := epoll.Bind(config, handler)
+	server, err := fib.Bind(config, handler)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -277,13 +277,13 @@ func TestReadsPauseForPeerThatNeverReadsAndResumeWhenItDoes(t *testing.T) {
 			}
 		},
 	})
-	config := epoll.DefaultConfig()
+	config := fib.DefaultConfig()
 	config.Addr = "127.0.0.1:0"
 	config.WriteBufferHighWatermark = watermark
 	// Leave the server-wide budget off, so the per-connection watermark is the
 	// only thing that can stop these reads.
 	config.MaxPendingBytes = 0
-	server, err := epoll.Bind(config, handler)
+	server, err := fib.Bind(config, handler)
 	if err != nil {
 		t.Fatal(err)
 	}

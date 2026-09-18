@@ -14,7 +14,7 @@ import (
 	"sync/atomic"
 	"unicode/utf8"
 
-	epoll "github.com/lesismal/fib/go"
+	fib "github.com/lesismal/fib/go"
 	epollhttp "github.com/lesismal/fib/go/http"
 )
 
@@ -64,7 +64,7 @@ func (h HandlerFuncs) OnClose(c *Connection, code uint16, reason string, err err
 // Connection is a WebSocket connection. Its write methods are safe to call
 // from application goroutines.
 type Connection struct {
-	conn        *epoll.Connection
+	conn        *fib.Connection
 	subprotocol string
 	closeSent   atomic.Bool
 	closeState  atomic.Pointer[connectionCloseState]
@@ -190,11 +190,11 @@ func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 	return h
 }
 
-func (h *ServerHandler) OnOpen(c *epoll.Connection) {
+func (h *ServerHandler) OnOpen(c *fib.Connection) {
 	c.SetAttachment(&connectionState{})
 }
 
-func (h *ServerHandler) OnData(c *epoll.Connection, data []byte) {
+func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 	state, _ := c.Attachment().(*connectionState)
 	if state == nil {
 		h.OnOpen(c)
@@ -244,7 +244,7 @@ func (h *ServerHandler) OnData(c *epoll.Connection, data []byte) {
 	h.upgrade(c, state, request, key, subprotocol, remainder)
 }
 
-func (h *ServerHandler) upgrade(c *epoll.Connection, state *connectionState, request *stdhttp.Request, key []byte, subprotocol string, remainder []byte) {
+func (h *ServerHandler) upgrade(c *fib.Connection, state *connectionState, request *stdhttp.Request, key []byte, subprotocol string, remainder []byte) {
 	if err := sendHandshakeResponse(c, key, subprotocol); err != nil {
 		c.Close()
 		return
@@ -478,7 +478,7 @@ func isHex(c byte) bool {
 	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
 }
 
-func (h *ServerHandler) reject(c *epoll.Connection, request *stdhttp.Request, status int) {
+func (h *ServerHandler) reject(c *fib.Connection, request *stdhttp.Request, status int) {
 	if request == nil {
 		request = &stdhttp.Request{ProtoMajor: 1, ProtoMinor: 1, Header: make(stdhttp.Header)}
 	}
@@ -491,9 +491,9 @@ func (h *ServerHandler) reject(c *epoll.Connection, request *stdhttp.Request, st
 	})
 }
 
-func (h *ServerHandler) OnPriorityData(*epoll.Connection, []byte) {}
+func (h *ServerHandler) OnPriorityData(*fib.Connection, []byte) {}
 
-func (h *ServerHandler) OnClose(c *epoll.Connection, err error) {
+func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 	state, _ := c.Attachment().(*connectionState)
 	c.SetAttachment(nil)
 	if state == nil {
@@ -523,7 +523,7 @@ func (h *ServerHandler) releaseHandshakeParser(state *connectionState) {
 
 var handshakeResponsePrefix = []byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ")
 
-func sendHandshakeResponse(c *epoll.Connection, key []byte, subprotocol string) error {
+func sendHandshakeResponse(c *fib.Connection, key []byte, subprotocol string) error {
 	var accept [28]byte
 	websocketAccept(accept[:], key)
 	if subprotocol == "" {
@@ -578,4 +578,4 @@ func closePayload(payload []byte) (uint16, string) {
 	return binary.BigEndian.Uint16(payload[:2]), string(payload[2:])
 }
 
-var _ epoll.Handler = (*ServerHandler)(nil)
+var _ fib.Handler = (*ServerHandler)(nil)

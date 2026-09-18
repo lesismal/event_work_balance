@@ -6,7 +6,7 @@ import (
 	"fmt"
 	stdhttp "net/http"
 
-	epoll "github.com/lesismal/fib/go"
+	fib "github.com/lesismal/fib/go"
 	epollhttp "github.com/lesismal/fib/go/http"
 )
 
@@ -17,9 +17,9 @@ func main() {
 			c.Conn.Close()
 		}
 	}))
-	config := epoll.DefaultConfig()
+	config := fib.DefaultConfig()
 	config.Addr = "127.0.0.1:8080"
-	server, err := epoll.Bind(config, handler)
+	server, err := fib.Bind(config, handler)
 	if err != nil {
 		panic(err)
 	}

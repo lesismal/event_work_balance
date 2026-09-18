@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"strings"
 
-	epoll "github.com/lesismal/fib/go"
+	fib "github.com/lesismal/fib/go"
 )
 
 type Handler interface {
@@ -30,7 +30,7 @@ type Response struct {
 }
 
 type Context struct {
-	Conn    *epoll.Connection
+	Conn    *fib.Connection
 	Request *stdhttp.Request
 	wrote   bool
 }
@@ -83,11 +83,11 @@ func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 	return &ServerHandler{handler: handler, config: config}
 }
 
-func (h *ServerHandler) OnOpen(c *epoll.Connection) {
+func (h *ServerHandler) OnOpen(c *fib.Connection) {
 	c.SetAttachment(NewParser(h.config))
 }
 
-func (h *ServerHandler) OnData(c *epoll.Connection, data []byte) {
+func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 	parser, _ := c.Attachment().(*Parser)
 	if parser == nil {
 		parser = NewParser(h.config)
@@ -119,8 +119,8 @@ func (h *ServerHandler) OnData(c *epoll.Connection, data []byte) {
 	}
 }
 
-func (h *ServerHandler) OnPriorityData(*epoll.Connection, []byte) {}
-func (h *ServerHandler) OnClose(c *epoll.Connection, _ error) {
+func (h *ServerHandler) OnPriorityData(*fib.Connection, []byte) {}
+func (h *ServerHandler) OnClose(c *fib.Connection, _ error) {
 	c.SetAttachment(nil)
 }
 
@@ -213,4 +213,4 @@ func validHeaderValue(value string) bool {
 	return true
 }
 
-var _ epoll.Handler = (*ServerHandler)(nil)
+var _ fib.Handler = (*ServerHandler)(nil)

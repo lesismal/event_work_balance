@@ -9,11 +9,11 @@ import (
 	"strconv"
 	"syscall"
 
-	epoll "github.com/lesismal/fib/go"
+	fib "github.com/lesismal/fib/go"
 )
 
 func main() {
-	config := epoll.DefaultConfig()
+	config := fib.DefaultConfig()
 	config.Addr = "127.0.0.1:9000"
 	config.Backlog = 256
 	if len(os.Args) > 1 {
@@ -23,7 +23,7 @@ func main() {
 		enabled, _ := strconv.ParseBool(os.Args[2])
 		config.UseWritev = enabled
 	}
-	server, err := epoll.Bind(config, epoll.HandlerFuncs{Data: func(c *epoll.Connection, data []byte) {
+	server, err := fib.Bind(config, fib.HandlerFuncs{Data: func(c *fib.Connection, data []byte) {
 		if c.Send(data) != nil {
 			c.Close()
 		}

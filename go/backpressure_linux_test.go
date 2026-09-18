@@ -1,6 +1,6 @@
 //go:build linux
 
-package epoll
+package fib
 
 import (
 	"bytes"
@@ -14,7 +14,7 @@ import (
 
 // startEchoServer brings up a server on a loopback port and returns its address
 // plus a shutdown function that fails the test if the loop errored.
-func startEchoServer(t *testing.T, config Config, handler Handler) (*Server, string) {
+func startEchoServer(t *testing.T, config Config, handler Handler) (*Engine, string) {
 	t.Helper()
 	config.Addr = "127.0.0.1:0"
 	server, err := Bind(config, handler)
@@ -43,7 +43,7 @@ func startEchoServer(t *testing.T, config Config, handler Handler) (*Server, str
 // counts, where the per-connection watermark alone would admit its own limit
 // times the connection count. Peers that stop reading must not be able to push
 // the server past it.
-func TestServerWideBudgetBoundsQueuedBytes(t *testing.T) {
+func TestEngineWideBudgetBoundsQueuedBytes(t *testing.T) {
 	const (
 		budget      = 256 << 10
 		connections = 8
@@ -241,7 +241,7 @@ func TestConnectionForRejectsStaleToken(t *testing.T) {
 	_, addr := startEchoServer(t, config, HandlerFuncs{Open: func(c *Connection) {
 		// Reach the server through the connection rather than through a
 		// variable the test goroutine is still assigning.
-		server := c.server
+		server := c.engine
 		report := func(msg string) {
 			select {
 			case checked <- failure{msg}:
@@ -286,7 +286,7 @@ func TestConnectionForRejectsStaleToken(t *testing.T) {
 // it has actually queued instead of a full round's worth apiece.
 func TestQueuedChunksPackIntoPooledBuffers(t *testing.T) {
 	server := newOfflineServer(t)
-	c := &Connection{token: 1, server: server}
+	c := &Connection{token: 1, engine: server}
 	c.fd.Store(-1)
 
 	chunk := bytes.Repeat([]byte{'z'}, 1024)
@@ -351,7 +351,7 @@ func TestPooledSendBuffersHoldAFullRound(t *testing.T) {
 
 	// A chunk larger than a round still lands in one item, so a big message is
 	// never split across buffers.
-	c := &Connection{token: 1, server: server}
+	c := &Connection{token: 1, engine: server}
 	c.fd.Store(-1)
 	big := bytes.Repeat([]byte{'y'}, server.retainedSendBuffer*2)
 	c.mu.Lock()
@@ -369,7 +369,7 @@ func TestPooledSendBuffersHoldAFullRound(t *testing.T) {
 // only postpones the allocation to the next round.
 func TestDrainedItemReturnsBufferToPool(t *testing.T) {
 	server := newOfflineServer(t)
-	c := &Connection{token: 1, server: server}
+	c := &Connection{token: 1, engine: server}
 	c.fd.Store(-1)
 
 	c.mu.Lock()
@@ -397,7 +397,7 @@ func TestDrainedItemReturnsBufferToPool(t *testing.T) {
 
 // newOfflineServer builds a server for exercising connection bookkeeping
 // directly, without running its event loop.
-func newOfflineServer(t *testing.T) *Server {
+func newOfflineServer(t *testing.T) *Engine {
 	t.Helper()
 	config := DefaultConfig()
 	config.Addr = "127.0.0.1:0"
@@ -413,7 +413,7 @@ func newOfflineServer(t *testing.T) *Server {
 // every pooled buffer permanently inflated.
 func TestOutsizedSendBufferIsDropped(t *testing.T) {
 	server := newOfflineServer(t)
-	c := &Connection{token: 1, server: server}
+	c := &Connection{token: 1, engine: server}
 	c.fd.Store(-1)
 	oversized := &sendBuffer{data: make([]byte, 0, server.retainedSendBuffer*2)}
 	item := sendItem{data: oversized.data, buf: oversized}

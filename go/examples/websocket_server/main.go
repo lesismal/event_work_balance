@@ -6,7 +6,7 @@ import (
 	"fmt"
 	stdhttp "net/http"
 
-	epoll "github.com/lesismal/fib/go"
+	fib "github.com/lesismal/fib/go"
 	"github.com/lesismal/fib/go/http/websocket"
 )
 
@@ -24,9 +24,9 @@ func main() {
 			fmt.Printf("WebSocket closed: code=%d reason=%q error=%v\n", code, reason, err)
 		},
 	})
-	config := epoll.DefaultConfig()
+	config := fib.DefaultConfig()
 	config.Addr = "127.0.0.1:8080"
-	server, err := epoll.Bind(config, handler)
+	server, err := fib.Bind(config, handler)
 	if err != nil {
 		panic(err)
 	}

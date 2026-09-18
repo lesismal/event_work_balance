@@ -1,4 +1,4 @@
-package epoll
+package fib
 
 import (
 	"runtime"
