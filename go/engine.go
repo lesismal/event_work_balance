@@ -52,11 +52,14 @@ type commandType uint8
 const (
 	commandRefresh commandType = iota
 	commandClose
+	commandDial
+	commandDialTimeout
 )
 
 type command struct {
 	kind       commandType
 	connection *Connection
+	dial       *dialRequest
 	err        error
 }
 type commandBatch struct{ items []command }
@@ -84,8 +87,12 @@ type Engine struct {
 	readsResumed           atomic.Uint64
 	commandMu              sync.Mutex
 	commands               *commandBatch
-	commandPool            sync.Pool
-	wakePending            atomic.Bool
+	// commandsClosed turns requests away once Close has drained the queue for
+	// the last time, since nothing would ever run what arrived after it.
+	// Guarded by commandMu.
+	commandsClosed bool
+	commandPool    sync.Pool
+	wakePending    atomic.Bool
 	// budgetPaused holds connections whose reads the server-wide budget stopped,
 	// waiting to be resumed once it recovers. Event-loop ownership.
 	budgetPaused []*Connection
@@ -303,8 +310,14 @@ func (e *Engine) submitReady(ready []*Connection, tasks []taskpool.Task) []taskp
 
 func (e *Engine) Stop() { e.stopping.Store(true); e.notify() }
 
-func (e *Engine) request(cmd command) {
+// request queues a command for the event loop. It reports false, and queues
+// nothing, once Close has drained the queue for the last time.
+func (e *Engine) request(cmd command) bool {
 	e.commandMu.Lock()
+	if e.commandsClosed {
+		e.commandMu.Unlock()
+		return false
+	}
 	if e.commands == nil {
 		if pooled := e.commandPool.Get(); pooled != nil {
 			e.commands = pooled.(*commandBatch)
@@ -315,6 +328,16 @@ func (e *Engine) request(cmd command) {
 	e.commands.items = append(e.commands.items, cmd)
 	e.commandMu.Unlock()
 	e.notify()
+	return true
+}
+
+// closeCommands drains the command queue one last time and turns away every
+// request after it. Close calls it once no worker can queue anything more.
+func (e *Engine) closeCommands() {
+	e.commandMu.Lock()
+	e.commandsClosed = true
+	e.commandMu.Unlock()
+	e.drainCommands()
 }
 
 // notify wakes the event loop, coalescing requests that arrive before it has
@@ -374,9 +397,14 @@ func (e *Engine) drainCommands() {
 		return
 	}
 	for _, cmd := range batch.items {
-		if cmd.kind == commandClose {
+		switch cmd.kind {
+		case commandClose:
 			e.closeConnection(cmd.connection, cmd.err, true)
-		} else {
+		case commandDial:
+			e.startDial(cmd.dial)
+		case commandDialTimeout:
+			e.expireDial(cmd.connection, cmd.dial)
+		default:
 			e.refreshConnection(cmd.connection)
 		}
 	}
@@ -442,6 +470,15 @@ func (e *Engine) refreshConnection(c *Connection) {
 }
 
 func (e *Engine) closeConnection(c *Connection, closeErr error, callback bool) {
+	if c.dialing != nil {
+		// The dialer has not been handed the connection yet, so it is the one
+		// to hear about the close, and the handler never hears of it at all.
+		if closeErr == nil {
+			closeErr = net.ErrClosed
+		}
+		e.failDial(c, closeErr)
+		return
+	}
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()

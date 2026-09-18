@@ -8,6 +8,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type Engine struct {
@@ -144,15 +145,61 @@ func (e *Engine) serve(listener net.Listener) error {
 			}
 			return err
 		}
-		c := &Connection{engine: e, conn: conn}
-		c.fd.Store(-1)
-		e.mu.Lock()
-		e.connections[c] = struct{}{}
-		e.mu.Unlock()
-		e.handler.OnOpen(c)
-		e.readers.Add(1)
-		go e.readConnection(c)
+		e.adopt(conn, nil)
 	}
+}
+
+// adopt starts serving an established connection: OnOpen, then done if the
+// connection was dialed, then its reader. It reports false, and closes conn,
+// if the engine has stopped in the meantime.
+func (e *Engine) adopt(conn net.Conn, done func(*Connection, error)) bool {
+	c := &Connection{engine: e, conn: conn}
+	c.fd.Store(-1)
+	e.mu.Lock()
+	if e.stopping.Load() {
+		e.mu.Unlock()
+		_ = conn.Close()
+		return false
+	}
+	e.connections[c] = struct{}{}
+	e.readers.Add(1)
+	e.mu.Unlock()
+	e.handler.OnOpen(c)
+	if done != nil {
+		done(c, nil)
+	}
+	go e.readConnection(c)
+	return true
+}
+
+// Dial connects to addr and serves the connection like an accepted one. This
+// backend leaves socket I/O to the runtime's poller, so the connect runs on a
+// goroutine of its own through net.DialTimeout, and done runs on that
+// goroutine rather than on an event loop. Otherwise it behaves as the native
+// backends' Dial does: OnOpen and then done on success, done alone with the
+// error on failure, and an error from Dial itself, with done never called,
+// only when the dial cannot start at all.
+func (e *Engine) Dial(network, addr string, timeout time.Duration, done func(*Connection, error)) error {
+	switch network {
+	case "":
+		network = "tcp"
+	case "tcp", "tcp4", "tcp6":
+	default:
+		return &net.OpError{Op: "dial", Net: network, Err: net.UnknownNetworkError(network)}
+	}
+	if e.stopping.Load() {
+		return &net.OpError{Op: "dial", Net: network, Err: net.ErrClosed}
+	}
+	go func() {
+		conn, err := net.DialTimeout(network, addr, timeout)
+		if err == nil && !e.adopt(conn, done) {
+			err = &net.OpError{Op: "dial", Net: network, Addr: conn.RemoteAddr(), Err: net.ErrClosed}
+		}
+		if err != nil && done != nil {
+			done(nil, err)
+		}
+	}()
+	return nil
 }
 func (e *Engine) readConnection(c *Connection) {
 	defer e.readers.Done()

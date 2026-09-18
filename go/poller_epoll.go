@@ -87,7 +87,12 @@ func (e *Engine) Run() error {
 				e.drainCommands()
 			default:
 				if c := e.connectionFor(token); c != nil {
-					if c = e.noteEvent(c, events[i].Events); c != nil {
+					if c.dialing != nil {
+						c = e.finishDial(c, events[i].Events, nil)
+					} else {
+						c = e.noteEvent(c, events[i].Events)
+					}
+					if c != nil {
 						ready = append(ready, c)
 					}
 				}

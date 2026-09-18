@@ -49,6 +49,9 @@ type Connection struct {
 	closeAfterSend bool
 	pendingBytes   atomic.Int64
 	attachment     atomic.Pointer[connectionAttachment]
+	// dialing is set while an outbound connect is still in progress, and
+	// cleared when it completes or fails. Event-loop ownership.
+	dialing *dialRequest
 }
 
 // Attachment returns application state associated with the connection.

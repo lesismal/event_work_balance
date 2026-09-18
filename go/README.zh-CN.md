@@ -115,6 +115,37 @@ if err := server.Run(); err != nil { panic(err) }
 config.Addrs = []string{"127.0.0.1:9000", "127.0.0.1:9001"}
 ```
 
+### 异步 Dial
+
+`Engine.Dial` 发起四层（TCP）连接，立即返回，不阻塞调用方。连接建立后的 fd 与
+accept 进来的连接一样由同一个事件循环管理，走同一个 handler、同一个 worker 池和
+同一套背压：
+
+```go
+err := server.Dial("tcp", "127.0.0.1:9001", 3*time.Second, func(c *fib.Connection, err error) {
+    if err != nil {
+        // 连接失败、超时（errors.Is(err, os.ErrDeadlineExceeded)）或 Engine 已关闭
+        // （errors.Is(err, net.ErrClosed)），err 为 *net.OpError。
+        return
+    }
+    c.Send([]byte("hello"))
+})
+```
+
+- network、addr 的含义与 `net.Dial` 一致；host 不是 IP 字面量时在单独的 goroutine
+  里解析，调用方不会等 DNS。timeout 为 0 表示只受操作系统自身的连接超时约束。
+- 原生后端由事件循环创建非阻塞 socket 并发起 `connect`，fd 随即以边沿触发注册到
+  epoll/kqueue，连接结果由它的第一个可写事件报告；Windows 上用 overlapped
+  `ConnectEx`，由完成端口报告结果。
+- 成功时先调用 handler 的 `OnOpen`，再调用 done；失败时只调用 done（连接为
+  nil），handler 不会收到任何回调。done 恰好调用一次，与 `OnOpen` 一样在事件循环
+  上执行，不能阻塞；可以传 nil。
+- 只有能立即判定无法发起时（未知 network、非法或无法解析的字面量地址、Engine 已
+  停止），`Dial` 才直接返回错误，此时 done 不会被调用。
+- Engine 关闭时，尚未完成的 Dial 都会以 `net.ErrClosed` 通知 done。
+- 兼容后端（如 FreeBSD）用 `net.DialTimeout` 在 goroutine 里连接，done 在该
+  goroutine 上执行。
+
 运行示例和测试：
 
 ```sh

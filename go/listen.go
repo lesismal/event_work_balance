@@ -28,6 +28,48 @@ func resolveListenAddr(network, addr string) (family int, sa syscall.Sockaddr, e
 	if err != nil {
 		return 0, nil, err
 	}
+	return tcpAddrToSockaddr(network, addr, resolved)
+}
+
+// resolveDialAddr turns a net.Dial network and address into the socket address
+// to connect to. A missing host means the local system, as it does to
+// net.Dial.
+func resolveDialAddr(network, addr string) (family int, sa syscall.Sockaddr, raddr *net.TCPAddr, err error) {
+	if !isTCPNetwork(network) {
+		return 0, nil, nil, net.UnknownNetworkError(network)
+	}
+	if network == "" {
+		network = "tcp"
+	}
+	raddr, err = net.ResolveTCPAddr(network, addr)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	if raddr.IP == nil || raddr.IP.IsUnspecified() {
+		loopback := net.IPv4(127, 0, 0, 1)
+		if network == "tcp6" || (raddr.IP != nil && raddr.IP.To4() == nil) {
+			loopback = net.IPv6loopback
+		}
+		raddr = &net.TCPAddr{IP: loopback, Port: raddr.Port}
+	}
+	family, sa, err = tcpAddrToSockaddr(network, addr, raddr)
+	return family, sa, raddr, err
+}
+
+// isTCPNetwork reports whether network is one this package listens and dials
+// on. Empty means "tcp".
+func isTCPNetwork(network string) bool {
+	switch network {
+	case "", "tcp", "tcp4", "tcp6":
+		return true
+	}
+	return false
+}
+
+// tcpAddrToSockaddr picks the socket family and address for a resolved TCP
+// address. An IPv4 address under "tcp" gets an IPv4 socket, as it does from the
+// net package.
+func tcpAddrToSockaddr(network, addr string, resolved *net.TCPAddr) (family int, sa syscall.Sockaddr, err error) {
 	ip4 := resolved.IP.To4()
 	switch {
 	case network == "tcp4":
@@ -38,7 +80,6 @@ func resolveListenAddr(network, addr string) (family int, sa syscall.Sockaddr, e
 		copy(bound.Addr[:], ip4)
 		return syscall.AF_INET, bound, nil
 	case ip4 != nil:
-		// An IPv4 literal under "tcp" binds an IPv4 socket, as net.Listen does.
 		bound := &syscall.SockaddrInet4{Port: resolved.Port}
 		copy(bound.Addr[:], ip4)
 		return syscall.AF_INET, bound, nil

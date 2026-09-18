@@ -89,13 +89,28 @@ func (e *Engine) Run() error {
 				}
 				continue
 			}
-			if c = e.noteEvent(c, kqueueEvents(ev)); c != nil {
+			if c.dialing != nil {
+				// A connect that failed reports its error in fflags, next to
+				// the EOF that ends it.
+				var reported error
+				if ev.Flags&syscall.EV_EOF != 0 && ev.Fflags != 0 {
+					reported = syscall.Errno(ev.Fflags)
+				}
+				c = e.finishDial(c, kqueueEvents(ev), reported)
+			} else {
+				c = e.noteEvent(c, kqueueEvents(ev))
+			}
+			if c != nil {
 				ready = append(ready, c)
 			}
 		}
 		// A kevent names only a descriptor, with no generation to tell one
 		// owner of it from the next, so nothing may close or accept a
-		// descriptor while events that name it are still being read. Closes
+		// descriptor while events that name it are still being read. A failed
+		// dial is the one exception, and a safe one: it clears its table slot
+		// as it closes, and nothing can take the descriptor back until the
+		// accepts and commands below, so its remaining events resolve to
+		// nothing. Closes
 		// and accepts therefore wait until the whole batch has been folded
 		// into connections. Closing a descriptor removes its pending events
 		// from the kqueue, so the next wait cannot see a stale one either.

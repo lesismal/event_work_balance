@@ -206,7 +206,7 @@ func (e *Engine) Close() error {
 		e.Stop()
 		e.taskWG.Wait()
 		e.releaseTaskPool()
-		e.drainCommands()
+		e.closeCommands()
 		for _, entries := range e.connections {
 			for _, c := range entries {
 				if c != nil {

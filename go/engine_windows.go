@@ -39,6 +39,7 @@ const (
 
 const (
 	opAccept uint8 = iota
+	opConnect
 	opRead
 	opWrite
 )
@@ -101,6 +102,9 @@ type connPlatform struct {
 	readArmed     bool
 	writeInFlight bool
 	recvFlags     uint32
+	// connectSent receives ConnectEx's byte count, which stays zero since a
+	// dial sends nothing with its connect.
+	connectSent uint32
 	// inFlight keeps the arrays an overlapped send is reading from reachable
 	// until it completes, even if the connection drops its queue meanwhile.
 	inFlight [maxWritevItems][]byte
@@ -283,6 +287,9 @@ func (e *Engine) complete(entry *overlappedEntry) *Connection {
 	case opAccept:
 		e.completeAccept((*acceptOp)(unsafe.Pointer(op)), err)
 		return nil
+	case opConnect:
+		e.completeConnect(op.conn, err)
+		return nil
 	case opRead:
 		return e.completeRead(op.conn, err)
 	default:
@@ -459,7 +466,7 @@ func (e *Engine) Close() error {
 		e.Stop()
 		e.taskWG.Wait()
 		e.releaseTaskPool()
-		e.drainCommands()
+		e.closeCommands()
 		for c := range e.conns {
 			e.closeConnection(c, nil, false)
 		}

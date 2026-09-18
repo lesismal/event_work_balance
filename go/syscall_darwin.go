@@ -45,6 +45,9 @@ func newSocket(family int) (int, error) {
 		syscall.Close(fd)
 		return -1, err
 	}
+	// A dialed socket becomes a connection as it is, so it opts out of
+	// SIGPIPE here, as an accepted one does in acceptSocket.
+	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_NOSIGPIPE, 1)
 	return fd, nil
 }
 
