@@ -1,4 +1,4 @@
-# Epoll Server
+# Fast In Balance
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -25,7 +25,7 @@ _Click the complete diagram to open the interactive, bilingual architecture docu
 
 ```sh
 make
-./echo_server 9000
+./c/echo_server 9000
 ```
 
 From another terminal:
@@ -53,7 +53,7 @@ make go
 make go-test
 ```
 
-The public API is in [`include/epoll_server.h`](include/epoll_server.h). Regular
+The public API is in [`c/include/epoll_server.h`](c/include/epoll_server.h). Regular
 input invokes `on_data`; out-of-band input raised by `EPOLLPRI` and read with
 `MSG_OOB` invokes `on_priority_data`. Both run on the logical worker currently
 executing that connection; they may parse the protocol and call

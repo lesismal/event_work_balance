@@ -1,23 +1,12 @@
-CC ?= cc
-CFLAGS ?= -O2 -g -std=c11 -Wall -Wextra -Wpedantic
-CPPFLAGS += -Iinclude
-LDLIBS ?= -pthread
+.PHONY: all c clean test go go-test
 
-.PHONY: all clean test go go-test
+all: c
 
-all: echo_server
+c:
+	$(MAKE) -C c
 
-echo_server: src/epoll_server.o examples/echo_server.o
-	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
-
-src/epoll_server.o: src/epoll_server.c include/epoll_server.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-
-examples/echo_server.o: examples/echo_server.c include/epoll_server.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-
-test: echo_server
-	./tests/integration.sh
+test:
+	$(MAKE) -C c test
 
 go:
 	cd go && go build ./...
@@ -26,4 +15,4 @@ go-test:
 	cd go && go test ./...
 
 clean:
-	$(RM) echo_server src/*.o examples/*.o
+	$(MAKE) -C c clean

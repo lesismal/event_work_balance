@@ -25,7 +25,7 @@ _点击完整架构与流程图可打开支持中英文切换的交互架构文�
 
 ```sh
 make
-./echo_server 9000
+./c/echo_server 9000
 ```
 
 另一个终端可执行：
@@ -51,7 +51,7 @@ make go
 make go-test
 ```
 
-公共接口位于 [`include/epoll_server.h`](include/epoll_server.h)。普通数据调用
+公共接口位于 [`c/include/epoll_server.h`](c/include/epoll_server.h)。普通数据调用
 `on_data`，由 `EPOLLPRI` 触发并通过 `MSG_OOB` 读取的带外数据单独调用
 `on_priority_data`。两者都在当前执行该 connection 的逻辑 worker 上调用，可解析协议并调用
 `epoll_connection_send`；发送函数会复制传入数据，因此回调返回后原缓冲区可立即复用。
