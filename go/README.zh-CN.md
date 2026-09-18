@@ -14,7 +14,8 @@
   设置，默认 16 KiB。
 - `Config.TaskPoolMode` 可选 `taskpool.ModeCond`（基于 `sync.Cond` 的有界环形
   队列，按 worker 数分片）、`taskpool.ModeElastic`（nbio 风格的弹性
-  fork/dispatcher，原生后端默认）或 `taskpool.ModeAdaptive`（见下）。
+  fork/dispatcher）或 `taskpool.ModeAdaptive`（见下，所有后端的默认值，
+  `taskpool.New` 也默认使用它）。
 - `taskpool.ModeAdaptive` 同样基于 `sync.Cond`、同样分片，worker 空闲时挂在条件
   变量上，但常驻数量随负载在下限和上限之间变化：
   - 扩容：任务入队时没有空闲 worker 可以接手，就新起一个 worker，直到上限。

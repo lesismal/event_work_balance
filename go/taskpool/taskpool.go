@@ -82,8 +82,10 @@ type TaskPool struct {
 	backend  backend
 }
 
+// New creates a ModeAdaptive pool that grows to maxConcurrent workers under
+// load and retires down to one worker per P when idle.
 func New(maxConcurrent, queueSize int) *TaskPool {
-	return NewWithMode(ModeCond, maxConcurrent, queueSize)
+	return NewWithMode(ModeAdaptive, maxConcurrent, queueSize)
 }
 
 // NewWithMode creates a pool of the given mode. For ModeAdaptive,

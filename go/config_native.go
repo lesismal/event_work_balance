@@ -81,9 +81,9 @@ type Config struct {
 }
 
 func DefaultConfig() Config {
-	sizing := DefaultPoolSizing(taskpool.ModeElastic)
+	sizing := DefaultPoolSizing(taskpool.ModeAdaptive)
 	return Config{Network: "tcp", Addr: ":9000", Backlog: defaultBacklog(), WorkerCount: sizing.WorkerCount,
 		MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024,
 		WriteBufferHighWatermark: defaultWriteHighWatermark, MaxPendingBytes: defaultMaxPendingBytes,
-		UseWritev: true, TaskPoolMode: taskpool.ModeElastic, SharedTaskPool: true}
+		UseWritev: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true}
 }

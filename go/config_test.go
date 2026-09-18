@@ -49,8 +49,8 @@ func TestDefaultConfigPoolSizing(t *testing.T) {
 		t.Fatalf("MaxPendingBytes = %d, want more than the per-connection watermark %d",
 			config.MaxPendingBytes, config.WriteBufferHighWatermark)
 	}
-	if config.TaskPoolMode != taskpool.ModeElastic {
-		t.Fatalf("TaskPoolMode = %v, want elastic", config.TaskPoolMode)
+	if config.TaskPoolMode != taskpool.ModeAdaptive {
+		t.Fatalf("TaskPoolMode = %v, want adaptive", config.TaskPoolMode)
 	}
 	if !config.SharedTaskPool {
 		t.Fatal("SharedTaskPool = false, want shared workers by default")
