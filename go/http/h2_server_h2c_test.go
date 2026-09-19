@@ -1,4 +1,4 @@
-//go:build (linux || darwin || windows) && go1.24
+//go:build linux || darwin || windows
 
 package http
 

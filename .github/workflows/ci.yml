@@ -61,7 +61,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        go: ['1.22.x', stable]
+        go: ['1.25.x', stable]
     defaults:
       run:
         working-directory: go
@@ -71,11 +71,6 @@ jobs:
         with:
           go-version: ${{ matrix.go }}
           cache-dependency-path: go/go.mod
-      # Go 1.22's internal linker omits LC_UUID, which current macOS dyld
-      # refuses to load; the external linker adds it.
-      - name: Use external linker for Go 1.22 on macOS
-        if: runner.os == 'macOS' && matrix.go == '1.22.x'
-        run: echo "GOFLAGS=-ldflags=-linkmode=external" >> "$GITHUB_ENV"
       - name: Build
         run: go build ./...
       - name: Test
