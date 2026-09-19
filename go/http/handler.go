@@ -32,15 +32,36 @@ type Response struct {
 }
 
 // Context is the connection a request arrived on. Respond with Respond or
-// WriteResponse rather than by sending on Conn: on an HTTP/2 connection the
-// response is framed for its stream, and bytes sent on Conn directly would
-// corrupt the connection.
+// WriteResponse rather than by sending on Conn: on an HTTP/2 or HTTP/3
+// connection the response is framed for its stream, and bytes sent on Conn
+// directly would corrupt the connection.
 type Context struct {
 	Conn    *fib.Connection
 	Request *stdhttp.Request
 	wrote   bool
 	// stream is the HTTP/2 stream the request arrived on, or nil for HTTP/1.
 	stream *h2ServerStream
+	// external is the stream of a protocol served outside this package.
+	external Stream
+}
+
+// Stream answers a request that arrived over a protocol served outside this
+// package, as HTTP/3 is by package http3, so that the same Handler serves
+// it through the same Context.
+type Stream interface {
+	// WriteResponse sends the final response to req.
+	WriteResponse(req *stdhttp.Request, response Response) error
+	// WriteInterim sends an informational 1xx response, already checked to
+	// be one.
+	WriteInterim(status int, header stdhttp.Header) error
+	// Push promises target to the client, as Context.Push does.
+	Push(req *stdhttp.Request, target string, opts *stdhttp.PushOptions) error
+}
+
+// NewStreamContext returns the Context through which a handler answers req,
+// which arrived on conn and is answered through stream.
+func NewStreamContext(conn *fib.Connection, req *stdhttp.Request, stream Stream) *Context {
+	return &Context{Conn: conn, Request: req, external: stream}
 }
 
 func (c *Context) Respond(status int, contentType string, body []byte) error {
@@ -57,6 +78,13 @@ func (c *Context) WriteResponse(response Response) error {
 	}
 	if response.StatusCode == 0 {
 		response.StatusCode = stdhttp.StatusOK
+	}
+	if c.external != nil {
+		if err := c.external.WriteResponse(c.Request, response); err != nil {
+			return err
+		}
+		c.wrote = true
+		return nil
 	}
 	if c.stream != nil {
 		// HTTP/2 multiplexes the connection, so Close retires it gracefully
@@ -89,10 +117,13 @@ func (c *Context) WriteResponse(response Response) error {
 // before Push returns; call Push before responding, since a promise must
 // arrive before the response that would lead the client to ask for it.
 //
-// Push returns http.ErrNotSupported on HTTP/1, on a request that was itself
-// pushed, and when the client has disabled push, as browsers and Go's own
-// client do.
+// Push returns http.ErrNotSupported on HTTP/1 and HTTP/3, on a request that
+// was itself pushed, and when the client has disabled push, as browsers and
+// Go's own client do.
 func (c *Context) Push(target string, opts *stdhttp.PushOptions) error {
+	if c.external != nil {
+		return c.external.Push(c.Request, target, opts)
+	}
 	if c.stream == nil {
 		return stdhttp.ErrNotSupported
 	}
@@ -112,6 +143,9 @@ func (c *Context) WriteInterim(status int, header stdhttp.Header) error {
 	}
 	if c.wrote {
 		return errors.New("http: interim response after the final one")
+	}
+	if c.external != nil {
+		return c.external.WriteInterim(status, header)
 	}
 	if c.stream != nil {
 		return c.stream.writeInterim(status, header)
