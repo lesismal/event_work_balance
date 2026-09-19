@@ -18,7 +18,7 @@ import (
 	"sync"
 
 	fib "github.com/lesismal/fib/go"
-	"github.com/lesismal/fib/go/http/internal/hpack"
+	"github.com/lesismal/fib/go/internal/hpack"
 )
 
 // HTTP/2 on the server side. ServerHandler recognizes a connection that

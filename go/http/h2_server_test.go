@@ -17,7 +17,7 @@ import (
 	"time"
 
 	fib "github.com/lesismal/fib/go"
-	"github.com/lesismal/fib/go/http/internal/hpack"
+	"github.com/lesismal/fib/go/internal/hpack"
 	"github.com/lesismal/fib/go/internal/tlstest"
 	fibtls "github.com/lesismal/fib/go/tls"
 )

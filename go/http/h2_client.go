@@ -13,7 +13,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/lesismal/fib/go/http/internal/hpack"
+	"github.com/lesismal/fib/go/internal/hpack"
 )
 
 // HTTP/2 on the client side: a clientConn whose TLS handshake chose "h2", or
