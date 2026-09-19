@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -24,7 +25,7 @@ import (
 )
 
 var (
-	// ErrUnsupportedScheme is what a dial to anything but ws:// gets.
+	// ErrUnsupportedScheme is what a dial to anything but ws:// or wss:// gets.
 	ErrUnsupportedScheme = errors.New("websocket: unsupported URL scheme")
 	// ErrBadHandshake is what a dial gets when the server does not complete the
 	// opening handshake. If the server answered at all, done also receives its
@@ -50,6 +51,9 @@ type DialerConfig struct {
 	// EnableCompression offers the server permessage-deflate (RFC 7692). If
 	// the server accepts, messages are sent compressed and may arrive so.
 	EnableCompression bool
+	// TLSConfig is used for wss:// URLs. Nil means the defaults; either way a
+	// config naming no server gets the URL's host.
+	TLSConfig *tls.Config
 }
 
 func DefaultDialerConfig() DialerConfig {
@@ -63,7 +67,7 @@ func DefaultDialerConfig() DialerConfig {
 //
 // The engine may be one made by fib.NewEngine for clients alone, or a server's
 // own: each client connection carries its own handler. The engine has to be
-// running. Only ws:// is supported.
+// running. ws:// and wss:// are supported.
 type Dialer struct {
 	engine *fib.Engine
 	config DialerConfig
@@ -102,7 +106,7 @@ func (d *Dialer) Dial(rawURL string, header stdhttp.Header, handler Handler,
 	if handler == nil {
 		handler = HandlerFuncs{}
 	}
-	req, addr, key, err := d.handshakeRequest(rawURL, header)
+	req, addr, secure, key, err := d.handshakeRequest(rawURL, header)
 	if err != nil {
 		done(nil, nil, err)
 		return
@@ -119,14 +123,20 @@ func (d *Dialer) Dial(rawURL string, header stdhttp.Header, handler Handler,
 		cc.timer = time.AfterFunc(d.config.HandshakeTimeout, func() { cc.fail(nil, errHandshakeTimeout, false) })
 	}
 	cc.mu.Unlock()
-	err = d.engine.DialWithHandler("tcp", addr, d.config.HandshakeTimeout, cc, func(conn *fib.Connection, err error) {
+	connected := func(conn *fib.Connection, err error) {
 		if err != nil {
 			cc.fail(nil, err, true)
 			return
 		}
 		// A failed send closes the connection, and OnClose fails the dial.
+		// Over TLS the request waits for the TLS handshake to complete.
 		_ = conn.SendOwned(cc.request)
-	})
+	}
+	if secure {
+		err = d.engine.DialTLS("tcp", addr, d.config.HandshakeTimeout, d.config.TLSConfig, cc, connected)
+	} else {
+		err = d.engine.DialWithHandler("tcp", addr, d.config.HandshakeTimeout, cc, connected)
+	}
 	if err != nil {
 		cc.fail(nil, err, false)
 	}
@@ -165,33 +175,42 @@ var reservedHeaders = []string{"Upgrade", "Connection", "Sec-Websocket-Key", "Se
 	"Sec-Websocket-Extensions", "Sec-Websocket-Protocol"}
 
 // handshakeRequest builds the opening handshake for rawURL, and reports the
-// address to dial and the key the server's answer must be derived from.
-func (d *Dialer) handshakeRequest(rawURL string, header stdhttp.Header) (*stdhttp.Request, string, string, error) {
+// address to dial, whether to speak TLS to it, and the key the server's answer
+// must be derived from.
+func (d *Dialer) handshakeRequest(rawURL string, header stdhttp.Header) (
+	req *stdhttp.Request, addr string, secure bool, key string, err error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, "", "", err
+		return nil, "", false, "", err
 	}
-	if u.Scheme != "ws" {
-		return nil, "", "", fmt.Errorf("%w %q", ErrUnsupportedScheme, u.Scheme)
+	port := u.Port()
+	switch u.Scheme {
+	case "ws":
+		if port == "" {
+			port = "80"
+		}
+	case "wss":
+		secure = true
+		if port == "" {
+			port = "443"
+		}
+	default:
+		return nil, "", false, "", fmt.Errorf("%w %q", ErrUnsupportedScheme, u.Scheme)
 	}
 	host := u.Hostname()
 	if host == "" {
-		return nil, "", "", errors.New("websocket: URL has no host")
-	}
-	port := u.Port()
-	if port == "" {
-		port = "80"
+		return nil, "", false, "", errors.New("websocket: URL has no host")
 	}
 	for _, name := range reservedHeaders {
 		if len(header.Values(name)) != 0 {
-			return nil, "", "", fmt.Errorf("websocket: the dialer sets the %s header itself", name)
+			return nil, "", false, "", fmt.Errorf("websocket: the dialer sets the %s header itself", name)
 		}
 	}
 	var nonce [16]byte
 	if _, err = rand.Read(nonce[:]); err != nil {
-		return nil, "", "", err
+		return nil, "", false, "", err
 	}
-	key := base64.StdEncoding.EncodeToString(nonce[:])
+	key = base64.StdEncoding.EncodeToString(nonce[:])
 	h := header.Clone()
 	if h == nil {
 		h = make(stdhttp.Header)
@@ -209,9 +228,9 @@ func (d *Dialer) handshakeRequest(rawURL string, header stdhttp.Header) (*stdhtt
 	// The request goes on the wire as http://, which is what the handshake is.
 	target := *u
 	target.Scheme = "http"
-	req := &stdhttp.Request{Method: stdhttp.MethodGet, URL: &target, Proto: "HTTP/1.1", ProtoMajor: 1,
+	req = &stdhttp.Request{Method: stdhttp.MethodGet, URL: &target, Proto: "HTTP/1.1", ProtoMajor: 1,
 		ProtoMinor: 1, Header: h, Host: u.Host}
-	return req, net.JoinHostPort(host, port), key, nil
+	return req, net.JoinHostPort(host, port), secure, key, nil
 }
 
 // clientConn is one client connection, from the dial through the handshake

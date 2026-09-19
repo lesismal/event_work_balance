@@ -31,6 +31,7 @@ type Connection struct {
 	scheduled, closing, closeDelivered bool
 	writeMu                            sync.Mutex
 	attachment                         atomic.Pointer[connectionAttachment]
+	tlsLayer                           *tlsLayer
 }
 
 func (c *Connection) FD() int { return int(c.fd.Load()) }
@@ -70,6 +71,14 @@ func (c *Connection) closeWithError(err error) {
 }
 
 func (c *Connection) Send(data []byte) error {
+	if t := c.tlsLayer; t != nil {
+		return t.send(data, nil)
+	}
+	return c.sendRaw(data)
+}
+
+// sendRaw writes bytes to the socket below any TLS layer.
+func (c *Connection) sendRaw(data []byte) error {
 	if len(data) == 0 {
 		return nil
 	}
@@ -100,11 +109,26 @@ func (c *Connection) Send(data []byte) error {
 func (c *Connection) SendOwned(data []byte) error { return c.Send(data) }
 
 func (c *Connection) SendParts(first, second []byte) error {
+	if t := c.tlsLayer; t != nil {
+		return t.send(first, second)
+	}
 	data := make([]byte, len(first)+len(second))
 	n := copy(data, first)
 	copy(data[n:], second)
 	return c.Send(data)
 }
+
+// sendClosed reports whether the connection has stopped accepting sends.
+func (c *Connection) sendClosed() bool {
+	c.mu.Lock()
+	closing := c.closing
+	c.mu.Unlock()
+	return closing
+}
+
+// closeAfterSendRaw closes the connection. Sends on this backend have already
+// reached the socket by the time they return, so nothing is left to wait for.
+func (c *Connection) closeAfterSendRaw() { c.closeWithError(nil) }
 
 func (c *Connection) enqueueData(data []byte) bool {
 	c.mu.Lock()

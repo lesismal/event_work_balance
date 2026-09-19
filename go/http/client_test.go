@@ -20,6 +20,7 @@ import (
 	"time"
 
 	fib "github.com/lesismal/fib/go"
+	"github.com/lesismal/fib/go/internal/tlstest"
 )
 
 // startClientEngine runs an engine with no listener, for clients only.
@@ -335,11 +336,82 @@ func TestClientDialFailureReachesCallback(t *testing.T) {
 	}
 }
 
-func TestClientRejectsHTTPS(t *testing.T) {
+func TestClientRejectsUnknownScheme(t *testing.T) {
 	client := newTestClient(t, DefaultClientConfig())
-	_, err := client.Go(mustRequest(t, "GET", "https://example.com/", nil)).Wait()
+	_, err := client.Go(mustRequest(t, "GET", "ftp://example.com/", nil)).Wait()
 	if !errors.Is(err, ErrUnsupportedScheme) {
 		t.Fatalf("err = %v, want ErrUnsupportedScheme", err)
+	}
+}
+
+// https requests reach a standard TLS server and keep their connection alive
+// between requests, as http ones do.
+func TestClientHTTPSKeepsConnectionAlive(t *testing.T) {
+	var conns connCounter
+	server := httptest.NewUnstartedServer(stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+		fmt.Fprintf(w, "%s %v", r.URL.Path, r.TLS != nil)
+	}))
+	server.Config.ConnState = conns.hook
+	server.StartTLS()
+	defer server.Close()
+	config := DefaultClientConfig()
+	config.TLSConfig = server.Client().Transport.(*stdhttp.Transport).TLSClientConfig
+	client := newTestClient(t, config)
+	for _, path := range []string{"/one", "/two", "/three"} {
+		resp, err := client.Go(mustRequest(t, "GET", server.URL+path, nil)).Wait()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := readBody(t, resp); got != path+" true" {
+			t.Fatalf("body = %q", got)
+		}
+	}
+	if n := conns.n.Load(); n != 1 {
+		t.Fatalf("server saw %d connections, want 1", n)
+	}
+}
+
+// The package's own server runs behind fib.NewTLSServer unchanged.
+func TestClientHTTPSToTLSHandler(t *testing.T) {
+	serverConfig, clientConfig, err := tlstest.Configs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = c.Respond(stdhttp.StatusOK, "text/plain", append([]byte(r.URL.Path+" "), body...))
+	}))
+	config := fib.DefaultConfig()
+	config.Addr = "127.0.0.1:0"
+	server, err := fib.Bind(config, fib.NewTLSServer(serverConfig, handler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := server.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- server.Run() }()
+	defer func() {
+		server.Stop()
+		<-runDone
+		_ = server.Close()
+	}()
+
+	clientCfg := DefaultClientConfig()
+	clientCfg.TLSConfig = clientConfig
+	client := newTestClient(t, clientCfg)
+	body := strings.Repeat("x", 256<<10)
+	url := fmt.Sprintf("https://localhost:%d/echo", addr.Port)
+	for i := 0; i < 3; i++ {
+		resp, err := client.Go(mustRequest(t, "POST", url, strings.NewReader(body))).Wait()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := readBody(t, resp); got != "/echo "+body {
+			t.Fatalf("body has %d bytes, want %d", len(got), len("/echo "+body))
+		}
 	}
 }
 

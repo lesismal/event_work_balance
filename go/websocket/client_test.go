@@ -5,10 +5,12 @@ package websocket
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	stdhttp "net/http"
@@ -19,6 +21,7 @@ import (
 	"time"
 
 	fib "github.com/lesismal/fib/go"
+	"github.com/lesismal/fib/go/internal/tlstest"
 )
 
 // startClientEngine runs an engine with no listener, for clients only.
@@ -156,6 +159,67 @@ func TestClientEchoesThroughServer(t *testing.T) {
 
 // The server's close reaches the client handler with the server's code, and
 // the client answers it.
+// wss:// runs the same exchange over TLS, against the package's own server
+// behind fib.NewTLSServer, with compression on so frames of every size cross
+// record boundaries.
+func TestClientEchoesOverTLS(t *testing.T) {
+	serverTLS, clientTLS, err := tlstest.Configs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	engineConfig := fib.DefaultConfig()
+	engineConfig.Addr = "127.0.0.1:0"
+	serverConfig := DefaultConfig()
+	serverConfig.EnableCompression = true
+	server, err := fib.Bind(engineConfig, fib.NewTLSServer(serverTLS,
+		NewHandlerWithConfig(serverConfig, echoServerHandler())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := server.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- server.Run() }()
+	t.Cleanup(func() {
+		server.Stop()
+		<-runDone
+		_ = server.Close()
+	})
+
+	dialerConfig := DefaultDialerConfig()
+	dialerConfig.TLSConfig = clientTLS
+	dialerConfig.EnableCompression = true
+	recorder := newClientRecorder()
+	url := fmt.Sprintf("wss://localhost:%d/ws", addr.Port)
+	conn, _, err := NewDialer(startClientEngine(t), dialerConfig).Go(url, nil, recorder.handler()).Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, size := range []int{5, 1000, 100 << 10, 1 << 20} {
+		payload := make([]byte, size)
+		_, _ = rand.Read(payload)
+		if err := conn.WriteBinary(payload); err != nil {
+			t.Fatal(err)
+		}
+		if event := recorder.next(t); event.Opcode != Binary || !bytes.Equal(event.Payload, payload) {
+			t.Fatalf("%d-byte echo came back as %d bytes", size, len(event.Payload))
+		}
+	}
+	if err := conn.Close(CloseNormal, "bye"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case report := <-recorder.closed:
+		if report.code != CloseNormal {
+			t.Fatalf("OnClose = %d %q", report.code, report.reason)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no close")
+	}
+}
+
 func TestClientSeesServerClose(t *testing.T) {
 	url := startWebSocketServer(t, DefaultConfig(), HandlerFuncs{Message: func(c *Connection, _ Opcode, _ []byte) {
 		_ = c.Close(ClosePolicyViolation, "go away")
@@ -363,8 +427,8 @@ func TestClientHandshakeTimeout(t *testing.T) {
 
 func TestClientRejectsBadURLsAndHeaders(t *testing.T) {
 	dialer := NewDialer(startClientEngine(t), DefaultDialerConfig())
-	if _, _, err := dialer.Go("wss://example.com/", nil, nil).Wait(); !errors.Is(err, ErrUnsupportedScheme) {
-		t.Fatalf("wss: err = %v, want ErrUnsupportedScheme", err)
+	if _, _, err := dialer.Go("ftp://example.com/", nil, nil).Wait(); !errors.Is(err, ErrUnsupportedScheme) {
+		t.Fatalf("ftp: err = %v, want ErrUnsupportedScheme", err)
 	}
 	header := stdhttp.Header{"Sec-Websocket-Key": {"mine"}}
 	if _, _, err := dialer.Go("ws://127.0.0.1:1/", header, nil).Wait(); err == nil {

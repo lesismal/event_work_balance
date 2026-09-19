@@ -5,6 +5,7 @@ package http
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -22,7 +23,8 @@ var (
 	// ErrClientClosed is what requests still waiting for a connection get when
 	// the client is closed, and what new requests get afterwards.
 	ErrClientClosed = errors.New("http: client closed")
-	// ErrUnsupportedScheme is what a request for anything but http:// gets.
+	// ErrUnsupportedScheme is what a request for anything but http:// or
+	// https:// gets.
 	ErrUnsupportedScheme = errors.New("http: unsupported URL scheme")
 	// errRequestTimeout is what a request gets when ClientConfig.Timeout runs
 	// out. errors.Is matches it against os.ErrDeadlineExceeded.
@@ -53,6 +55,9 @@ type ClientConfig struct {
 	// second is also the memory one response can take.
 	MaxResponseHeaderBytes int
 	MaxResponseBodyBytes   int64
+	// TLSConfig is used for https:// requests. Nil means the defaults; either
+	// way a config naming no server gets the request's host.
+	TLSConfig *tls.Config
 }
 
 func DefaultClientConfig() ClientConfig {
@@ -73,7 +78,8 @@ func DefaultClientConfig() ClientConfig {
 // callback never waits on the network.
 //
 // A client keeps its connections alive between requests and sends one request
-// at a time on each; it does not pipeline. Only http:// is supported.
+// at a time on each; it does not pipeline. http:// and https:// are
+// supported; https speaks HTTP/1.1 over TLS.
 //
 // The engine may be one made by fib.NewEngine for clients alone, or a server's
 // own engine: client connections carry their own handler, so the two never
@@ -84,7 +90,7 @@ type Client struct {
 	engine *fib.Engine
 	config ClientConfig
 	mu     sync.Mutex
-	hosts  map[string]*hostPool
+	hosts  map[hostTarget]*hostPool
 	closed bool
 }
 
@@ -98,7 +104,7 @@ func NewClient(engine *fib.Engine, config ClientConfig) *Client {
 	if config.MaxResponseBodyBytes <= 0 {
 		config.MaxResponseBodyBytes = defaults.MaxResponseBodyBytes
 	}
-	return &Client{engine: engine, config: config, hosts: make(map[string]*hostPool)}
+	return &Client{engine: engine, config: config, hosts: make(map[hostTarget]*hostPool)}
 }
 
 // Do sends req and calls callback exactly once with its response or the
@@ -118,7 +124,7 @@ func (c *Client) Do(req *stdhttp.Request, callback func(*stdhttp.Response, error
 	if callback == nil {
 		callback = func(*stdhttp.Response, error) {}
 	}
-	addr, err := requestAddr(req)
+	target, err := requestTarget(req)
 	if err != nil {
 		callback(nil, err)
 		return
@@ -139,7 +145,7 @@ func (c *Client) Do(req *stdhttp.Request, callback func(*stdhttp.Response, error
 		r.stopContext = context.AfterFunc(ctx, func() { r.abort(ctx.Err()) })
 	}
 	r.mu.Unlock()
-	c.enqueue(addr, r, false)
+	c.enqueue(target, r, false)
 }
 
 // Future is a request in flight, for callers that would rather wait on it than
@@ -196,28 +202,45 @@ func (c *Client) Close() {
 	}
 }
 
-// requestAddr is the host:port to dial for req.
-func requestAddr(req *stdhttp.Request) (string, error) {
+// hostTarget is where a request goes: the host:port to dial, and whether to
+// speak TLS to it. Connections are pooled per target, so http and https to the
+// same address never share one.
+type hostTarget struct {
+	addr   string
+	secure bool
+}
+
+// requestTarget is where to send req.
+func requestTarget(req *stdhttp.Request) (hostTarget, error) {
 	if req.URL == nil {
-		return "", errors.New("http: request has no URL")
+		return hostTarget{}, errors.New("http: request has no URL")
 	}
-	if req.URL.Scheme != "http" {
-		return "", fmt.Errorf("%w %q", ErrUnsupportedScheme, req.URL.Scheme)
+	var target hostTarget
+	port := req.URL.Port()
+	switch req.URL.Scheme {
+	case "http":
+		if port == "" {
+			port = "80"
+		}
+	case "https":
+		target.secure = true
+		if port == "" {
+			port = "443"
+		}
+	default:
+		return hostTarget{}, fmt.Errorf("%w %q", ErrUnsupportedScheme, req.URL.Scheme)
 	}
 	host := req.URL.Hostname()
 	if host == "" {
-		return "", errors.New("http: request URL has no host")
+		return hostTarget{}, errors.New("http: request URL has no host")
 	}
-	port := req.URL.Port()
-	if port == "" {
-		port = "80"
-	}
-	return net.JoinHostPort(host, port), nil
+	target.addr = net.JoinHostPort(host, port)
+	return target, nil
 }
 
-// hostPool is the client's state for one host:port. Guarded by Client.mu.
+// hostPool is the client's state for one target. Guarded by Client.mu.
 type hostPool struct {
-	addr string
+	target hostTarget
 	// open counts connections open or dialing, and dialing the second kind.
 	open    int
 	dialing int
@@ -232,19 +255,19 @@ type assignment struct {
 	req  *clientRequest
 }
 
-// enqueue queues r for addr and starts whatever that makes possible. A retried
-// request goes to the front, since it has already waited its turn once.
-func (c *Client) enqueue(addr string, r *clientRequest, retry bool) {
+// enqueue queues r for target and starts whatever that makes possible. A
+// retried request goes to the front, since it has already waited its turn once.
+func (c *Client) enqueue(target hostTarget, r *clientRequest, retry bool) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		r.finish(nil, ErrClientClosed)
 		return
 	}
-	h := c.hosts[addr]
+	h := c.hosts[target]
 	if h == nil {
-		h = &hostPool{addr: addr}
-		c.hosts[addr] = h
+		h = &hostPool{target: target}
+		c.hosts[target] = h
 	}
 	if retry {
 		h.waiting = append([]*clientRequest{r}, h.waiting...)
@@ -306,9 +329,13 @@ func (c *Client) dial(h *hostPool) {
 	cc := &clientConn{client: c, host: h}
 	cc.parser.maxHeader = c.config.MaxResponseHeaderBytes
 	cc.parser.maxBody = c.config.MaxResponseBodyBytes
-	err := c.engine.DialWithHandler("tcp", h.addr, c.config.DialTimeout, cc, func(_ *fib.Connection, err error) {
-		c.dialed(cc, err)
-	})
+	done := func(_ *fib.Connection, err error) { c.dialed(cc, err) }
+	var err error
+	if h.target.secure {
+		err = c.engine.DialTLS("tcp", h.target.addr, c.config.DialTimeout, c.config.TLSConfig, cc, done)
+	} else {
+		err = c.engine.DialWithHandler("tcp", h.target.addr, c.config.DialTimeout, cc, done)
+	}
 	if err != nil {
 		c.dialed(cc, err)
 	}
@@ -521,7 +548,7 @@ func (cc *clientConn) send(r *clientRequest) {
 	cc.mu.Lock()
 	if cc.closed {
 		cc.mu.Unlock()
-		cc.client.enqueue(cc.host.addr, r, true)
+		cc.client.enqueue(cc.host.target, r, true)
 		return
 	}
 	cc.current = r
@@ -616,7 +643,7 @@ func (cc *clientConn) OnClose(_ *fib.Connection, err error) {
 		// A kept connection the server had already closed. Nothing came back,
 		// so a request that is safe to repeat is sent again on another.
 		r.retried = true
-		cc.client.enqueue(cc.host.addr, r, true)
+		cc.client.enqueue(cc.host.target, r, true)
 		return
 	}
 	if err == nil || err == io.EOF {

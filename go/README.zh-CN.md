@@ -168,6 +168,31 @@ err := server.Dial("tcp", "127.0.0.1:9001", 3*time.Second, func(c *fib.Connectio
 - `fib.NewEngine(config, handler)` 创建不监听任何地址的 Engine，只用于 Dial 出去
   的连接；它的 `LocalAddr` 返回错误。
 
+### TLS
+
+TLS 以 handler 包装的方式提供，基于标准库 `crypto/tls`，不需要额外依赖：
+
+```go
+// server：把任意 handler 包在 NewTLSServer 里
+server, err := fib.Bind(config, fib.NewTLSServer(tlsConfig, handler))
+
+// client：DialTLS 在 config 没有 ServerName 时取 addr 的 host
+err = engine.DialTLS("tcp", "example.com:443", 3*time.Second, tlsConfig, handler, done)
+```
+
+- 被包装的 handler 看到的是普通连接：`OnData` 收到的是明文，`Send`、`SendOwned`、
+  `SendParts`、`CloseAfterSend` 自动加密，所以 http、websocket 子 package 不用改动
+  就能跑在 TLS 上。`CloseAfterSend` 会先发送 close_notify。
+- `OnOpen`（以及 Dial 的 done）在 TCP 连接建立后立即调用，早于 TLS 握手；此时就可以
+  `Send`，数据会先缓存，握手完成后按顺序加密发出。握手失败或超时会关闭连接，
+  `OnClose` 收到对应错误。
+- `crypto/tls` 的握手是阻塞调用，所以每条连接的握手在单独的 goroutine 里进行，握手
+  结束后 goroutine 退出；之后的记录由 worker 在 `OnData` 中非阻塞解密，跨多轮读到达
+  的记录会被正确拼接。
+- `TLSHandler.HandshakeTimeout` 限制握手时长，0 表示 `DefaultTLSHandshakeTimeout`
+  （10 秒），负数表示不限制。
+- `Connection.TLSConnectionState()` 在握手完成后返回协商结果（版本、ALPN、对端证书等）。
+
 运行示例和测试：
 
 ```sh
@@ -216,7 +241,9 @@ client.Do(req, func(resp *http.Response, err error) {
 resp, err := client.Go(req).Wait() // Future：Wait 阻塞，Done() 可用于 select
 ```
 
-- 只支持 `http://`；`https://` 返回 `ErrUnsupportedScheme`。
+- 支持 `http://` 和 `https://`；https 使用 `ClientConfig.TLSConfig`（nil 表示默认
+  配置，未设置 ServerName 时取 URL 的 host）。其他 scheme 返回 `ErrUnsupportedScheme`。
+  http 与 https 即使地址相同也各自使用独立的连接池。
 - 每个 host:port 维护连接池：keep-alive 复用，`MaxConnsPerHost` 限制同时打开或正在
   建立的连接数，超出的请求排队；`MaxIdleConnsPerHost`、`IdleConnTimeout` 控制空闲
   连接的保留。每条连接同时只跑一个请求，不做 pipelining。
@@ -299,7 +326,8 @@ dialer.Dial("ws://127.0.0.1:8080/ws", nil, handler, func(c *websocket.Connection
 conn, resp, err := dialer.Go(url, header, handler).Wait() // Future 形式
 ```
 
-- 只支持 `ws://`；`wss://` 返回 `ErrUnsupportedScheme`。
+- 支持 `ws://` 和 `wss://`；wss 使用 `DialerConfig.TLSConfig`，规则同 HTTP client。
+  其他 scheme 返回 `ErrUnsupportedScheme`。
 - 成功时先调用 handler 的 `OnOpen`（参数是握手请求），再调用 done；失败时只调用
   done，连接为 nil，服务端有响应时一并传入 resp（例如 403），便于查看状态码和头部。
 - 握手会校验 101 状态、`Upgrade`/`Connection` 头、`Sec-WebSocket-Accept` 与本次

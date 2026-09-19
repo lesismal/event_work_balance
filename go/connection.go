@@ -55,6 +55,9 @@ type Connection struct {
 	// dialing is set while an outbound connect is still in progress, and
 	// cleared when it completes or fails. Event-loop ownership.
 	dialing *dialRequest
+	// tlsLayer is set by TLSHandler.OnOpen when the connection runs TLS, and
+	// then carries every send through encryption.
+	tlsLayer *tlsLayer
 }
 
 // Attachment returns application state associated with the connection.
@@ -82,6 +85,15 @@ func (c *Connection) Close() {
 // CloseAfterSend closes the connection after all data already accepted by Send
 // has been handed to the kernel.
 func (c *Connection) CloseAfterSend() {
+	if t := c.tlsLayer; t != nil {
+		t.closeAfterSendTLS()
+		return
+	}
+	c.closeAfterSendRaw()
+}
+
+// closeAfterSendRaw is CloseAfterSend below any TLS layer.
+func (c *Connection) closeAfterSendRaw() {
 	c.mu.Lock()
 	if c.closing || c.closed || c.closeAfterSend {
 		c.mu.Unlock()
@@ -242,13 +254,32 @@ func (c *Connection) subPending(n int64) {
 
 // Send copies data before returning. It first attempts a direct nonblocking write.
 func (c *Connection) Send(data []byte) error {
+	if t := c.tlsLayer; t != nil {
+		return t.send(data, nil)
+	}
 	return c.send(data, true)
 }
 
 // SendOwned sends data without copying it. Ownership transfers to the
 // connection immediately; the caller must not access data after the call.
 func (c *Connection) SendOwned(data []byte) error {
+	if t := c.tlsLayer; t != nil {
+		return t.send(data, nil)
+	}
 	return c.send(data, false)
+}
+
+// sendRaw writes bytes to the socket below any TLS layer.
+func (c *Connection) sendRaw(data []byte) error {
+	return c.send(data, true)
+}
+
+// sendClosed reports whether the connection has stopped accepting sends.
+func (c *Connection) sendClosed() bool {
+	c.mu.Lock()
+	closed := c.closing || c.closed || c.closeAfterSend
+	c.mu.Unlock()
+	return closed
 }
 
 func (c *Connection) send(data []byte, copyData bool) error {
@@ -312,6 +343,9 @@ func (c *Connection) send(data []byte, copyData bool) error {
 // SendParts writes a two-part message without first joining the parts. If the
 // socket is backpressured, only the unsent suffix is copied before returning.
 func (c *Connection) SendParts(first, second []byte) error {
+	if t := c.tlsLayer; t != nil {
+		return t.send(first, second)
+	}
 	total := len(first) + len(second)
 	if total == 0 {
 		return nil
