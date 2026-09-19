@@ -126,6 +126,9 @@ type h2ServerStream struct {
 	// The rest is guarded by the connection's mu.
 	remoteDone bool
 	responded  bool
+	// trailer is what the response sends after its body, once the body is
+	// out. Guarded by the connection's mu.
+	trailer    stdhttp.Header
 	localDone  bool
 	reset      bool
 	sendWindow int64
@@ -781,7 +784,7 @@ func (sc *h2ServerConn) finishRequest(st *h2ServerStream) error {
 		req.Body = io.NopCloser(bytes.NewReader(st.body))
 	}
 	st.body = nil
-	sc.handler.handler.ServeHTTP(&Context{Conn: sc.conn, Request: req, stream: st}, req)
+	serveRequest(sc.handler.handler, &Context{Conn: sc.conn, Request: req, stream: st})
 	return nil
 }
 
@@ -861,10 +864,13 @@ func (st *h2ServerStream) respond(req *stdhttp.Request, response Response) error
 		block = sc.enc.AppendField(block, "content-length", strconv.Itoa(len(response.Body)), false)
 	}
 	block = sc.appendHeaderLocked(block, response.Header)
+	if bodyAllowed && req.Method != stdhttp.MethodHead {
+		st.trailer = h2Trailer(response.Trailer)
+	}
 	out := make([]byte, 0, len(block)+2*h2FrameHeaderLen+len(body))
-	out = h2AppendHeaderBlock(out, st.id, block, len(body) == 0, sc.peerMaxFrame)
+	out = h2AppendHeaderBlock(out, st.id, block, len(body) == 0 && st.trailer == nil, sc.peerMaxFrame)
 	if len(body) == 0 {
-		st.localDone = true
+		out = sc.endStreamLocked(out, st)
 	} else {
 		st.pending = body
 		out = sc.flushStreamLocked(out, st)
@@ -987,15 +993,49 @@ func (sc *h2ServerConn) flushStreamLocked(out []byte, st *h2ServerStream) []byte
 		chunk := st.pending[:n]
 		st.pending = st.pending[n:]
 		var flags uint8
-		if len(st.pending) == 0 {
-			flags = h2FlagEndStream
+		last := len(st.pending) == 0
+		if last {
 			st.pending = nil
-			st.localDone = true
+			if st.trailer == nil {
+				flags = h2FlagEndStream
+			}
 		}
 		out = h2AppendFrameHeader(out, h2FrameData, flags, st.id, len(chunk))
 		out = append(out, chunk...)
 		sc.sendWindow -= n
 		st.sendWindow -= n
+		if last {
+			out = sc.endStreamLocked(out, st)
+		}
+	}
+	return out
+}
+
+// endStreamLocked marks the response on st sent, sending its trailers, which
+// end the stream, if it has any. They are encoded only now, as they go out,
+// since HPACK's table has to change in the order the blocks are sent.
+func (sc *h2ServerConn) endStreamLocked(out []byte, st *h2ServerStream) []byte {
+	st.localDone = true
+	if st.trailer == nil {
+		return out
+	}
+	block := sc.enc.Begin(nil)
+	block = sc.appendHeaderLocked(block, st.trailer)
+	st.trailer = nil
+	return h2AppendHeaderBlock(out, st.id, block, true, sc.peerMaxFrame)
+}
+
+// h2Trailer is the part of trailer HTTP/2 can send, or nil if that is none.
+func h2Trailer(trailer stdhttp.Header) stdhttp.Header {
+	var out stdhttp.Header
+	for key, values := range trailer {
+		if forbiddenTrailer(key) || h2CheckHeader(stdhttp.Header{key: values}) != nil {
+			continue
+		}
+		if out == nil {
+			out = make(stdhttp.Header, len(trailer))
+		}
+		out[key] = values
 	}
 	return out
 }

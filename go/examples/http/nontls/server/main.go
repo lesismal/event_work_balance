@@ -1,9 +1,12 @@
 //go:build linux || darwin || windows
 
 // Command server is an HTTP echo server: it answers each request with its
-// method, path and body.
+// method, path and body. With -dir it also serves that directory's files
+// under /files/, through net/http's FileServer, which gets Range and
+// conditional requests from net/http and sends each file by sendfile(2).
 //
-//	go run ./examples/http/nontls/server
+//	go run ./examples/http/nontls/server -dir .
+//	curl -O http://127.0.0.1:8080/files/go.mod
 package main
 
 import (
@@ -11,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	stdhttp "net/http"
+	"strings"
 
 	fib "github.com/lesismal/fib/go"
 	"github.com/lesismal/fib/go/examples/internal/example"
@@ -19,11 +23,16 @@ import (
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
+	dir := flag.String("dir", "", "directory to serve under /files/")
 	flag.Parse()
 
+	handler := echo()
+	if *dir != "" {
+		handler = withFiles(*dir, handler)
+	}
 	config := fib.DefaultConfig()
 	config.Addr = *addr
-	engine, err := fib.Bind(config, fibhttp.NewHandler(echo()))
+	engine, err := fib.Bind(config, fibhttp.NewHandler(handler))
 	if err != nil {
 		example.Fatal(err)
 	}
@@ -39,5 +48,18 @@ func echo() fibhttp.HandlerFunc {
 		if err := c.Respond(stdhttp.StatusOK, "text/plain; charset=utf-8", []byte(reply)); err != nil {
 			c.Conn.Close()
 		}
+	}
+}
+
+// withFiles serves dir under /files/ and leaves every other path to next.
+// Context is an http.ResponseWriter, so net/http's handlers answer through it.
+func withFiles(dir string, next fibhttp.HandlerFunc) fibhttp.HandlerFunc {
+	files := stdhttp.StripPrefix("/files/", stdhttp.FileServer(stdhttp.Dir(dir)))
+	return func(c *fibhttp.Context, r *stdhttp.Request) {
+		if strings.HasPrefix(r.URL.Path, "/files/") {
+			files.ServeHTTP(c, r)
+			return
+		}
+		next(c, r)
 	}
 }

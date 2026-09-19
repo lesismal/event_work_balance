@@ -19,6 +19,10 @@ var (
 	ErrHeaderTooLarge = errors.New("http: request header too large")
 	ErrBodyTooLarge   = errors.New("http: request body too large")
 	ErrMalformed      = errors.New("http: malformed request")
+	// ErrUnsupportedTransferEncoding is a request whose body is framed by a
+	// transfer coding other than chunked, which the server answers with 501
+	// (RFC 9112 section 6.1). errors.Is matches it against ErrMalformed too.
+	ErrUnsupportedTransferEncoding = fmt.Errorf("%w: unsupported transfer encoding", ErrMalformed)
 )
 
 var requestReaderPool = sync.Pool{New: func() any {
@@ -140,6 +144,7 @@ func (p *Parser) FeedOne(data []byte) (*stdhttp.Request, bool, error) {
 			p.buffer = nil
 			return nil, false, fmt.Errorf("%w: %v", ErrMalformed, err)
 		}
+		req.Close = req.Close || frame.request.Close
 		body, readErr := io.ReadAll(io.LimitReader(req.Body, p.config.MaxBodyBytes+1))
 		_ = req.Body.Close()
 		if readErr != nil || int64(len(body)) > p.config.MaxBodyBytes {
@@ -201,12 +206,29 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 	}
 	req, err := readRequest(p.buffer[:headerEnd], false)
 	if err != nil {
+		if strings.Contains(err.Error(), "unsupported transfer encoding") {
+			// net/http refuses transfer codings other than chunked, without
+			// an error type to tell that from a malformed request.
+			return frameInfo{}, false, ErrUnsupportedTransferEncoding
+		}
 		return frameInfo{}, false, fmt.Errorf("%w: %v", ErrMalformed, err)
 	}
 	_ = req.Body.Close()
+	if !req.ProtoAtLeast(1, 1) && hasHeaderField(p.buffer[:headerEnd], "transfer-encoding") {
+		// HTTP/1.0 has no transfer codings, so a body framed by one cannot
+		// be trusted to end where either side thinks (RFC 9112 section 6.1).
+		// net/http drops the field, so it is looked for in the raw header.
+		return frameInfo{}, false, fmt.Errorf("%w: Transfer-Encoding in an HTTP/1.0 request", ErrMalformed)
+	}
 	if len(req.TransferEncoding) != 0 {
 		if len(req.TransferEncoding) != 1 || !strings.EqualFold(req.TransferEncoding[0], "chunked") {
-			return frameInfo{}, false, fmt.Errorf("%w: unsupported transfer encoding", ErrMalformed)
+			return frameInfo{}, false, ErrUnsupportedTransferEncoding
+		}
+		if hasHeaderField(p.buffer[:headerEnd], "content-length") {
+			// Framed two ways, a request may be read differently by whatever
+			// passed it on; chunked wins, and the connection ends after it
+			// (RFC 9112 section 6.3).
+			req.Close = true
 		}
 		end, complete, err := chunkedEnd(p.buffer, headerEnd, p.config.MaxHeaderBytes, p.config.MaxBodyBytes)
 		if err == nil && !complete {
@@ -310,4 +332,15 @@ func chunkedEnd(data []byte, offset, maxTrailer int, maxBody int64) (int, bool, 
 		}
 		offset = chunkEnd + 2
 	}
+}
+
+// hasHeaderField reports whether a raw header block has a field named name,
+// which is given in lower case.
+func hasHeaderField(header []byte, name string) bool {
+	for line := range bytes.SplitSeq(header, []byte("\n")) {
+		if len(line) > len(name) && line[len(name)] == ':' && strings.EqualFold(string(line[:len(name)]), name) {
+			return true
+		}
+	}
+	return false
 }

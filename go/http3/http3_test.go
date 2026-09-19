@@ -347,3 +347,30 @@ func TestDialFailure(t *testing.T) {
 		t.Fatal("request to nowhere succeeded")
 	}
 }
+
+// Trailers go out as a trailing HEADERS frame, whether the handler gives them
+// with the whole response or writes the response through the ResponseWriter
+// methods.
+func TestResponseTrailers(t *testing.T) {
+	url := startServer(t, Config{}, func(c *fibhttp.Context, r *stdhttp.Request) {
+		if r.URL.Path == "/writer" {
+			c.Header().Set("Trailer", "X-Sum")
+			_, _ = c.WriteString("written")
+			c.Header().Set("X-Sum", "w")
+			return
+		}
+		_ = c.WriteResponse(fibhttp.Response{StatusCode: 200, Body: []byte("whole"),
+			Trailer: stdhttp.Header{"X-Sum": {"s"}, "Content-Length": {"forbidden"}}})
+	})
+	client := newClient(t, nil)
+	for path, want := range map[string][2]string{"/whole": {"whole", "s"}, "/writer": {"written", "w"}} {
+		resp, err := client.Go(mustRequest(t, "GET", url+path, nil)).Wait()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if body := readBody(t, resp); body != want[0] || resp.Trailer.Get("X-Sum") != want[1] ||
+			resp.Trailer.Get("Content-Length") != "" {
+			t.Fatalf("%s: body %q, trailer %v", path, body, resp.Trailer)
+		}
+	}
+}

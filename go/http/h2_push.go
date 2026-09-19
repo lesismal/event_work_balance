@@ -127,6 +127,6 @@ func (st *h2ServerStream) push(parent *stdhttp.Request, target string, opts *std
 	sc.sendLocked(h2AppendPushPromise(nil, st.id, id, block, sc.peerMaxFrame))
 	sc.mu.Unlock()
 
-	sc.handler.handler.ServeHTTP(&Context{Conn: sc.conn, Request: req, stream: promised}, req)
+	serveRequest(sc.handler.handler, &Context{Conn: sc.conn, Request: req, stream: promised})
 	return nil
 }

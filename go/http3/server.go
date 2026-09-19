@@ -483,7 +483,9 @@ func (rs *requestStream) finish() {
 		req.Body = io.NopCloser(bytes.NewReader(rs.body))
 	}
 	rs.body = nil
-	rs.sc.h.handler.ServeHTTP(fibhttp.NewStreamContext(rs.sc.conn, req, rs), req)
+	c := fibhttp.NewStreamContext(rs.sc.conn, req, rs)
+	rs.sc.h.handler.ServeHTTP(c, req)
+	_ = c.Finish()
 }
 
 // abort gives up on a malformed or incomplete request.
@@ -570,6 +572,21 @@ func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Re
 	if len(body) > 0 {
 		out = appendFrameHeader(out, frameData, len(body))
 		out = append(out, body...)
+	}
+	if bodyAllowed(req, status) && len(response.Trailer) > 0 {
+		trailer := append([]byte(nil), qpack.Prefix...)
+		for key, values := range response.Trailer {
+			name := strings.ToLower(key)
+			if !validTrailer(name, values) {
+				continue
+			}
+			for _, value := range values {
+				trailer = qpack.AppendField(trailer, name, value, false)
+			}
+		}
+		if len(trailer) > len(qpack.Prefix) {
+			out = appendHeadersFrame(out, trailer)
+		}
 	}
 	err := rs.s.Write(out, true)
 	if !rs.remoteDone {

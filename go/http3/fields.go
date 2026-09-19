@@ -268,3 +268,24 @@ func decodeFields(block []byte, maxSize int) ([]qpack.HeaderField, error) {
 	})
 	return fields, err
 }
+
+// validTrailer reports whether a response may send name, in lower case, as
+// a trailer: a field HTTP/3 carries, with sendable values, that does not
+// frame, route or authenticate the message (RFC 9110 section 6.5.1).
+func validTrailer(name string, values []string) bool {
+	switch name {
+	case "content-length", "transfer-encoding", "trailer", "host", "content-type", "content-encoding",
+		"content-range", "cache-control", "expect", "max-forwards", "pragma", "range", "te",
+		"authorization", "set-cookie":
+		return false
+	}
+	if name == "" || connectionHeaders[name] || !validName(name) {
+		return false
+	}
+	for _, value := range values {
+		if !sendableValue(value) {
+			return false
+		}
+	}
+	return true
+}

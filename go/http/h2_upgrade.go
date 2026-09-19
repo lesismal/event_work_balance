@@ -49,7 +49,7 @@ func (h *ServerHandler) upgradeH2C(c *fib.Connection, parser *Parser, request *s
 	if err != nil {
 		// Settings the server cannot accept: carry on in HTTP/1.1, which
 		// the client has to be ready for anyway.
-		h.handler.ServeHTTP(&Context{Conn: c, Request: request}, request)
+		serveRequest(h.handler, &Context{Conn: c, Request: request})
 		return
 	}
 	rest := parser.TakeBuffered()
@@ -75,7 +75,7 @@ func (h *ServerHandler) upgradeH2C(c *fib.Connection, parser *Parser, request *s
 	sc.streams[1] = st
 	sc.lastStreamID = 1
 	sc.mu.Unlock()
-	h.handler.ServeHTTP(&Context{Conn: c, Request: request, stream: st}, request)
+	serveRequest(h.handler, &Context{Conn: c, Request: request, stream: st})
 	if len(rest) > 0 {
 		sc.feed(rest)
 	}

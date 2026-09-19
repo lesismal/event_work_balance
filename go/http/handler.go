@@ -28,17 +28,33 @@ type Response struct {
 	StatusCode int
 	Header     stdhttp.Header
 	Body       []byte
-	Close      bool
+	// Trailer is sent after the body. HTTP/1.1 carries it by sending the
+	// body chunked, and announces its names in a Trailer header; HTTP/2 and
+	// HTTP/3 send it as a trailing header block. An HTTP/1.0 client, and a
+	// response that has no body, gets none of it.
+	Trailer stdhttp.Header
+	Close   bool
 }
 
-// Context is the connection a request arrived on. Respond with Respond or
-// WriteResponse rather than by sending on Conn: on an HTTP/2 or HTTP/3
-// connection the response is framed for its stream, and bytes sent on Conn
-// directly would corrupt the connection.
+// Context is the connection a request arrived on, and the response to it.
+// Respond with Respond or WriteResponse, or write the response piece by piece
+// through the http.ResponseWriter methods Context has, rather than by
+// sending on Conn: on an HTTP/2 or HTTP/3 connection the response is framed
+// for its stream, and bytes sent on Conn directly would corrupt the
+// connection.
+//
+// Since Context is an http.ResponseWriter, http.ServeFile, http.ServeContent
+// and other net/http helpers can answer through it; see ReadFrom for how
+// they send files.
 type Context struct {
 	Conn    *fib.Connection
 	Request *stdhttp.Request
 	wrote   bool
+	// closing records that the response ends the HTTP/1 connection, so that
+	// no request pipelined behind it is served.
+	closing bool
+	// w is the response being written through the ResponseWriter methods.
+	w *responseWriter
 	// stream is the HTTP/2 stream the request arrived on, or nil for HTTP/1.
 	stream *h2ServerStream
 	// external is the stream of a protocol served outside this package.
@@ -72,9 +88,18 @@ func (c *Context) Respond(status int, contentType string, body []byte) error {
 	return c.WriteResponse(Response{StatusCode: status, Header: header, Body: body})
 }
 
+// WriteResponse sends the whole response at once. It fails once the
+// response has been begun through the ResponseWriter methods.
 func (c *Context) WriteResponse(response Response) error {
+	if c.w != nil && c.w.status != 0 {
+		return ErrResponseWritten
+	}
+	return c.writeResponse(response)
+}
+
+func (c *Context) writeResponse(response Response) error {
 	if c.wrote {
-		return errors.New("http: response already written")
+		return ErrResponseWritten
 	}
 	if response.StatusCode == 0 {
 		response.StatusCode = stdhttp.StatusOK
@@ -95,7 +120,7 @@ func (c *Context) WriteResponse(response Response) error {
 		c.wrote = true
 		return nil
 	}
-	closeConnection := response.Close || c.Request.Close
+	closeConnection := response.Close || c.Request.Close || headerHasToken(response.Header, "Connection", "close")
 	data, err := marshalResponse(c.Request, response, closeConnection)
 	if err != nil {
 		return err
@@ -105,6 +130,7 @@ func (c *Context) WriteResponse(response Response) error {
 	}
 	c.wrote = true
 	if closeConnection {
+		c.closing = true
 		c.Conn.CloseAfterSend()
 	}
 	return nil
@@ -141,7 +167,7 @@ func (c *Context) WriteInterim(status int, header stdhttp.Header) error {
 	if status < 100 || status > 199 || status == stdhttp.StatusSwitchingProtocols {
 		return fmt.Errorf("http: invalid interim status code %d", status)
 	}
-	if c.wrote {
+	if c.wrote || c.w != nil && c.w.status != 0 {
 		return errors.New("http: interim response after the final one")
 	}
 	if c.external != nil {
@@ -231,12 +257,17 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 		}
 		request.RemoteAddr = parser.remoteAddr
 		request.TLS = h.tlsState(c, parser)
+		if status := checkRequest(request); status != 0 {
+			err = requestError(status)
+			break
+		}
 		if settings, ok := h.h2cUpgrade(c, request); ok {
 			h.upgradeH2C(c, parser, request, settings)
 			return
 		}
-		h.handler.ServeHTTP(&Context{Conn: c, Request: request}, request)
-		if request.Close {
+		context := &Context{Conn: c, Request: request}
+		serveRequest(h.handler, context)
+		if request.Close || context.closing {
 			return
 		}
 		if len(parser.buffer) == 0 {
@@ -251,10 +282,16 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 	}
 	if err != nil {
 		status := stdhttp.StatusBadRequest
-		if errors.Is(err, ErrHeaderTooLarge) {
+		var statusErr requestError
+		switch {
+		case errors.As(err, &statusErr):
+			status = int(statusErr)
+		case errors.Is(err, ErrHeaderTooLarge):
 			status = stdhttp.StatusRequestHeaderFieldsTooLarge
-		} else if errors.Is(err, ErrBodyTooLarge) {
+		case errors.Is(err, ErrBodyTooLarge):
 			status = stdhttp.StatusRequestEntityTooLarge
+		case errors.Is(err, ErrUnsupportedTransferEncoding):
+			status = stdhttp.StatusNotImplemented
 		}
 		request := &stdhttp.Request{ProtoMajor: 1, ProtoMinor: 1, Header: make(stdhttp.Header)}
 		context := &Context{Conn: c, Request: request}
@@ -265,6 +302,37 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 			Close:      true,
 		})
 	}
+}
+
+// serveRequest runs the handler for the request context carries, and then ends the
+// response the handler wrote through the ResponseWriter methods, if it began
+// one, as net/http does when a handler returns.
+func serveRequest(handler Handler, context *Context) {
+	handler.ServeHTTP(context, context.Request)
+	_ = context.Finish()
+}
+
+// requestError is a request the server refuses with its status.
+type requestError int
+
+func (e requestError) Error() string { return "http: " + stdhttp.StatusText(int(e)) }
+
+// checkRequest returns the status to refuse a request that parsed but that
+// the server cannot serve with, or 0. An HTTP/1.1 request has to name its
+// host exactly once (RFC 9112 section 3.2), and an expectation other than
+// 100-continue cannot be met (RFC 9110 section 10.1.1).
+func checkRequest(request *stdhttp.Request) int {
+	if request.ProtoAtLeast(1, 1) && request.Method != stdhttp.MethodConnect {
+		if hosts, ok := request.Header["Host"]; !ok && request.Host == "" || len(hosts) > 1 {
+			return stdhttp.StatusBadRequest
+		}
+	}
+	if expect, ok := request.Header["Expect"]; ok {
+		if len(expect) != 1 || !strings.EqualFold(strings.TrimSpace(expect[0]), "100-continue") {
+			return stdhttp.StatusExpectationFailed
+		}
+	}
+	return 0
 }
 
 // sniff tells HTTP/2 from HTTP/1 by whether the connection opens with the
@@ -309,67 +377,72 @@ func (h *ServerHandler) OnClose(c *fib.Connection, _ error) {
 }
 
 func marshalResponse(request *stdhttp.Request, response Response, closeConnection bool) ([]byte, error) {
-	if response.StatusCode < 100 || response.StatusCode > 999 {
-		return nil, fmt.Errorf("http: invalid status code %d", response.StatusCode)
-	}
-	bodyAllowed := response.StatusCode != stdhttp.StatusNoContent &&
-		response.StatusCode != stdhttp.StatusNotModified &&
-		(response.StatusCode < 100 || response.StatusCode >= 200)
-	contentLength := len(response.Body)
-	if !bodyAllowed {
-		contentLength = 0
-	}
-	proto := "HTTP/1.1"
-	connectionValue := ""
-	if closeConnection {
-		connectionValue = "close"
-	}
-	if request.ProtoMajor == 1 && request.ProtoMinor == 0 {
-		proto = "HTTP/1.0"
-		if !closeConnection {
-			connectionValue = "keep-alive"
+	status := response.StatusCode
+	head := responseHead{status: status, header: response.Header, contentLength: -1, close: closeConnection}
+	hasBody := statusHasBody(status)
+	isHead := request.Method == stdhttp.MethodHead
+	var trailer stdhttp.Header
+	switch {
+	case status == stdhttp.StatusNotModified:
+		// A 304 may repeat the length of what it stands for, and only a
+		// length the handler gives knows that (RFC 9110 section 8.6).
+		head.contentLength = declaredLength(response.Header)
+	case !hasBody:
+		// 1xx and 204 never carry Content-Length.
+	case isHead:
+		head.contentLength = declaredLength(response.Header)
+		if head.contentLength < 0 {
+			head.contentLength = int64(len(response.Body))
 		}
+	case len(response.Trailer) > 0 && request.ProtoAtLeast(1, 1):
+		head.chunked = true
+		trailer = make(stdhttp.Header, len(response.Trailer))
+		for key, values := range response.Trailer {
+			if !forbiddenTrailer(key) {
+				key = stdhttp.CanonicalHeaderKey(key)
+				trailer[key] = values
+				head.trailers = append(head.trailers, key)
+			}
+		}
+		sort.Strings(head.trailers)
+	default:
+		head.contentLength = int64(len(response.Body))
 	}
-	statusText := stdhttp.StatusText(response.StatusCode)
-	if statusText == "" {
-		statusText = "Status"
-	}
-	// Build directly into the returned byte slice. Avoid cloning the header map
-	// and fmt/bytes.Buffer overhead on every response.
-	capacity := len(response.Body) + 96
+	capacity := len(response.Body) + 128
 	for key, values := range response.Header {
 		capacity += len(key) + 4
 		for _, value := range values {
 			capacity += len(value) + 2
 		}
 	}
-	out := make([]byte, 0, capacity)
-	out = append(out, proto...)
-	out = append(out, ' ')
-	out = strconv.AppendInt(out, int64(response.StatusCode), 10)
-	out = append(out, ' ')
-	out = append(out, statusText...)
-	out = append(out, '\r', '\n')
-	out = append(out, "Content-Length: "...)
-	out = strconv.AppendInt(out, int64(contentLength), 10)
-	out = append(out, '\r', '\n')
-	if connectionValue != "" {
-		out = append(out, "Connection: "...)
-		out = append(out, connectionValue...)
-		out = append(out, '\r', '\n')
-	}
-	out, err := appendHeaderLines(out, response.Header, func(key string) bool {
-		return strings.EqualFold(key, "Content-Length") || strings.EqualFold(key, "Transfer-Encoding") ||
-			(connectionValue != "" && strings.EqualFold(key, "Connection"))
-	})
+	out, err := appendResponseHead(make([]byte, 0, capacity), request, head)
 	if err != nil {
 		return nil, err
 	}
-	out = append(out, '\r', '\n')
-	if request.Method != stdhttp.MethodHead && bodyAllowed {
-		out = append(out, response.Body...)
+	if isHead || !hasBody {
+		return out, nil
 	}
-	return out, nil
+	if !head.chunked {
+		return append(out, response.Body...), nil
+	}
+	if len(response.Body) > 0 {
+		out = appendChunk(out, response.Body)
+	}
+	out = append(out, "0\r\n"...)
+	if out, err = appendHeaderLines(out, trailer, nil); err != nil {
+		return nil, err
+	}
+	return append(out, crlf...), nil
+}
+
+// declaredLength is the Content-Length header holds, or -1.
+func declaredLength(header stdhttp.Header) int64 {
+	if values := header["Content-Length"]; len(values) == 1 {
+		if n, err := strconv.ParseInt(strings.TrimSpace(values[0]), 10, 64); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return -1
 }
 
 // appendHeaderLines appends header as HTTP/1 lines in key order, leaving out
