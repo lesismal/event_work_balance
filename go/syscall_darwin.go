@@ -51,6 +51,23 @@ func newSocket(family int) (int, error) {
 	return fd, nil
 }
 
+func newDatagramSocket(family int) (int, error) {
+	syscall.ForkLock.RLock()
+	fd, err := syscall.Socket(family, syscall.SOCK_DGRAM, 0)
+	if err == nil {
+		syscall.CloseOnExec(fd)
+	}
+	syscall.ForkLock.RUnlock()
+	if err != nil {
+		return -1, err
+	}
+	if err = syscall.SetNonblock(fd, true); err != nil {
+		syscall.Close(fd)
+		return -1, err
+	}
+	return fd, nil
+}
+
 var (
 	backlogOnce  sync.Once
 	backlogValue int

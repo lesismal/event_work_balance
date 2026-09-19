@@ -4,6 +4,7 @@ package fib
 
 import (
 	"net"
+	"net/netip"
 	"sync/atomic"
 	"syscall"
 )
@@ -17,10 +18,11 @@ const (
 	// server carry any number of listeners.
 	listenerKind = uint64(0)
 	wakeKind     = uint64(1)
+	udpKind      = uint64(2)
 	// firstGeneration seeds the generation half of a connection token. Starting
 	// above the reserved kinds keeps every connection token distinct from a
 	// listener or wake token whatever descriptor it lands on.
-	firstGeneration = uint64(2)
+	firstGeneration = uint64(3)
 	// connPageShift sizes one page of the descriptor table. 4096 entries is
 	// 32KB per page, small enough that a server holding few connections in a
 	// wide descriptor range wastes little, large enough that the page
@@ -57,17 +59,58 @@ type connPlatform struct {
 	token uint64
 }
 
+// udpPlatform is empty here: a dialed UDP connection reads its own descriptor
+// and a peer sends through its listener's.
+type udpPlatform struct{}
+
+type udpListenerPlatform struct{ fd int }
+
+// FD returns the connection's descriptor, or -1 once it is closed. A UDP peer
+// has no descriptor of its own and always reports -1.
 func (c *Connection) FD() int { return int(c.fd.Load()) }
+
+func (c *Connection) initUDPPeer() { c.fd.Store(-1) }
+
+func (l *udpListener) sockname() (syscall.Sockaddr, error) { return syscall.Getsockname(l.fd) }
+
+func (c *Connection) peerSockaddr() (syscall.Sockaddr, error) { return syscall.Getpeername(c.FD()) }
+
+// sysSendDatagram sends one datagram. Callers hold c.mu.
+func (c *Connection) sysSendDatagram(data []byte) error {
+	for {
+		var err error
+		if l := c.udp.listener; l != nil {
+			err = syscall.Sendto(l.fd, data, 0, c.udp.sa)
+		} else {
+			_, err = syscall.Write(c.FD(), data)
+		}
+		if err != syscall.EINTR {
+			return err
+		}
+	}
+}
 
 func (e *Engine) open(config Config, addrs []string) error {
 	e.nextGeneration.Store(firstGeneration)
+	udp := isUDPNetwork(config.Network)
 	for _, addr := range addrs {
+		if udp {
+			fd, err := createUDPListener(config, addr)
+			if err != nil {
+				e.closeListeners()
+				return err
+			}
+			e.udpListeners = append(e.udpListeners, &udpListener{udpListenerPlatform: udpListenerPlatform{fd: fd},
+				peers: make(map[netip.AddrPort]*Connection)})
+			continue
+		}
 		fd, err := createListener(config, addr)
 		if err != nil {
 			e.closeListeners()
 			return err
 		}
 		e.listenFDs = append(e.listenFDs, fd)
+		e.noteUnixPath(config.Network, addr)
 	}
 	if err := e.openBackend(); err != nil {
 		e.closeListeners()
@@ -81,10 +124,75 @@ func (e *Engine) closeListeners() {
 		syscall.Close(fd)
 	}
 	e.listenFDs = nil
+	for _, l := range e.udpListeners {
+		syscall.Close(l.fd)
+	}
+	e.udpListeners = nil
+	e.removeUnixPaths()
 }
 
 func listenerToken(fd int) uint64 { return uint64(uint32(fd)) | listenerKind<<32 }
 func wakeToken(fd int) uint64     { return uint64(uint32(fd)) | wakeKind<<32 }
+func udpToken(fd int) uint64      { return uint64(uint32(fd)) | udpKind<<32 }
+
+// udpListenerAt returns the UDP listener on a descriptor, or nil.
+func (e *Engine) udpListenerAt(fd int) *udpListener {
+	for _, l := range e.udpListeners {
+		if l.fd == fd {
+			return l
+		}
+	}
+	return nil
+}
+
+// readUDPListener reads the datagrams waiting on a UDP listener and queues
+// each on its peer's connection, opening connections for new peers. The socket
+// is level-triggered, so it reads at most one round's share and leaves the
+// rest to the next round. Callers run on the event loop.
+func (e *Engine) readUDPListener(l *udpListener, ready []*Connection) []*Connection {
+	buf := e.datagramBuffer()
+	for i := 0; i < maxDatagramsPerRound; i++ {
+		n, from, err := syscall.Recvfrom(l.fd, buf, 0)
+		if err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
+			return ready
+		}
+		c := e.udpPeer(l, from)
+		if c == nil {
+			continue
+		}
+		if r := e.deliverDatagram(c, buf[:n]); r != nil {
+			ready = append(ready, r)
+		}
+	}
+	return ready
+}
+
+// readUDPConnection reads a dialed UDP connection's datagrams, as
+// readUDPListener does for a listener's. An error, such as the refusal a
+// connected socket reports when nothing listens at the peer's port, closes the
+// connection. Callers run on the event loop.
+func (e *Engine) readUDPConnection(c *Connection, ready []*Connection) []*Connection {
+	buf := e.datagramBuffer()
+	for i := 0; i < maxDatagramsPerRound; i++ {
+		n, err := syscall.Read(c.FD(), buf)
+		if err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
+			if !isWouldBlock(err) {
+				c.closeWithError(err)
+			}
+			return ready
+		}
+		if r := e.deliverDatagram(c, buf[:n]); r != nil {
+			ready = append(ready, r)
+		}
+	}
+	return ready
+}
 
 // connectionAt returns the connection currently holding a descriptor.
 func (e *Engine) connectionAt(fd int) *Connection {
@@ -137,8 +245,31 @@ func (e *Engine) isListener(fd int) bool {
 	return false
 }
 
-// LocalAddrs returns one address per listener, in configured order. Ports left
-// at zero report the port the kernel chose.
+// ListenAddrs returns the address of every listener, in configured order,
+// whatever its network: a *net.TCPAddr, *net.UnixAddr or *net.UDPAddr. Ports
+// left at zero report the port the kernel chose.
+func (e *Engine) ListenAddrs() ([]net.Addr, error) {
+	addrs := make([]net.Addr, 0, len(e.listenFDs)+len(e.udpListeners))
+	for _, fd := range e.listenFDs {
+		sa, err := syscall.Getsockname(fd)
+		if err != nil {
+			return nil, err
+		}
+		addrs = append(addrs, sockaddrToAddr(sa))
+	}
+	udpAddrs, err := e.LocalUDPAddrs()
+	if err != nil {
+		return nil, err
+	}
+	for _, addr := range udpAddrs {
+		addrs = append(addrs, addr)
+	}
+	return addrs, nil
+}
+
+// LocalAddrs returns one address per TCP listener, in configured order. Ports
+// left at zero report the port the kernel chose. It fails for an engine
+// listening on Unix sockets; ListenAddrs reports those.
 func (e *Engine) LocalAddrs() ([]*net.TCPAddr, error) {
 	addrs := make([]*net.TCPAddr, 0, len(e.listenFDs))
 	for _, fd := range e.listenFDs {
@@ -186,6 +317,10 @@ func (e *Engine) acceptConnections(listenFD int) {
 
 // detach releases a closed connection's descriptor and its table slot.
 func (e *Engine) detach(c *Connection) {
+	if c.udp != nil && c.udp.listener != nil {
+		e.detachPeer(c)
+		return
+	}
 	fd := int(c.fd.Swap(-1))
 	if fd < 0 {
 		return
@@ -204,6 +339,7 @@ func (e *Engine) Close() error {
 	var closeErr error
 	e.closeOnce.Do(func() {
 		e.Stop()
+		e.stopUDPSweeper()
 		e.taskWG.Wait()
 		e.releaseTaskPool()
 		e.closeCommands()
@@ -214,12 +350,19 @@ func (e *Engine) Close() error {
 				}
 			}
 		}
+		e.closeUDPPeers()
 		e.budgetPaused = nil
 		for _, fd := range e.listenFDs {
 			if err := syscall.Close(fd); err != nil && closeErr == nil {
 				closeErr = err
 			}
 		}
+		for _, l := range e.udpListeners {
+			if err := syscall.Close(l.fd); err != nil && closeErr == nil {
+				closeErr = err
+			}
+		}
+		e.removeUnixPaths()
 		if err := e.closeBackend(); err != nil && closeErr == nil {
 			closeErr = err
 		}
@@ -236,7 +379,9 @@ func createListener(config Config, addr string) (int, error) {
 	if err != nil {
 		return -1, err
 	}
-	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+	if family != syscall.AF_UNIX {
+		_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+	}
 	if family == syscall.AF_INET6 {
 		// "tcp" accepts both families on one socket; "tcp6" is IPv6 only. This
 		// is the distinction net.Listen draws between the two networks.
@@ -250,6 +395,30 @@ func createListener(config Config, addr string) (int, error) {
 		err = syscall.Listen(fd, config.Backlog)
 	}
 	if err != nil {
+		syscall.Close(fd)
+		return -1, err
+	}
+	return fd, nil
+}
+
+func createUDPListener(config Config, addr string) (int, error) {
+	family, bound, err := resolveListenAddr(config.Network, addr)
+	if err != nil {
+		return -1, err
+	}
+	fd, err := newDatagramSocket(family)
+	if err != nil {
+		return -1, err
+	}
+	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+	if family == syscall.AF_INET6 {
+		v6only := 0
+		if config.Network == "udp6" {
+			v6only = 1
+		}
+		_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, v6only)
+	}
+	if err = syscall.Bind(fd, bound); err != nil {
 		syscall.Close(fd)
 		return -1, err
 	}

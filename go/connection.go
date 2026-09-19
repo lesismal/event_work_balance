@@ -55,9 +55,10 @@ type Connection struct {
 	// dialing is set while an outbound connect is still in progress, and
 	// cleared when it completes or fails. Event-loop ownership.
 	dialing *dialRequest
-	// tlsLayer is set by TLSHandler.OnOpen when the connection runs TLS, and
-	// then carries every send through encryption.
-	tlsLayer *tlsLayer
+	// layer, when set, carries every send, as TLS does to encrypt it.
+	layer Layer
+	// udp is set for a UDP connection, which exchanges datagrams.
+	udp *udpState
 }
 
 // Attachment returns application state associated with the connection.
@@ -85,14 +86,14 @@ func (c *Connection) Close() {
 // CloseAfterSend closes the connection after all data already accepted by Send
 // has been handed to the kernel.
 func (c *Connection) CloseAfterSend() {
-	if t := c.tlsLayer; t != nil {
-		t.closeAfterSendTLS()
+	if l := c.layer; l != nil {
+		l.CloseAfterSend()
 		return
 	}
 	c.closeAfterSendRaw()
 }
 
-// closeAfterSendRaw is CloseAfterSend below any TLS layer.
+// closeAfterSendRaw is CloseAfterSend below any layer.
 func (c *Connection) closeAfterSendRaw() {
 	c.mu.Lock()
 	if c.closing || c.closed || c.closeAfterSend {
@@ -208,6 +209,11 @@ func (c *Connection) pauseStateChangedLocked() bool {
 // flush and so cannot re-evaluate on its own, and the event loop has to wake it
 // once the budget recovers.
 func (c *Connection) pauseDecision(readPaused bool) (pause, byBudget bool) {
+	if c.udp != nil {
+		// Datagrams are never queued for sending, so there is nothing to wait
+		// for, and a flood is bounded by the receive queue instead.
+		return false, false
+	}
 	e := c.engine
 	if e.maxPendingBytes > 0 && e.pendingTotal.Load() >= e.maxPendingBytes {
 		return true, true
@@ -254,8 +260,8 @@ func (c *Connection) subPending(n int64) {
 
 // Send copies data before returning. It first attempts a direct nonblocking write.
 func (c *Connection) Send(data []byte) error {
-	if t := c.tlsLayer; t != nil {
-		return t.send(data, nil)
+	if l := c.layer; l != nil {
+		return l.Send(data, nil)
 	}
 	return c.send(data, true)
 }
@@ -263,13 +269,13 @@ func (c *Connection) Send(data []byte) error {
 // SendOwned sends data without copying it. Ownership transfers to the
 // connection immediately; the caller must not access data after the call.
 func (c *Connection) SendOwned(data []byte) error {
-	if t := c.tlsLayer; t != nil {
-		return t.send(data, nil)
+	if l := c.layer; l != nil {
+		return l.Send(data, nil)
 	}
 	return c.send(data, false)
 }
 
-// sendRaw writes bytes to the socket below any TLS layer.
+// sendRaw writes bytes to the socket below any layer.
 func (c *Connection) sendRaw(data []byte) error {
 	return c.send(data, true)
 }
@@ -283,6 +289,9 @@ func (c *Connection) sendClosed() bool {
 }
 
 func (c *Connection) send(data []byte, copyData bool) error {
+	if c.udp != nil {
+		return c.sendDatagram(data)
+	}
 	if len(data) == 0 {
 		return nil
 	}
@@ -343,8 +352,11 @@ func (c *Connection) send(data []byte, copyData bool) error {
 // SendParts writes a two-part message without first joining the parts. If the
 // socket is backpressured, only the unsent suffix is copied before returning.
 func (c *Connection) SendParts(first, second []byte) error {
-	if t := c.tlsLayer; t != nil {
-		return t.send(first, second)
+	if l := c.layer; l != nil {
+		return l.Send(first, second)
+	}
+	if c.udp != nil {
+		return c.sendDatagramParts(first, second)
 	}
 	total := len(first) + len(second)
 	if total == 0 {
@@ -444,6 +456,14 @@ func (c *Connection) process() {
 		c.mu.Unlock()
 		deferred = 0
 		alive := !closed
+		if c.udp != nil {
+			// The loop has already read the socket; the round only hands the
+			// queued datagrams to the handler.
+			if alive && events&evIn != 0 {
+				c.drainDatagrams()
+			}
+			continue
+		}
 		var closeErr error
 		// Flush before reading so that a round which both frees socket send
 		// space and delivers new input never reads while output is still
@@ -608,7 +628,9 @@ func (c *Connection) drainPriorityInput() error {
 		if err == syscall.EINTR {
 			continue
 		}
-		if isWouldBlock(err) || err == syscall.EINVAL {
+		// EINVAL means no urgent data is waiting, and EOPNOTSUPP a socket
+		// that has none at all, such as a Unix one.
+		if isWouldBlock(err) || err == syscall.EINVAL || err == syscall.EOPNOTSUPP {
 			return nil
 		}
 		return err

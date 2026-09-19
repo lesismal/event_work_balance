@@ -110,7 +110,7 @@ func (h *TLSHandler) OnOpen(c *Connection) {
 	} else {
 		t.conn = tls.Server(t, h.Config)
 	}
-	c.tlsLayer = t
+	c.SetLayer(t)
 	h.inner().OnOpen(c)
 	timeout := h.HandshakeTimeout
 	if timeout == 0 {
@@ -120,7 +120,7 @@ func (h *TLSHandler) OnOpen(c *Connection) {
 }
 
 func (h *TLSHandler) OnData(c *Connection, data []byte) {
-	if t := c.tlsLayer; t != nil {
+	if t, ok := c.layer.(*tlsLayer); ok {
 		t.feed(h.inner(), data)
 	}
 }
@@ -132,7 +132,7 @@ func (h *TLSHandler) OnPriorityData(c *Connection, data []byte) {
 }
 
 func (h *TLSHandler) OnClose(c *Connection, err error) {
-	if t := c.tlsLayer; t != nil {
+	if t, ok := c.layer.(*tlsLayer); ok {
 		t.shutdown()
 	}
 	h.inner().OnClose(c, err)
@@ -261,8 +261,8 @@ func (t *tlsLayer) shutdown() {
 	t.mu.Unlock()
 }
 
-// send encrypts plaintext, or holds a copy of it until the handshake is done.
-func (t *tlsLayer) send(first, second []byte) error {
+// Send encrypts plaintext, or holds a copy of it until the handshake is done.
+func (t *tlsLayer) Send(first, second []byte) error {
 	if len(first)+len(second) == 0 {
 		return nil
 	}
@@ -290,9 +290,9 @@ func (t *tlsLayer) send(first, second []byte) error {
 	return err
 }
 
-// closeAfterSendTLS ends the stream with close_notify behind what was already
+// CloseAfterSend ends the stream with close_notify behind what was already
 // sent, and then closes the connection once it has all been written.
-func (t *tlsLayer) closeAfterSendTLS() {
+func (t *tlsLayer) CloseAfterSend() {
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
 	if t.closeAfterSend {
@@ -372,8 +372,8 @@ func (tlsAddr) String() string  { return "fib" }
 // negotiated protocol and the peer's certificates. It reports false for a
 // connection without TLS and for one whose handshake has not completed.
 func (c *Connection) TLSConnectionState() (tls.ConnectionState, bool) {
-	t := c.tlsLayer
-	if t == nil {
+	t, ok := c.layer.(*tlsLayer)
+	if !ok {
 		return tls.ConnectionState{}, false
 	}
 	t.wmu.Lock()

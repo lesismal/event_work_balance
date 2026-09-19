@@ -70,6 +70,10 @@ func newSocket(family int) (int, error) {
 	return syscall.Socket(family, syscall.SOCK_STREAM|syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC, 0)
 }
 
+func newDatagramSocket(family int) (int, error) {
+	return syscall.Socket(family, syscall.SOCK_DGRAM|syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC, 0)
+}
+
 func writevRaw(fd int, iov []syscall.Iovec) (int, error) {
 	r0, _, errno := syscall.Syscall(syscall.SYS_WRITEV, uintptr(fd), uintptr(unsafe.Pointer(&iov[0])), uintptr(len(iov)))
 	if errno != 0 {

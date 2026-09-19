@@ -43,6 +43,13 @@ func (e *Engine) openBackend() error {
 			break
 		}
 	}
+	// UDP sockets are level-triggered, so the loop can stop reading one after
+	// its share of a round and still hear about the rest.
+	for _, l := range e.udpListeners {
+		if err == nil {
+			err = e.addFD(l.fd, udpToken(l.fd), uint32(syscall.EPOLLIN))
+		}
+	}
 	if err == nil {
 		err = e.addFD(wakeFD, wakeToken(wakeFD), uint32(syscall.EPOLLIN)|epollET)
 	}
@@ -85,8 +92,16 @@ func (e *Engine) Run() error {
 				e.acceptConnections(int(uint32(token)))
 			case wakeKind:
 				e.drainCommands()
+			case udpKind:
+				if l := e.udpListenerAt(int(uint32(token))); l != nil {
+					ready = e.readUDPListener(l, ready)
+				}
 			default:
 				if c := e.connectionFor(token); c != nil {
+					if c.udp != nil {
+						ready = e.readUDPConnection(c, ready)
+						continue
+					}
 					if c.dialing != nil {
 						c = e.finishDial(c, events[i].Events, nil)
 					} else {
@@ -129,6 +144,12 @@ func (e *Engine) addFD(fd int, token uint64, events uint32) error {
 
 func (e *Engine) registerConnection(fd int, token uint64) error {
 	return e.addFD(fd, token, allEvents)
+}
+
+// registerDatagram registers a dialed UDP socket. Only reads matter, since
+// sends never wait, and it is level-triggered like a UDP listener.
+func (e *Engine) registerDatagram(fd int, token uint64) error {
+	return e.addFD(fd, token, uint32(syscall.EPOLLIN|syscall.EPOLLERR))
 }
 
 func (e *Engine) unregister(fd int) {

@@ -4,6 +4,7 @@ package fib
 
 import (
 	"net"
+	"net/netip"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -42,15 +43,38 @@ const (
 	opConnect
 	opRead
 	opWrite
+	// opRecvFrom is a UDP listener's receive, and opRecvDatagram a dialed UDP
+	// connection's. Unlike the zero-byte TCP read, both receive the datagram
+	// itself, since a zero-byte receive would truncate it.
+	opRecvFrom
+	opRecvDatagram
 )
 
 // ioOp is an OVERLAPPED plus what the loop needs to route its completion. The
 // OVERLAPPED comes first, so the pointer the port hands back is the ioOp's own
 // address.
 type ioOp struct {
-	ov   syscall.Overlapped
-	kind uint8
-	conn *Connection
+	ov       syscall.Overlapped
+	kind     uint8
+	conn     *Connection
+	listener *udpListener
+}
+
+// udpPlatform is a dialed UDP connection's receive buffer, which its
+// overlapped receive fills while the kernel holds it.
+type udpPlatform struct{ buf []byte }
+
+// udpListenerPlatform is a UDP socket and its one overlapped receive: the
+// buffer and the sender's address the kernel writes into, which have to stay
+// put until the receive completes.
+type udpListenerPlatform struct {
+	fd      syscall.Handle
+	op      ioOp
+	buf     []byte
+	from    syscall.RawSockaddrAny
+	fromLen int32
+	flags   uint32
+	closed  bool
 }
 
 // acceptOp is one outstanding AcceptEx: the socket it will hand over, and the
@@ -87,6 +111,9 @@ type enginePlatform struct {
 	// accepts counts AcceptEx calls not yet completed, for the same reason.
 	// Event-loop ownership.
 	accepts int
+	// udpRecvs counts UDP listener receives not yet completed, for the same
+	// reason again. Event-loop ownership.
+	udpRecvs int
 }
 
 type connPlatform struct {
@@ -115,7 +142,25 @@ type connPlatform struct {
 
 func (c *Connection) socket() syscall.Handle { return syscall.Handle(c.handle.Load()) }
 
-// FD returns the connection's socket handle, or -1 once it is closed.
+func (c *Connection) initUDPPeer() { c.handle.Store(uintptr(syscall.InvalidHandle)) }
+
+func (l *udpListener) sockname() (syscall.Sockaddr, error) { return syscall.Getsockname(l.fd) }
+
+func (c *Connection) peerSockaddr() (syscall.Sockaddr, error) { return syscall.Getpeername(c.socket()) }
+
+// sysSendDatagram sends one datagram without waiting. Callers hold c.mu.
+func (c *Connection) sysSendDatagram(data []byte) error {
+	var bufs [1]syscall.WSABuf
+	wsaBufs(bufs[:], data)
+	var n uint32
+	if l := c.udp.listener; l != nil {
+		return syscall.WSASendto(l.fd, &bufs[0], 1, &n, 0, c.udp.sa, nil, nil)
+	}
+	return syscall.WSASend(c.socket(), &bufs[0], 1, &n, 0, nil, nil)
+}
+
+// FD returns the connection's socket handle, or -1 once it is closed. A UDP
+// peer has no socket of its own and always reports -1.
 func (c *Connection) FD() int {
 	h := c.socket()
 	if h == syscall.InvalidHandle {
@@ -131,6 +176,9 @@ func (e *Engine) open(config Config, addrs []string) error {
 	}
 	e.port = port
 	e.conns = make(map[*Connection]struct{})
+	if isUDPNetwork(config.Network) {
+		return e.openUDP(config, addrs)
+	}
 	for _, addr := range addrs {
 		l, err := createListener(config, addr)
 		if err == nil {
@@ -142,10 +190,12 @@ func (e *Engine) open(config Config, addrs []string) error {
 			for _, opened := range e.listeners {
 				syscall.Closesocket(opened.fd)
 			}
+			e.removeUnixPaths()
 			syscall.CloseHandle(port)
 			return err
 		}
 		e.listeners = append(e.listeners, l)
+		e.noteUnixPath(config.Network, addr)
 	}
 	for _, l := range e.listeners {
 		for i := 0; i < acceptsPerListener; i++ {
@@ -161,6 +211,155 @@ func (e *Engine) open(config Config, addrs []string) error {
 	return nil
 }
 
+// openUDP binds the UDP sockets and posts each one's first receive.
+func (e *Engine) openUDP(config Config, addrs []string) error {
+	for _, addr := range addrs {
+		l, err := createUDPListener(config, addr)
+		if err == nil {
+			if _, err = syscall.CreateIoCompletionPort(l.fd, e.port, 0, 0); err != nil {
+				syscall.Closesocket(l.fd)
+			}
+		}
+		if err != nil {
+			e.abandon()
+			return err
+		}
+		e.udpListeners = append(e.udpListeners, l)
+	}
+	for _, l := range e.udpListeners {
+		if err := e.postRecvFrom(l); err != nil {
+			e.abandon()
+			return err
+		}
+	}
+	return nil
+}
+
+func createUDPListener(config Config, addr string) (*udpListener, error) {
+	family, bound, err := resolveListenAddr(config.Network, addr)
+	if err != nil {
+		return nil, err
+	}
+	fd, err := newDatagramSocket(family)
+	if err != nil {
+		return nil, err
+	}
+	if family == syscall.AF_INET6 {
+		v6only := 0
+		if config.Network == "udp6" {
+			v6only = 1
+		}
+		_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, v6only)
+	}
+	if err = syscall.Bind(fd, bound); err != nil {
+		syscall.Closesocket(fd)
+		return nil, err
+	}
+	l := &udpListener{peers: make(map[netip.AddrPort]*Connection)}
+	l.fd = fd
+	l.buf = make([]byte, maxDatagramSize)
+	l.op = ioOp{kind: opRecvFrom, listener: l}
+	return l, nil
+}
+
+// postRecvFrom posts a UDP listener's receive. A receive that fails at once
+// for one datagram, such as one too large for the buffer, is retried rather
+// than leaving the socket unread.
+func (e *Engine) postRecvFrom(l *udpListener) error {
+	var err error
+	for attempt := 0; attempt < 16; attempt++ {
+		l.op.ov = syscall.Overlapped{}
+		l.flags = 0
+		l.fromLen = int32(unsafe.Sizeof(l.from))
+		var bufs [1]syscall.WSABuf
+		wsaBufs(bufs[:], l.buf)
+		var n uint32
+		err = syscall.WSARecvFrom(l.fd, &bufs[0], 1, &n, &l.flags, &l.from, &l.fromLen, &l.op.ov, nil)
+		if err == nil || err == syscall.ERROR_IO_PENDING {
+			e.udpRecvs++
+			return nil
+		}
+		if err != wsaEMSGSIZE && err != wsaECONNRESET {
+			break
+		}
+	}
+	return err
+}
+
+// completeRecvFrom hands one datagram to its peer's connection, opening one
+// for a new peer, and posts the next receive.
+func (e *Engine) completeRecvFrom(l *udpListener, n int, err error) *Connection {
+	e.udpRecvs--
+	if l.closed || e.stopping.Load() {
+		return nil
+	}
+	var ready *Connection
+	if err == nil {
+		if sa, saErr := l.from.Sockaddr(); saErr == nil {
+			if c := e.udpPeer(l, sa); c != nil {
+				ready = e.deliverDatagram(c, l.buf[:n])
+			}
+		}
+	}
+	// A failed receive loses only its own datagram. If no receive can be
+	// posted at all the socket is broken, and the peers it serves are left
+	// to their idle timeout.
+	_ = e.postRecvFrom(l)
+	return ready
+}
+
+// completeDatagramRead hands a dialed UDP connection its datagram and posts
+// the next receive.
+func (e *Engine) completeDatagramRead(c *Connection, n int, err error) *Connection {
+	c.outstanding.Add(-1)
+	c.mu.Lock()
+	c.readArmed = false
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		e.forget(c)
+		return nil
+	}
+	if err != nil && err != wsaEMSGSIZE {
+		// A refusal from the peer's host, for one, arrives here.
+		c.closeWithError(err)
+		return nil
+	}
+	var ready *Connection
+	if err == nil {
+		ready = e.deliverDatagram(c, c.udp.buf[:n])
+	}
+	c.mu.Lock()
+	armErr := c.armDatagramReadLocked()
+	c.mu.Unlock()
+	if armErr != nil {
+		c.closeWithError(armErr)
+	}
+	return ready
+}
+
+// armDatagramReadLocked posts a dialed UDP connection's receive. Callers hold
+// c.mu.
+func (c *Connection) armDatagramReadLocked() error {
+	if c.readArmed || c.closing || c.closed {
+		return nil
+	}
+	c.readOp.ov = syscall.Overlapped{}
+	c.recvFlags = 0
+	c.readArmed = true
+	c.outstanding.Add(1)
+	var bufs [1]syscall.WSABuf
+	wsaBufs(bufs[:], c.udp.buf)
+	var n uint32
+	err := syscall.WSARecv(c.socket(), &bufs[0], 1, &n, &c.recvFlags, &c.readOp.ov, nil)
+	if err != nil && err != syscall.ERROR_IO_PENDING {
+		c.readArmed = false
+		c.outstanding.Add(-1)
+		return err
+	}
+	return nil
+}
+
 // abandon tears down a Bind that failed after its AcceptEx calls went out.
 func (e *Engine) abandon() {
 	e.stopping.Store(true)
@@ -168,6 +367,11 @@ func (e *Engine) abandon() {
 		l.closed = true
 		syscall.Closesocket(l.fd)
 	}
+	for _, l := range e.udpListeners {
+		l.closed = true
+		syscall.Closesocket(l.fd)
+	}
+	e.removeUnixPaths()
 	e.drainPort()
 	syscall.CloseHandle(e.port)
 }
@@ -221,8 +425,31 @@ func (e *Engine) postAccept(op *acceptOp) error {
 	return nil
 }
 
-// LocalAddrs returns one address per listener, in configured order. Ports left
-// at zero report the port the kernel chose.
+// ListenAddrs returns the address of every listener, in configured order,
+// whatever its network: a *net.TCPAddr, *net.UnixAddr or *net.UDPAddr. Ports
+// left at zero report the port the kernel chose.
+func (e *Engine) ListenAddrs() ([]net.Addr, error) {
+	addrs := make([]net.Addr, 0, len(e.listeners)+len(e.udpListeners))
+	for _, l := range e.listeners {
+		sa, err := syscall.Getsockname(l.fd)
+		if err != nil {
+			return nil, err
+		}
+		addrs = append(addrs, sockaddrToAddr(sa))
+	}
+	udpAddrs, err := e.LocalUDPAddrs()
+	if err != nil {
+		return nil, err
+	}
+	for _, addr := range udpAddrs {
+		addrs = append(addrs, addr)
+	}
+	return addrs, nil
+}
+
+// LocalAddrs returns one address per TCP listener, in configured order. Ports
+// left at zero report the port the kernel chose. It fails for an engine
+// listening on Unix sockets; ListenAddrs reports those.
 func (e *Engine) LocalAddrs() ([]*net.TCPAddr, error) {
 	addrs := make([]*net.TCPAddr, 0, len(e.listeners))
 	for _, l := range e.listeners {
@@ -292,6 +519,10 @@ func (e *Engine) complete(entry *overlappedEntry) *Connection {
 		return nil
 	case opRead:
 		return e.completeRead(op.conn, err)
+	case opRecvFrom:
+		return e.completeRecvFrom(op.listener, int(entry.qty), err)
+	case opRecvDatagram:
+		return e.completeDatagramRead(op.conn, int(entry.qty), err)
 	default:
 		return e.completeWrite(op.conn, int(entry.qty), err)
 	}
@@ -453,6 +684,10 @@ func (e *Engine) setReadPaused(c *Connection, paused bool) error {
 // The cancelled operations still complete through the port, and the connection
 // stays in conns until the last of them has.
 func (e *Engine) detach(c *Connection) {
+	if c.udp != nil && c.udp.listener != nil {
+		e.detachPeer(c)
+		return
+	}
 	if h := syscall.Handle(c.handle.Swap(uintptr(syscall.InvalidHandle))); h != syscall.InvalidHandle {
 		_ = syscall.Closesocket(h)
 	}
@@ -464,12 +699,14 @@ func (e *Engine) Close() error {
 	var closeErr error
 	e.closeOnce.Do(func() {
 		e.Stop()
+		e.stopUDPSweeper()
 		e.taskWG.Wait()
 		e.releaseTaskPool()
 		e.closeCommands()
 		for c := range e.conns {
 			e.closeConnection(c, nil, false)
 		}
+		e.closeUDPPeers()
 		e.budgetPaused = nil
 		for _, l := range e.listeners {
 			l.closed = true
@@ -477,6 +714,13 @@ func (e *Engine) Close() error {
 				closeErr = err
 			}
 		}
+		for _, l := range e.udpListeners {
+			l.closed = true
+			if err := syscall.Closesocket(l.fd); err != nil && closeErr == nil {
+				closeErr = err
+			}
+		}
+		e.removeUnixPaths()
 		e.drainPort()
 		if err := syscall.CloseHandle(e.port); err != nil && closeErr == nil {
 			closeErr = err
@@ -491,7 +735,7 @@ func (e *Engine) Close() error {
 func (e *Engine) drainPort() {
 	entries := make([]overlappedEntry, 64)
 	deadline := time.Now().Add(closeDrainTimeout)
-	for (len(e.conns) > 0 || e.accepts > 0) && time.Now().Before(deadline) {
+	for (len(e.conns) > 0 || e.accepts > 0 || e.udpRecvs > 0) && time.Now().Before(deadline) {
 		n, err := getQueuedCompletionStatusEx(e.port, entries, 100)
 		if err != nil {
 			continue

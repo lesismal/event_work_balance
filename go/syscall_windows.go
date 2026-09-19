@@ -11,9 +11,14 @@ import (
 const (
 	wsaEWOULDBLOCK = syscall.Errno(10035)
 	wsaEINVAL      = syscall.Errno(10022)
-	soError        = 0x1007
-	msgOOB         = 0x1
-	fionbio        = 0x8004667e
+	wsaEMSGSIZE    = syscall.Errno(10040)
+	wsaECONNRESET  = syscall.Errno(10054)
+	// sioUDPConnReset is SIO_UDP_CONNRESET, which stops an ICMP port
+	// unreachable from failing a UDP socket's next receive.
+	sioUDPConnReset = 0x9800000C
+	soError         = 0x1007
+	msgOOB          = 0x1
+	fionbio         = 0x8004667e
 )
 
 // These three are KnownDLLs, which Windows always loads from the system
@@ -69,16 +74,46 @@ func setNonblock(fd syscall.Handle) error {
 	return nil
 }
 
-// newSocket creates a socket the completion port can drive: socket() gives it
-// the overlapped attribute, and the handle is kept from child processes.
+// newSocket creates a stream socket the completion port can drive: socket()
+// gives it the overlapped attribute, and the handle is kept from child
+// processes. family is an IP family, or AF_UNIX for a Unix socket.
 func newSocket(family int) (syscall.Handle, error) {
+	proto := syscall.IPPROTO_TCP
+	if family == syscall.AF_UNIX {
+		proto = 0
+	}
 	syscall.ForkLock.RLock()
-	fd, err := syscall.Socket(family, syscall.SOCK_STREAM, syscall.IPPROTO_TCP)
+	fd, err := syscall.Socket(family, syscall.SOCK_STREAM, proto)
 	if err == nil {
 		syscall.CloseOnExec(fd)
 	}
 	syscall.ForkLock.RUnlock()
 	return fd, err
+}
+
+// newDatagramSocket creates a non-blocking UDP socket the completion port can
+// drive. An unconnected socket also stops reporting ICMP port unreachable as
+// a receive error: one peer that went away would otherwise fail the receive
+// every other peer's datagrams arrive on.
+func newDatagramSocket(family int) (syscall.Handle, error) {
+	syscall.ForkLock.RLock()
+	fd, err := syscall.Socket(family, syscall.SOCK_DGRAM, syscall.IPPROTO_UDP)
+	if err == nil {
+		syscall.CloseOnExec(fd)
+	}
+	syscall.ForkLock.RUnlock()
+	if err != nil {
+		return fd, err
+	}
+	if err = setNonblock(fd); err != nil {
+		syscall.Closesocket(fd)
+		return syscall.InvalidHandle, err
+	}
+	var off uint32
+	var returned uint32
+	_ = syscall.WSAIoctl(fd, sioUDPConnReset, (*byte)(unsafe.Pointer(&off)), uint32(unsafe.Sizeof(off)),
+		nil, 0, &returned, nil, 0)
+	return fd, nil
 }
 
 func defaultBacklog() int { return syscall.SOMAXCONN }

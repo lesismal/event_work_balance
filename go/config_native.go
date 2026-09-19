@@ -3,6 +3,8 @@
 package fib
 
 import (
+	"time"
+
 	"github.com/lesismal/fib/go/taskpool"
 )
 
@@ -18,6 +20,16 @@ type Config struct {
 	// "tcp" with no host listens on both families where the kernel has IPv6,
 	// "tcp4" and "tcp6" pin it to one. This is the same choice net.Listen
 	// makes from the same arguments.
+	//
+	// "unix" listens on a Unix domain stream socket, with Addr as its path, as
+	// net.Listen does: the path must not exist yet, it is removed when the
+	// engine closes, and on Linux a leading '@' names an abstract socket.
+	// Connections on it behave exactly like TCP ones.
+	//
+	// "udp", "udp4" and "udp6" bind UDP sockets instead, as net.ListenPacket
+	// does. Each peer address that sends a datagram becomes a connection of
+	// its own, whose OnData receives one datagram per call and whose Send
+	// sends one; see UDPIdleTimeout for how such a connection ends.
 	Network string
 	Addr    string
 	// Addrs, when it is not empty, is the complete set of addresses to listen
@@ -75,6 +87,12 @@ type Config struct {
 	// I/O, take contended locks, or run unbounded work want the worker pool,
 	// which exists precisely so that one slow connection cannot stall the rest.
 	InlineHandlers bool
+	// UDPIdleTimeout closes a UDP peer's connection once the peer has neither
+	// sent nor been sent a datagram for this long, since UDP has no close of
+	// its own to end it. OnClose receives ErrUDPIdleTimeout. Zero means
+	// DefaultUDPIdleTimeout and a negative value keeps peers until they are
+	// closed. Dialed UDP connections are never timed out.
+	UDPIdleTimeout time.Duration
 	// customPoolSizing records that SetPoolSizing pinned the sizing, so that a
 	// later SetTaskPoolMode does not overwrite it.
 	customPoolSizing bool

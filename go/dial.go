@@ -34,8 +34,11 @@ type dialRequest struct {
 // engine's event loop, which then serves it exactly as it serves an accepted
 // one: the same handler, the same workers and the same backpressure.
 //
-// network and addr are what net.Dial takes: network is "tcp", "tcp4" or
-// "tcp6" (empty means "tcp"), and addr is "host:port". A host that is not an IP
+// network and addr are what net.Dial takes: network is "tcp", "tcp4", "tcp6",
+// "udp", "udp4", "udp6" or "unix" (empty means "tcp"), and addr is
+// "host:port", or for "unix" the socket's path. A UDP
+// dial connects its socket to addr, so the connection exchanges datagrams with
+// that peer alone: each Send is one datagram and each OnData one received. A host that is not an IP
 // literal is resolved on a goroutine of its own, so Dial never waits on DNS.
 // A timeout of zero leaves the connect to the operating system's own timeout.
 //
@@ -69,7 +72,7 @@ func (e *Engine) DialWithHandler(network, addr string, timeout time.Duration, ha
 		return d.opError(net.ErrClosed)
 	}
 	if !isLiteralAddr(addr) {
-		if !isTCPNetwork(network) {
+		if !isDialNetwork(network) {
 			return d.opError(net.UnknownNetworkError(network))
 		}
 		go func() {
@@ -121,8 +124,13 @@ func (d *dialRequest) opError(err error) error {
 		err = os.NewSyscallError("connect", errno)
 	}
 	opErr := &net.OpError{Op: "dial", Net: d.network, Err: err}
-	if d.raddr != nil {
+	if isUnixNetwork(d.network) {
+		opErr.Addr = &net.UnixAddr{Name: d.addr, Net: "unix"}
+	} else if d.raddr != nil {
 		opErr.Addr = d.raddr
+		if isUDPNetwork(d.network) {
+			opErr.Addr = &net.UDPAddr{IP: d.raddr.IP, Port: d.raddr.Port, Zone: d.raddr.Zone}
+		}
 	}
 	return opErr
 }
@@ -145,6 +153,11 @@ func (e *Engine) startDial(d *dialRequest) {
 	}
 	if connected {
 		e.completeDial(c)
+		if c.udp == nil {
+			// A connect that finished on the spot never raised the
+			// completion that arms the first read where that is needed.
+			c.rearmRead()
+		}
 		return
 	}
 	if d.timeout > 0 {

@@ -2,13 +2,19 @@
 
 package fib
 
-import "syscall"
+import (
+	"net"
+	"syscall"
+)
 
 // connectSocket opens a non-blocking socket, starts connecting it and
 // registers it with the backend, where the connect's outcome arrives as the
 // socket's first events. connected reports a connect the kernel finished on the
 // spot, as it may over loopback. Callers run on the event loop.
 func (e *Engine) connectSocket(d *dialRequest) (c *Connection, connected bool, err error) {
+	if isUDPNetwork(d.network) {
+		return e.connectDatagram(d)
+	}
 	fd, err := newSocket(d.family)
 	if err != nil {
 		return nil, false, err
@@ -41,6 +47,36 @@ func (e *Engine) connectSocket(d *dialRequest) (c *Connection, connected bool, e
 	}
 	e.trackConnection(fd, c)
 	return c, connected, nil
+}
+
+// connectDatagram opens a UDP socket connected to the dialed peer. Connecting
+// a UDP socket only records the peer, so it is done on the spot.
+func (e *Engine) connectDatagram(d *dialRequest) (c *Connection, connected bool, err error) {
+	fd, err := newDatagramSocket(d.family)
+	if err != nil {
+		return nil, false, err
+	}
+	for {
+		err = syscall.Connect(fd, d.sa)
+		if err != syscall.EINTR {
+			break
+		}
+	}
+	if err != nil {
+		syscall.Close(fd)
+		return nil, false, err
+	}
+	token := uint64(uint32(fd)) | e.nextGeneration.Add(1)<<32
+	c = &Connection{engine: e, handler: d.handler, dialing: d,
+		udp: &udpState{raddr: &net.UDPAddr{IP: d.raddr.IP, Port: d.raddr.Port, Zone: d.raddr.Zone}}}
+	c.token = token
+	c.fd.Store(int32(fd))
+	if err = e.registerDatagram(fd, token); err != nil {
+		syscall.Close(fd)
+		return nil, false, err
+	}
+	e.trackConnection(fd, c)
+	return c, true, nil
 }
 
 // finishDial settles a connect from the events its socket raised and reports

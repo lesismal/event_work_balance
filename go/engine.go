@@ -6,8 +6,10 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/lesismal/fib/go/taskpool"
 )
@@ -55,6 +57,7 @@ const (
 	commandClose
 	commandDial
 	commandDialTimeout
+	commandUDPSweep
 )
 
 type command struct {
@@ -109,6 +112,41 @@ type Engine struct {
 	readBufferPool  sync.Pool
 	sendBufferPool  sync.Pool
 	closeOnce       sync.Once
+	// udpListeners are the engine's UDP sockets, when Config.Network names
+	// UDP. udpIdleTimeout closes their silent peers, and udpSweepDone stops
+	// the ticker that checks for them.
+	udpListeners   []*udpListener
+	udpIdleTimeout time.Duration
+	udpSweepDone   chan struct{}
+	// datagramBuf receives every datagram the loop reads. Event-loop
+	// ownership.
+	datagramBuf []byte
+	// unixPaths are the socket files the engine's Unix listeners created,
+	// which it removes when it closes, as net.UnixListener does.
+	unixPaths []string
+}
+
+// removeUnixPaths removes the socket files the engine created.
+func (e *Engine) removeUnixPaths() {
+	for _, path := range e.unixPaths {
+		_ = os.Remove(path)
+	}
+	e.unixPaths = nil
+}
+
+// noteUnixPath records a socket file a listener just created.
+func (e *Engine) noteUnixPath(network, path string) {
+	if isUnixNetwork(network) && !isAbstractUnixPath(path) {
+		e.unixPaths = append(e.unixPaths, path)
+	}
+}
+
+// datagramBuffer returns the loop's receive buffer for datagrams.
+func (e *Engine) datagramBuffer() []byte {
+	if e.datagramBuf == nil {
+		e.datagramBuf = make([]byte, maxDatagramSize)
+	}
+	return e.datagramBuf
 }
 
 // acquireSendBuffer returns a pooled outbound buffer.
@@ -193,6 +231,7 @@ func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) 
 		// on top of the bytes that arrived. Retaining at exactly the round size
 		// would drop the buffer every round and allocate a new one next round.
 		retainedSendBuffer: 2 * config.ReadBufferSize,
+		udpIdleTimeout:     udpIdleTimeout(config.UDPIdleTimeout),
 		handler:            handler}
 	e.readBufferPool.New = func() any { return &readBuffer{data: make([]byte, config.ReadBufferSize)} }
 	// Pooled outbound buffers start at the size a full round's replies actually
@@ -211,6 +250,7 @@ func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) 
 		e.releaseTaskPool()
 		return nil, err
 	}
+	e.startUDPSweeper()
 	return e, nil
 }
 
@@ -424,6 +464,8 @@ func (e *Engine) drainCommands() {
 			e.startDial(cmd.dial)
 		case commandDialTimeout:
 			e.expireDial(cmd.connection, cmd.dial)
+		case commandUDPSweep:
+			e.sweepUDP()
 		default:
 			e.refreshConnection(cmd.connection)
 		}

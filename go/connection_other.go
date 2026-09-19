@@ -9,6 +9,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type portableEvent struct {
@@ -31,8 +32,20 @@ type Connection struct {
 	scheduled, closing, closeDelivered bool
 	writeMu                            sync.Mutex
 	attachment                         atomic.Pointer[connectionAttachment]
-	tlsLayer                           *tlsLayer
+	layer                              Layer
+	// udp marks a connection that exchanges datagrams: a peer of a UDP
+	// listener, whose conn is a udpPeerConn, or a dialed UDP socket.
+	udp bool
+	// udpActive is when a listener's peer last sent or was sent a datagram,
+	// in nanoseconds, for the idle timeout.
+	udpActive atomic.Int64
 }
+
+// IsUDP reports whether the connection exchanges datagrams.
+func (c *Connection) IsUDP() bool { return c.udp }
+
+// RemoteAddr returns the peer's address.
+func (c *Connection) RemoteAddr() net.Addr { return c.conn.RemoteAddr() }
 
 func (c *Connection) FD() int { return int(c.fd.Load()) }
 
@@ -71,13 +84,13 @@ func (c *Connection) closeWithError(err error) {
 }
 
 func (c *Connection) Send(data []byte) error {
-	if t := c.tlsLayer; t != nil {
-		return t.send(data, nil)
+	if l := c.layer; l != nil {
+		return l.Send(data, nil)
 	}
 	return c.sendRaw(data)
 }
 
-// sendRaw writes bytes to the socket below any TLS layer.
+// sendRaw writes bytes to the socket below any layer.
 func (c *Connection) sendRaw(data []byte) error {
 	if len(data) == 0 {
 		return nil
@@ -102,6 +115,9 @@ func (c *Connection) sendRaw(data []byte) error {
 		}
 		data = data[n:]
 	}
+	if c.udp {
+		c.udpActive.Store(time.Now().UnixNano())
+	}
 	return nil
 }
 
@@ -109,8 +125,8 @@ func (c *Connection) sendRaw(data []byte) error {
 func (c *Connection) SendOwned(data []byte) error { return c.Send(data) }
 
 func (c *Connection) SendParts(first, second []byte) error {
-	if t := c.tlsLayer; t != nil {
-		return t.send(first, second)
+	if l := c.layer; l != nil {
+		return l.Send(first, second)
 	}
 	data := make([]byte, len(first)+len(second))
 	n := copy(data, first)

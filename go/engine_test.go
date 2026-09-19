@@ -538,12 +538,12 @@ func TestListenAddressFormsMatchNetListen(t *testing.T) {
 
 func TestListenRejectsUnknownNetwork(t *testing.T) {
 	config := DefaultConfig()
-	config.Network = "udp"
+	config.Network = "unixgram"
 	config.Addr = "127.0.0.1:0"
 	server, err := Bind(config, HandlerFuncs{})
 	if err == nil {
 		server.Close()
-		t.Fatal("Bind accepted network \"udp\", want an error")
+		t.Fatal("Bind accepted network \"unixgram\", want an error")
 	}
 	var unknown net.UnknownNetworkError
 	if !errors.As(err, &unknown) {

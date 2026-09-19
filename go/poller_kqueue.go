@@ -46,6 +46,12 @@ func (e *Engine) openBackend() error {
 		changes = append(changes, syscall.Kevent_t{Ident: uint64(fd), Filter: syscall.EVFILT_READ,
 			Flags: syscall.EV_ADD | syscall.EV_CLEAR})
 	}
+	// UDP sockets are level-triggered, so the loop can stop reading one after
+	// its share of a round and still hear about the rest.
+	for _, l := range e.udpListeners {
+		changes = append(changes, syscall.Kevent_t{Ident: uint64(l.fd), Filter: syscall.EVFILT_READ,
+			Flags: syscall.EV_ADD})
+	}
 	changes = append(changes, syscall.Kevent_t{Ident: wakeIdent, Filter: syscall.EVFILT_USER,
 		Flags: syscall.EV_ADD | syscall.EV_CLEAR})
 	if _, err = syscall.Kevent(kq, changes, nil, nil); err != nil {
@@ -84,9 +90,19 @@ func (e *Engine) Run() error {
 			fd := int(ev.Ident)
 			c := e.connectionAt(fd)
 			if c == nil {
-				if ev.Filter == syscall.EVFILT_READ && e.isListener(fd) {
-					e.acceptable = append(e.acceptable, fd)
+				if ev.Filter == syscall.EVFILT_READ {
+					if l := e.udpListenerAt(fd); l != nil {
+						// Reading opens and closes no descriptor, so it
+						// need not wait for the batch to end.
+						ready = e.readUDPListener(l, ready)
+					} else if e.isListener(fd) {
+						e.acceptable = append(e.acceptable, fd)
+					}
 				}
+				continue
+			}
+			if c.udp != nil {
+				ready = e.readUDPConnection(c, ready)
 				continue
 			}
 			if c.dialing != nil {
@@ -171,7 +187,23 @@ func (e *Engine) registerConnection(fd int, _ uint64) error {
 		{Ident: uint64(fd), Filter: syscall.EVFILT_WRITE, Flags: syscall.EV_ADD | syscall.EV_CLEAR},
 		{Ident: uint64(fd), Filter: evfiltExcept, Flags: syscall.EV_ADD | syscall.EV_CLEAR, Fflags: noteOOB},
 	}
-	_, err := syscall.Kevent(e.kq, changes[:], nil, nil)
+	n := len(changes)
+	if sa, err := syscall.Getsockname(fd); err == nil {
+		if _, unix := sa.(*syscall.SockaddrUnix); unix {
+			// A Unix socket has no urgent data, yet EVFILT_EXCEPT still fires
+			// on it, which would cost a failing MSG_OOB receive per round.
+			n--
+		}
+	}
+	_, err := syscall.Kevent(e.kq, changes[:n], nil, nil)
+	return err
+}
+
+// registerDatagram registers a dialed UDP socket for reads alone, since sends
+// never wait, and level-triggered like a UDP listener.
+func (e *Engine) registerDatagram(fd int, _ uint64) error {
+	change := [1]syscall.Kevent_t{{Ident: uint64(fd), Filter: syscall.EVFILT_READ, Flags: syscall.EV_ADD}}
+	_, err := syscall.Kevent(e.kq, change[:], nil, nil)
 	return err
 }
 

@@ -229,8 +229,8 @@ func TestDialRejectsWhatCannotStart(t *testing.T) {
 	client, _ := startEchoServer(t, DefaultConfig(), nil)
 	never := func(*Connection, error) { t.Error("done called for a dial that could not start") }
 	for _, tc := range []struct{ network, addr string }{
-		{"udp", "127.0.0.1:80"},
-		{"udp", "localhost:80"},
+		{"unixgram", "127.0.0.1:80"},
+		{"unixgram", "localhost:80"},
 		{"tcp", "127.0.0.1"},
 		{"tcp", "127.0.0.1:99999"},
 		{"tcp4", "[::1]:80"},
