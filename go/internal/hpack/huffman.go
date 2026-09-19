@@ -90,3 +90,14 @@ func huffmanAppend(dst []byte, s string) []byte {
 	}
 	return dst
 }
+
+// HuffmanDecode decodes s, a Huffman-coded string, failing once it would
+// decode to more than maxLen bytes when maxLen is positive. QPACK uses the
+// same code with prefixes of its own, so it decodes through this.
+func HuffmanDecode(s []byte, maxLen int) (string, error) { return huffmanDecode(s, maxLen) }
+
+// HuffmanLen is the length of s once Huffman coded.
+func HuffmanLen(s string) int { return huffmanLen(s) }
+
+// AppendHuffman appends s Huffman coded, padded with ones.
+func AppendHuffman(dst []byte, s string) []byte { return huffmanAppend(dst, s) }

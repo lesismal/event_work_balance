@@ -410,6 +410,82 @@ resp, err := client.Go(req).Wait() // Future：Wait 阻塞，Done() 可用于 se
 - 先 `client.Close()` 再关闭 Engine：`Close` 让排队中的请求以 `ErrClientClosed` 失败，
   已发出的请求照常完成；直接关闭 Engine 不会通知 client，已发出的请求只能等超时。
 
+## HTTP/3 子 package
+
+`http3` package 在 Engine 的 UDP socket 上提供 HTTP/3（RFC 9114），其下的 QUIC
+（RFC 9000/9001/9002）和 QPACK（RFC 9204）都在本库内实现，TLS 1.3 握手使用标准库的
+`crypto/tls.QUICConn`，不引入任何第三方依赖。Handler 与 `http` package 完全相同，
+同一个 `fibhttp.Handler` 可以同时服务 HTTP/1.1、HTTP/2 和 HTTP/3：
+
+```go
+config := fib.DefaultConfig()
+config.Network = "udp"
+config.Addr = ":443"
+server, err := fib.Bind(config, http3.NewHandler(tlsConfig, handler))
+```
+
+- 服务端就是一个 UDP Engine，handler 用 `http3.NewHandler`（或 `NewHandlerWithConfig`
+  调整 `MaxHeaderBytes`、`MaxBodyBytes`、`MaxConcurrentStreams`、`MaxIdleTimeout`）。
+  TLS 配置里的 ALPN 会自动加上 `h3`。
+- Engine 按对端地址区分 UDP 连接，每个发来 QUIC Initial 的地址对应一个 QUIC 连接，挂在
+  该地址的 `fib.Connection` 上；因此不支持连接迁移（NAT 重绑定后连接会失效），服务端在
+  传输参数里声明 `disable_active_migration`。没有连接状态的短包头包会收到 stateless
+  reset，让对端立即结束而不是等超时；不认识的 QUIC 版本收到 Version Negotiation。
+- QUIC 的空闲超时（`MaxIdleTimeout`，默认 30 秒）应小于 Engine 的
+  `Config.UDPIdleTimeout`（默认 60 秒），否则 Engine 会先把静默的对端连接关掉。
+- Handler 不用改：请求的 `Proto` 为 `HTTP/3.0`，`Request.TLS` 带有 TLS 状态，用
+  `Context.Respond`/`WriteResponse` 回复，响应被编成该 stream 的 HEADERS/DATA 帧；
+  可以在其他 goroutine 中异步回复。`WriteInterim` 支持 1xx 中间响应（如 103 Early
+  Hints），`Expect: 100-continue` 自动回复 100。`Push` 返回 `http.ErrNotSupported`：
+  HTTP/3 的 push 需要客户端先发 MAX_PUSH_ID，浏览器都不这样做。
+- `Response.Close` 在 HTTP/3 上优雅关闭：发送 GOAWAY，不再接受新请求，已在处理的请求
+  的响应全部送达后再关闭连接。
+- 请求 body 超过 `MaxBodyBytes` 返回 413，header 超过 `MaxHeaderBytes` 返回 431；
+  非法请求（缺少伪头部、大写字段名、连接相关字段等）用 H3_MESSAGE_ERROR 重置该
+  stream，协议错误（控制流不以 SETTINGS 开头、DATA 出现在 HEADERS 之前、引用动态表等）
+  按 RFC 9114 的错误码关闭连接。
+- 浏览器通过 HTTP/1.1 或 HTTP/2 响应里的 `Alt-Svc` 头发现 HTTP/3，`http3.AltSvc(port)`
+  生成这个头的值；通常在同一端口号上同时跑 TCP 的 HTTPS 和 UDP 的 HTTP/3（见示例）。
+
+QUIC 层的实现要点：
+
+- 包保护支持 TLS 1.3 的三种套件：AES-128-GCM、AES-256-GCM 和
+  ChaCha20-Poly1305（标准库没有导出 ChaCha20-Poly1305，本库按 RFC 8439 自行实现，
+  并用 RFC 9001 附录的测试向量校验）；支持对端发起的密钥更新（key update）；
+  客户端支持 Retry。不支持 0-RTT。
+- 丢包检测与拥塞控制按 RFC 9002 实现：ACK 阈值和时间阈值判定丢包、PTO 探测、
+  NewReno 拥塞控制；服务端在验证客户端地址前遵守 3 倍放大限制。发出的数据报固定为
+  1200 字节（所有 IPv6 路径都能承载的大小），因此不需要 PMTU 探测。
+- 流控：遵守对端的连接级和 stream 级限制；接收方向每个 stream 窗口 1MB、连接窗口
+  16MB，按消费量自动补充；并发 stream 数用 MAX_STREAMS 动态放开。
+- QPACK 两端都声明动态表容量为 0：编码只用静态表和字面量（字面量在更短时使用
+  Huffman 编码），解码拒绝任何动态表引用，因此编码器流和解码器流无需内容。
+- 已与 quic-go 做双向互通测试（包括 5% 随机丢包下的 20MB 双向传输），客户端也验证过
+  Cloudflare、Google、nginx、Facebook、Varnish、quiche 的线上 HTTP/3 服务。
+
+### 异步 HTTP/3 client
+
+`http3.Client` 与 `http.Client` 的用法相同：
+
+```go
+client := http3.NewClient(engine, http3.DefaultClientConfig()) // engine 可以是任意运行中的 Engine
+req, _ := http.NewRequest("GET", "https://example.com/", nil)
+client.Do(req, func(resp *http.Response, err error) { /* 恰好回调一次 */ })
+resp, err := client.Go(req).Wait()
+```
+
+- 只支持 `https://`（端口默认 443），其他 scheme 返回 `ErrUnsupportedScheme`。
+  `ClientConfig.TLSConfig` 未设置 ServerName 时取 URL 的 host，ALPN 固定为 `h3`。
+- 每个 host:port 一个 QUIC 连接，所有请求各占一个 stream 并发发送，数量受服务端
+  MAX_STREAMS 限制，超出的请求排队，等服务端放开 stream 后自动发送。
+- 收到 GOAWAY 时，服务端未处理的请求和排队中的请求自动在新连接上发送；被服务端以
+  H3_REQUEST_REJECTED 重置的请求同样重发一次。
+- `Timeout`、请求的 context 取消只重置对应 stream（H3_REQUEST_CANCELLED），不影响
+  同连接上的其他请求；`HandshakeTimeout`、`MaxIdleTimeout`、`IdleConnTimeout` 分别
+  限制握手、QUIC 空闲超时和连接复用的空闲时间；`MaxResponseHeaderBytes`、
+  `MaxResponseBodyBytes` 限制单个响应大小。支持 trailer，1xx 中间响应自动跳过。
+- 回调可能在任意 goroutine 上执行；先 `client.Close()` 再关闭 Engine。
+
 ## WebSocket 子 package
 
 `websocket` package 实现 RFC 6455 Upgrade 握手、增量帧解析、
@@ -517,13 +593,14 @@ conn, resp, err := dialer.Go(url, header, handler).Wait() // Future 形式
 ## Examples
 
 每种协议一个目录，每个目录下分 TLS 与非 TLS 两个子目录（UDP 只有非 TLS：本库
-不内置 DTLS），各有一个 echo server 和一个 echo client：
+不内置 DTLS；HTTP/3 只有 TLS：QUIC 总是加密的），各有一个 echo server 和一个 echo client：
 
 ```text
 examples/
 ├── tcp/        nontls/{server,client}  127.0.0.1:9000    tls/{server,client}  127.0.0.1:9443
 ├── udp/        nontls/{server,client}  127.0.0.1:9001
 ├── http/       nontls/{server,client}  127.0.0.1:8080    tls/{server,client}  127.0.0.1:8443 (HTTPS)
+├── http3/                                                tls/{server,client}  127.0.0.1:8445 (UDP)
 └── websocket/  nontls/{server,client}  127.0.0.1:8081    tls/{server,client}  127.0.0.1:8444 (wss)
 ```
 
@@ -542,7 +619,10 @@ go run ./examples/tcp/tls/client -n 10
   信任这个文件（`-ca` 修改），因此会像正式部署一样校验服务端证书。`-insecure` 跳过校验。
 - 不同协议的 TLS 写法：TCP、HTTP、WebSocket server 用 `fibtls.NewServer` 包装原本的
   handler，client 分别用 `fibtls.Dial`、`ClientConfig.TLSConfig`、
-  `DialerConfig.TLSConfig`。
+  `DialerConfig.TLSConfig`。HTTP/3 的 TLS 由 QUIC 自己完成，server 把 TLS 配置直接
+  交给 `http3.NewHandler`，client 用 `http3.ClientConfig.TLSConfig`。
+- HTTP/3 server 在同一端口号上同时监听 UDP（HTTP/3）和 TCP（HTTPS，HTTP/2 与
+  HTTP/1.1），TCP 上的响应带 `Alt-Svc`，浏览器据此切换到 HTTP/3。
 - WebSocket server 的 `-compress` 开启 permessage-deflate，CI 用它跑 Autobahn 测试。
 
 ## GOMAXPROCS
