@@ -11,22 +11,6 @@ import (
 	"unsafe"
 )
 
-func acceptSocket(listenFD int) (int, error) {
-	r0, _, errno := syscall.RawSyscall6(
-		syscall.SYS_ACCEPT4,
-		uintptr(listenFD),
-		0,
-		0,
-		uintptr(syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC),
-		0,
-		0,
-	)
-	if errno != 0 {
-		return -1, errno
-	}
-	return int(r0), nil
-}
-
 var (
 	backlogOnce  sync.Once
 	backlogValue int

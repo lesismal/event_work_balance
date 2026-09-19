@@ -110,7 +110,7 @@ jobs:
         run: |
           # freebsd exercises the portable fallback engine.
           for target in \
-            linux/amd64 linux/arm64 linux/arm linux/riscv64 linux/loong64 \
+            linux/amd64 linux/386 linux/arm64 linux/arm linux/riscv64 linux/loong64 \
             darwin/amd64 darwin/arm64 \
             windows/amd64 windows/arm64 windows/386 \
             freebsd/amd64; do
