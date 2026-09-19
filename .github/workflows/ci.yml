@@ -160,21 +160,27 @@ jobs:
           echo "server did not start"
           cat "$RUNNER_TEMP/server.log"
           exit 1
-      # TLS is not covered.
+      # TLS is not covered. run.sh splits the cases across several wstest
+      # processes and checks every report.
       - name: Run fuzzingclient
         run: |
-          mkdir -p reports
-          docker run --rm --network host \
-            -v "$PWD/.github/autobahn:/config" \
-            -v "$PWD/reports:/reports" \
-            crossbario/autobahn-testsuite \
-            wstest -m fuzzingclient -s /config/fuzzingclient.json
-      - name: Check results
-        run: python3 .github/autobahn/check_report.py reports/servers/index.json
+          # Record memory use, so a run that is killed shows who grew.
+          (while sleep 30; do
+            echo "$(date -u +%T) $(free -m | awk '/^Mem:/ {print "used=" $3 "MiB avail=" $7 "MiB"}')" \
+              "server_rss=$(ps -o rss= -C websocket_server | tr -d ' ')KiB" \
+              "$(docker stats --no-stream --format '{{.Name}}={{.MemUsage}}' | tr '\n' ' ')"
+          done) > "$RUNNER_TEMP/memory.log" 2>&1 &
+          .github/autobahn/run.sh reports
+      - name: Diagnostics
+        if: failure()
+        run: |
+          tail -n 40 "$RUNNER_TEMP/memory.log" || true
+          sudo dmesg | grep -iE 'out of memory|oom|killed process' | tail -n 20 || true
+          tail -n 40 "$RUNNER_TEMP/server.log" || true
       - name: Upload report
         if: always()
         uses: actions/upload-artifact@v5
         with:
           name: autobahn-report
-          path: reports/servers
+          path: reports
           if-no-files-found: ignore
