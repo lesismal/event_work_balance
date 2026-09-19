@@ -463,6 +463,13 @@ QUIC 层的实现要点：
 - 已与 quic-go 做双向互通测试（包括 5% 随机丢包下的 20MB 双向传输），客户端也验证过
   Cloudflare、Google、nginx、Facebook、Varnish、quiche 的线上 HTTP/3 服务。
 
+#### 限制与待优化
+
+HTTP/3 当前的限制（按对端地址区分连接、不支持迁移、固定 1200 字节数据报、关闭时没有
+closing/draining 期等）、有意未实现的功能及原因（0-RTT、QPACK 动态表、server push 等），
+以及待优化项（主动 key update 与安全加固、pacing、PMTU 探测、拥塞控制、批量收发等）见
+[`docs/http3.zh-CN.md`](../docs/http3.zh-CN.md)。
+
 ### 异步 HTTP/3 client
 
 `http3.Client` 与 `http.Client` 的用法相同：

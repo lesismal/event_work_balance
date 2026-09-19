@@ -53,6 +53,9 @@ make go
 make go-test
 ```
 
+HTTP/3（及其下的 QUIC、QPACK）当前的限制、有意未实现的功能和待优化项整理在
+[`docs/http3.zh-CN.md`](docs/http3.zh-CN.md)。
+
 公共接口位于 [`c/include/epoll_server.h`](c/include/epoll_server.h)。普通数据调用
 `on_data`，由 `EPOLLPRI` 触发并通过 `MSG_OOB` 读取的带外数据单独调用
 `on_priority_data`。两者都在当前执行该 connection 的逻辑 worker 上调用，可解析协议并调用
