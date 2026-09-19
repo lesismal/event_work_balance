@@ -161,7 +161,7 @@ jobs:
           cat "$RUNNER_TEMP/server.log"
           exit 1
       # TLS is not covered. run.sh splits the cases across several wstest
-      # processes and checks every report.
+      # processes, merges their reports into reports/servers and checks it.
       - name: Run fuzzingclient
         run: |
           # Record memory use, so a run that is killed shows who grew.
@@ -182,5 +182,5 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: autobahn-report
-          path: reports
+          path: reports/servers
           if-no-files-found: ignore

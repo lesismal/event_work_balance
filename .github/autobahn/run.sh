@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Runs the Autobahn fuzzingclient against the echo server in several short
 # wstest processes instead of one, writing each one's report under
-# <reports>/<group>, then checks every report.
+# <reports>/runs/<group>. merge_reports.py then joins them into one report in
+# <reports>/servers, which is what gets checked; each run's own index lists the
+# cases of the other runs as Missing.
 #
 # The compression cases (12.*, 13.*) are split by subgroup because the test
 # client, not the server, is what grows: with client_no_context_takeover it
@@ -35,7 +37,7 @@ for group in "${groups[@]}"; do
   fi
   cat > "$config/$group.json" <<EOF
 {
-  "outdir": "/reports/$group",
+  "outdir": "/reports/runs/$group",
   "servers": [{"agent": "fib", "url": "$url"}],
   "cases": $cases,
   "exclude-cases": $exclude,
@@ -51,4 +53,9 @@ EOF
   echo "::endgroup::"
 done
 
-python3 "$here/check_report.py" "$reports"/*/index.json
+docker run --rm \
+  -v "$here:/scripts" \
+  -v "$reports:/reports" \
+  crossbario/autobahn-testsuite \
+  python /scripts/merge_reports.py /reports/servers "${groups[@]/#//reports/runs/}"
+python3 "$here/check_report.py" "$reports/servers/index.json"
