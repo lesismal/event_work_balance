@@ -5,6 +5,7 @@ package http
 import (
 	"bufio"
 	"bytes"
+	stdtls "crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -56,6 +57,15 @@ type Parser struct {
 	// sniffed records that the server handler has seen enough of the
 	// connection to know it is not HTTP/2.
 	sniffed bool
+	// tls is the connection's TLS state for every request's TLS, looked up
+	// once, which tlsChecked records.
+	tls        *stdtls.ConnectionState
+	tlsChecked bool
+	// wantContinue asks the server handler to send 100 Continue for a request
+	// whose header has arrived with Expect: 100-continue and whose body has
+	// not; continued records that it was asked for the request in progress.
+	wantContinue bool
+	continued    bool
 }
 
 type frameInfo struct {
@@ -85,6 +95,7 @@ func (p *Parser) Reset() {
 		p.buffer = p.buffer[:0]
 	}
 	p.headerScan = 0
+	p.continued, p.wantContinue = false, false
 }
 
 // Feed may return zero, one, or several pipelined requests.
@@ -152,6 +163,7 @@ func (p *Parser) TakeBuffered() []byte {
 	data := p.buffer
 	p.buffer = nil
 	p.headerScan = 0
+	p.continued, p.wantContinue = false, false
 	return data
 }
 
@@ -167,6 +179,7 @@ func (p *Parser) consume(n int) {
 		p.buffer = p.buffer[:len(p.buffer)-n]
 	}
 	p.headerScan = 0
+	p.continued = false
 }
 
 func (p *Parser) frameLength() (frameInfo, bool, error) {
@@ -196,6 +209,9 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 			return frameInfo{}, false, fmt.Errorf("%w: unsupported transfer encoding", ErrMalformed)
 		}
 		end, complete, err := chunkedEnd(p.buffer, headerEnd, p.config.MaxHeaderBytes, p.config.MaxBodyBytes)
+		if err == nil && !complete {
+			p.expectContinue(req)
+		}
 		if err != nil || !complete {
 			return frameInfo{end: end, headerEnd: headerEnd, chunked: true, request: req}, complete, err
 		}
@@ -212,9 +228,19 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 	}
 	end64 := int64(headerEnd) + req.ContentLength
 	if end64 > int64(len(p.buffer)) {
+		p.expectContinue(req)
 		return frameInfo{}, false, nil
 	}
 	return frameInfo{end: int(end64), headerEnd: headerEnd, request: req}, true, nil
+}
+
+// expectContinue notes a request, complete but for its body, that waits for
+// 100 Continue before sending it.
+func (p *Parser) expectContinue(req *stdhttp.Request) {
+	if !p.continued && req.ProtoAtLeast(1, 1) && strings.EqualFold(req.Header.Get("Expect"), "100-continue") {
+		p.continued = true
+		p.wantContinue = true
+	}
 }
 
 func readRequest(data []byte, keepBody bool) (*stdhttp.Request, error) {

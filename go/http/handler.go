@@ -3,6 +3,7 @@
 package http
 
 import (
+	stdtls "crypto/tls"
 	"errors"
 	"fmt"
 	stdhttp "net/http"
@@ -12,6 +13,7 @@ import (
 	"strings"
 
 	fib "github.com/lesismal/fib/go"
+	fibtls "github.com/lesismal/fib/go/tls"
 )
 
 type Handler interface {
@@ -57,7 +59,8 @@ func (c *Context) WriteResponse(response Response) error {
 		response.StatusCode = stdhttp.StatusOK
 	}
 	if c.stream != nil {
-		// HTTP/2 multiplexes the connection, so Close does not apply to it.
+		// HTTP/2 multiplexes the connection, so Close retires it gracefully
+		// with GOAWAY rather than cutting the other streams short.
 		if err := c.stream.respond(c.Request, response); err != nil {
 			return err
 		}
@@ -78,6 +81,58 @@ func (c *Context) WriteResponse(response Response) error {
 	}
 	return nil
 }
+
+// Push promises target to the client ahead of its asking, as http.Pusher
+// does: target is an absolute path, or an absolute URL with the request's
+// scheme, and opts may set the method (GET or HEAD) and request headers.
+// The promised request is served through the handler, on its own stream,
+// before Push returns; call Push before responding, since a promise must
+// arrive before the response that would lead the client to ask for it.
+//
+// Push returns http.ErrNotSupported on HTTP/1, on a request that was itself
+// pushed, and when the client has disabled push, as browsers and Go's own
+// client do.
+func (c *Context) Push(target string, opts *stdhttp.PushOptions) error {
+	if c.stream == nil {
+		return stdhttp.ErrNotSupported
+	}
+	return c.stream.push(c.Request, target, opts)
+}
+
+// WriteInterim sends an informational 1xx response ahead of the final one,
+// such as 103 Early Hints with Link headers. It may be called several times
+// before WriteResponse. 101 is not allowed, and an HTTP/1.0 client, which
+// does not know interim responses, gets http.ErrNotSupported.
+//
+// A request that expects 100-continue gets its 100 Continue without asking:
+// the body is read whole before the handler runs.
+func (c *Context) WriteInterim(status int, header stdhttp.Header) error {
+	if status < 100 || status > 199 || status == stdhttp.StatusSwitchingProtocols {
+		return fmt.Errorf("http: invalid interim status code %d", status)
+	}
+	if c.wrote {
+		return errors.New("http: interim response after the final one")
+	}
+	if c.stream != nil {
+		return c.stream.writeInterim(status, header)
+	}
+	if !c.Request.ProtoAtLeast(1, 1) {
+		return stdhttp.ErrNotSupported
+	}
+	out := make([]byte, 0, 64)
+	out = append(out, "HTTP/1.1 "...)
+	out = strconv.AppendInt(out, int64(status), 10)
+	out = append(out, ' ')
+	out = append(out, stdhttp.StatusText(status)...)
+	out = append(out, '\r', '\n')
+	out, err := appendHeaderLines(out, header, nil)
+	if err != nil {
+		return err
+	}
+	return c.Conn.SendOwned(append(out, '\r', '\n'))
+}
+
+var _ stdhttp.Pusher = (*Context)(nil)
 
 type ServerHandler struct {
 	handler Handler
@@ -130,14 +185,35 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 			return
 		}
 	}
-	requests, err := parser.Feed(data)
-	for _, request := range requests {
-		request.RemoteAddr = parser.remoteAddr
-		context := &Context{Conn: c, Request: request}
-		h.handler.ServeHTTP(context, request)
-		if request.Close {
+	// One request at a time, since one may switch the connection to HTTP/2
+	// and leave what follows it to the new protocol.
+	var err error
+	for ; ; data = nil {
+		var request *stdhttp.Request
+		var complete bool
+		request, complete, err = parser.FeedOne(data)
+		if err != nil || !complete {
 			break
 		}
+		request.RemoteAddr = parser.remoteAddr
+		request.TLS = h.tlsState(c, parser)
+		if settings, ok := h.h2cUpgrade(c, request); ok {
+			h.upgradeH2C(c, parser, request, settings)
+			return
+		}
+		h.handler.ServeHTTP(&Context{Conn: c, Request: request}, request)
+		if request.Close {
+			return
+		}
+		if len(parser.buffer) == 0 {
+			break
+		}
+	}
+	if parser.wantContinue {
+		// The request waits for permission to send its body; the body is
+		// read whole before the handler runs, so permission is given at once.
+		parser.wantContinue = false
+		_ = c.Send([]byte("HTTP/1.1 100 Continue\r\n\r\n"))
 	}
 	if err != nil {
 		status := stdhttp.StatusBadRequest
@@ -168,6 +244,7 @@ func (h *ServerHandler) sniff(c *fib.Connection, parser *Parser, data []byte) []
 			return nil
 		}
 		sc := newH2ServerConn(h, c, parser.remoteAddr)
+		sc.tlsState = h.tlsState(c, parser)
 		c.SetAttachment(sc)
 		sc.start()
 		sc.feed(parser.TakeBuffered())
@@ -175,6 +252,18 @@ func (h *ServerHandler) sniff(c *fib.Connection, parser *Parser, data []byte) []
 	}
 	parser.sniffed = true
 	return parser.TakeBuffered()
+}
+
+// tlsState is the connection's TLS state, looked up once the handshake has
+// delivered the first bytes, or nil for a connection without TLS.
+func (h *ServerHandler) tlsState(c *fib.Connection, parser *Parser) *stdtls.ConnectionState {
+	if !parser.tlsChecked {
+		parser.tlsChecked = true
+		if state, ok := fibtls.ConnectionState(c); ok {
+			parser.tls = &state
+		}
+	}
+	return parser.tls
 }
 
 func (h *ServerHandler) OnPriorityData(*fib.Connection, []byte) {}
@@ -235,20 +324,35 @@ func marshalResponse(request *stdhttp.Request, response Response, closeConnectio
 		out = append(out, connectionValue...)
 		out = append(out, '\r', '\n')
 	}
-	keys := make([]string, 0, len(response.Header))
-	for key := range response.Header {
-		if strings.EqualFold(key, "Content-Length") || strings.EqualFold(key, "Transfer-Encoding") ||
-			(connectionValue != "" && strings.EqualFold(key, "Connection")) {
-			continue
+	out, err := appendHeaderLines(out, response.Header, func(key string) bool {
+		return strings.EqualFold(key, "Content-Length") || strings.EqualFold(key, "Transfer-Encoding") ||
+			(connectionValue != "" && strings.EqualFold(key, "Connection"))
+	})
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, '\r', '\n')
+	if request.Method != stdhttp.MethodHead && bodyAllowed {
+		out = append(out, response.Body...)
+	}
+	return out, nil
+}
+
+// appendHeaderLines appends header as HTTP/1 lines in key order, leaving out
+// the keys skip reports.
+func appendHeaderLines(out []byte, header stdhttp.Header, skip func(string) bool) ([]byte, error) {
+	keys := make([]string, 0, len(header))
+	for key := range header {
+		if skip == nil || !skip(key) {
+			keys = append(keys, key)
 		}
-		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
 		if key == "" || textproto.CanonicalMIMEHeaderKey(key) == "" {
 			return nil, errors.New("http: invalid response header name")
 		}
-		for _, value := range response.Header[key] {
+		for _, value := range header[key] {
 			if !validHeaderValue(value) {
 				return nil, errors.New("http: invalid response header value")
 			}
@@ -257,10 +361,6 @@ func marshalResponse(request *stdhttp.Request, response Response, closeConnectio
 			out = append(out, value...)
 			out = append(out, '\r', '\n')
 		}
-	}
-	out = append(out, '\r', '\n')
-	if request.Method != stdhttp.MethodHead && bodyAllowed {
-		out = append(out, response.Body...)
 	}
 	return out, nil
 }

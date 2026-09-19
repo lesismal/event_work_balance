@@ -19,6 +19,7 @@ const (
 	h2MaxFrameSizeLimit   = 1<<24 - 1
 	h2DefaultWindow       = 65535
 	h2MaxWindow           = 1<<31 - 1
+	h2MaxStreamID         = 1<<31 - 1
 )
 
 type h2FrameType uint8
@@ -226,6 +227,31 @@ func h2AppendHeaderBlock(dst []byte, streamID uint32, block []byte, endStream bo
 		}
 		typ, flags = h2FrameContinuation, 0
 	}
+}
+
+// h2AppendPushPromise promises stream promisedID on streamID, splitting the
+// header block across CONTINUATION frames as maxFrameSize requires.
+func h2AppendPushPromise(dst []byte, streamID, promisedID uint32, block []byte, maxFrameSize int) []byte {
+	chunk := block[:min(len(block), maxFrameSize-4)]
+	block = block[len(chunk):]
+	var flags uint8
+	if len(block) == 0 {
+		flags = h2FlagEndHeaders
+	}
+	dst = h2AppendFrameHeader(dst, h2FramePushPromise, flags, streamID, 4+len(chunk))
+	dst = binary.BigEndian.AppendUint32(dst, promisedID&0x7fffffff)
+	dst = append(dst, chunk...)
+	for len(block) > 0 {
+		chunk = block[:min(len(block), maxFrameSize)]
+		block = block[len(chunk):]
+		flags = 0
+		if len(block) == 0 {
+			flags = h2FlagEndHeaders
+		}
+		dst = h2AppendFrameHeader(dst, h2FrameContinuation, flags, streamID, len(chunk))
+		dst = append(dst, chunk...)
+	}
+	return dst
 }
 
 // h2ParseSettings calls apply for each setting in a SETTINGS payload.

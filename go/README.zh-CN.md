@@ -293,11 +293,14 @@ go run ./examples/http/nontls/server   # 另开终端：go run ./examples/http/n
 ### HTTP/2
 
 同一个 `ServerHandler` 同时服务 HTTP/1 和 HTTP/2，不需要额外配置：连接以 HTTP/2
-preface 开头时按 HTTP/2 处理，否则按 HTTP/1。这覆盖了两种场景：
+preface 开头时按 HTTP/2 处理，否则按 HTTP/1。这覆盖了三种场景：
 
 - TLS + ALPN（h2）：用 `fibhttp.ConfigureTLS` 让 TLS 配置在 ALPN 中优先提供 `h2`，
   浏览器、`net/http` 等客户端就会选择 HTTP/2；不支持 h2 的客户端继续走 HTTP/1.1。
 - 明文 HTTP/2（h2c，prior knowledge）：客户端直接发送 preface 即可。
+- 明文 HTTP/1.1 升级（`Upgrade: h2c` + `HTTP2-Settings`，`curl --http2 http://...` 用的
+  就是这种方式）：服务端回复 101，随后在 stream 1 上用 HTTP/2 回复这个请求，连接之后
+  按 HTTP/2 继续。TLS 连接只通过 ALPN 切换，不接受这种升级。
 
 ```go
 tlsConfig = fibhttp.ConfigureTLS(tlsConfig) // ALPN: h2, http/1.1
@@ -308,7 +311,9 @@ server, err := fib.Bind(config, fibtls.NewServer(tlsConfig, fibhttp.NewHandler(h
   用 `Context.Respond`/`WriteResponse` 回复即可，响应会被编成该 stream 的 HEADERS/DATA
   帧。HTTP/2 连接上不要直接调用 `Context.Conn.Send`。
 - 多路复用：一个连接上的多个 stream 并发进行，handler 可以在其他 goroutine 中稍后
-  回复（异步响应），不同 stream 的响应互不阻塞；`Response.Close` 对 HTTP/2 无效。
+  回复（异步响应），不同 stream 的响应互不阻塞。
+- `Response.Close` 在 HTTP/2 上优雅关闭连接：发送 GOAWAY(NO_ERROR)，不再接受新
+  stream，已在处理的 stream 完成后再关闭连接。
 - 流控：遵守对端的连接级与 stream 级窗口，窗口不足的响应 body 暂存，等 WINDOW_UPDATE
   后继续发送；接收方向每个 stream 窗口 1MB、连接窗口 16MB，按消费量自动补充。
 - 实现了 HPACK（含 Huffman 与动态表）、CONTINUATION、trailer、多个 cookie 字段合并、
@@ -317,7 +322,47 @@ server, err := fib.Bind(config, fibtls.NewServer(tlsConfig, fibhttp.NewHandler(h
 - `Config.MaxConcurrentStreams` 限制单连接并发 stream 数（默认 250，超出的 stream 被
   REFUSED_STREAM 拒绝）；`MaxHeaderBytes`、`MaxBodyBytes` 同样作用于 HTTP/2，超限时
   返回 431/413。`Config.DisableHTTP2` 关闭 HTTP/2，只服务 HTTP/1。
-- 不支持 server push、HTTP/1.1 `Upgrade: h2c`（RFC 9113 已废弃）和 1xx 中间响应。
+- 通过 TLS 到达的请求（HTTP/1 和 HTTP/2）都会设置 `Request.TLS`，可以读取 ALPN 结果、
+  对端证书等。
+
+#### Server push
+
+`Context` 实现了 `http.Pusher`：在回复之前调用 `Push`，服务端先发送 PUSH_PROMISE，
+再用同一个 handler 处理被推送的请求，响应在它自己的 stream 上发送；`Push` 在被推送
+请求的 handler 返回后才返回：
+
+```go
+func(c *fibhttp.Context, r *http.Request) {
+    if r.URL.Path == "/index.html" {
+        _ = c.Push("/style.css", nil) // 客户端不支持时返回 http.ErrNotSupported，忽略即可
+    }
+    _ = c.Respond(http.StatusOK, "text/html", page)
+}
+```
+
+- target 是绝对路径，或 scheme 与当前请求相同的绝对 URL；`PushOptions` 可指定方法
+  （GET 或 HEAD）和请求头，不能带 body 相关及连接相关的头。
+- 遵守客户端的设置：`SETTINGS_ENABLE_PUSH=0` 时返回 `http.ErrNotSupported`，推送中的
+  stream 数达到客户端的 `SETTINGS_MAX_CONCURRENT_STREAMS` 时返回 `ErrPushLimit`。
+  客户端可以用 RST_STREAM 取消推送，不影响连接。
+- HTTP/1、被推送的请求本身再调用 `Push` 时返回 `http.ErrNotSupported`。
+- 主流浏览器和 Go 的 `net/http` 客户端都已关闭 push，本库的 client 同样不接收 push
+  （SETTINGS_ENABLE_PUSH=0）；需要预加载时更推荐 103 Early Hints。
+
+#### 1xx 中间响应
+
+`Context.WriteInterim(status, header)` 在最终响应之前发送 1xx 中间响应，HTTP/1.1 和
+HTTP/2 都支持，例如 103 Early Hints：
+
+```go
+_ = c.WriteInterim(http.StatusEarlyHints, http.Header{"Link": {"</style.css>; rel=preload"}})
+_ = c.Respond(http.StatusOK, "text/html", page)
+```
+
+- 可以调用多次，必须在 `WriteResponse` 之前；不允许 101；HTTP/1.0 请求返回
+  `http.ErrNotSupported`。
+- 带 `Expect: 100-continue` 的请求会自动收到 100 Continue（HTTP/1.1 与 HTTP/2），
+  因为 body 总是在 handler 运行前完整读取，客户端不必等待超时才发送 body。
 
 ### 异步 HTTP client
 

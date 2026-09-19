@@ -173,13 +173,41 @@ func TestH2ServerSniffsSplitHTTP1(t *testing.T) {
 }
 
 // h2TestConn is a minimal HTTP/2 client speaking raw frames, for exercising
-// what net/http's client never does.
+// what net/http's client never does. Every header block is decoded as it
+// arrives, whichever stream it belongs to, so the HPACK table stays in step.
 type h2TestConn struct {
 	t   *testing.T
 	c   net.Conn
 	enc *hpack.Encoder
 	dec *hpack.Decoder
 	in  []byte
+	// streams holds what has arrived per stream, and cont the header block
+	// still arriving in CONTINUATION frames.
+	streams map[uint32]*h2TestStream
+	cont    *h2TestFrame
+}
+
+// h2TestStream is what a stream has received: its final response header,
+// the statuses of interim responses, the body, and the requests promised on
+// it by server push.
+type h2TestStream struct {
+	header   map[string]string
+	interim  []string
+	body     []byte
+	done     bool
+	reset    H2ErrorCode
+	resetSet bool
+	promises []uint32
+	// promised is the request header of a pushed stream.
+	promised map[string]string
+}
+
+// h2TestFrame is a frame with its header block, if any, decoded.
+type h2TestFrame struct {
+	h2Frame
+	fields   map[string]string
+	promised uint32
+	block    []byte
 }
 
 func dialH2(t *testing.T, addr string, settings ...[2]uint32) *h2TestConn {
@@ -189,10 +217,15 @@ func dialH2(t *testing.T, addr string, settings ...[2]uint32) *h2TestConn {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { c.Close() })
-	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
-	tc := &h2TestConn{t: t, c: c, enc: hpack.NewEncoder(), dec: hpack.NewDecoder(hpack.DefaultTableSize)}
+	tc := newH2TestConn(t, c)
 	tc.write(append([]byte(h2Preface), h2AppendSettings(nil, settings...)...))
 	return tc
+}
+
+func newH2TestConn(t *testing.T, c net.Conn) *h2TestConn {
+	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+	return &h2TestConn{t: t, c: c, enc: hpack.NewEncoder(), dec: hpack.NewDecoder(hpack.DefaultTableSize),
+		streams: map[uint32]*h2TestStream{}}
 }
 
 func (tc *h2TestConn) write(b []byte) {
@@ -202,8 +235,85 @@ func (tc *h2TestConn) write(b []byte) {
 	}
 }
 
-// read returns the next frame, or fails the test on timeout or close.
-func (tc *h2TestConn) read() h2Frame {
+func (tc *h2TestConn) stream(id uint32) *h2TestStream {
+	st := tc.streams[id]
+	if st == nil {
+		st = &h2TestStream{}
+		tc.streams[id] = st
+	}
+	return st
+}
+
+// read returns the next frame, or fails the test on timeout or close. A
+// header block split by CONTINUATION comes back once, whole, as the frame
+// that started it.
+func (tc *h2TestConn) read() h2TestFrame {
+	tc.t.Helper()
+	for {
+		f := tc.readRaw()
+		switch f.typ {
+		case h2FrameHeaders:
+			tc.cont = &h2TestFrame{h2Frame: f, block: append([]byte(nil), f.payload...)}
+		case h2FramePushPromise:
+			tc.cont = &h2TestFrame{h2Frame: f, promised: binary.BigEndian.Uint32(f.payload) & 0x7fffffff,
+				block: append([]byte(nil), f.payload[4:]...)}
+		case h2FrameContinuation:
+			if tc.cont == nil || tc.cont.streamID != f.streamID {
+				tc.t.Fatalf("unexpected CONTINUATION on stream %d", f.streamID)
+			}
+			tc.cont.block = append(tc.cont.block, f.payload...)
+		default:
+			tc.account(&h2TestFrame{h2Frame: f})
+			return h2TestFrame{h2Frame: f}
+		}
+		if !f.has(h2FlagEndHeaders) {
+			continue
+		}
+		whole := tc.cont
+		tc.cont = nil
+		whole.fields = map[string]string{}
+		if err := tc.dec.Decode(whole.block, func(hf hpack.HeaderField) error {
+			whole.fields[hf.Name] = hf.Value
+			return nil
+		}); err != nil {
+			tc.t.Fatal(err)
+		}
+		whole.flags |= f.flags & h2FlagEndHeaders
+		tc.account(whole)
+		return *whole
+	}
+}
+
+// account records a frame against its stream.
+func (tc *h2TestConn) account(f *h2TestFrame) {
+	if f.streamID == 0 {
+		return
+	}
+	st := tc.stream(f.streamID)
+	switch f.typ {
+	case h2FrameHeaders:
+		if status := f.fields[":status"]; len(status) == 3 && status[0] == '1' {
+			st.interim = append(st.interim, status)
+		} else if st.header == nil {
+			st.header = f.fields
+		}
+	case h2FramePushPromise:
+		st.promises = append(st.promises, f.promised)
+		tc.stream(f.promised).promised = f.fields
+	case h2FrameData:
+		st.body = append(st.body, f.payload...)
+	case h2FrameRSTStream:
+		st.reset, st.resetSet, st.done = H2ErrorCode(binary.BigEndian.Uint32(f.payload)), true, true
+		return
+	default:
+		return
+	}
+	if f.has(h2FlagEndStream) {
+		st.done = true
+	}
+}
+
+func (tc *h2TestConn) readRaw() h2Frame {
 	tc.t.Helper()
 	for {
 		f, n, err := h2ReadFrame(tc.in, h2MaxFrameSizeLimit)
@@ -225,7 +335,7 @@ func (tc *h2TestConn) read() h2Frame {
 }
 
 // readUntil skips frames until one of type typ arrives.
-func (tc *h2TestConn) readUntil(typ h2FrameType) h2Frame {
+func (tc *h2TestConn) readUntil(typ h2FrameType) h2TestFrame {
 	tc.t.Helper()
 	for {
 		if f := tc.read(); f.typ == typ {
@@ -250,33 +360,18 @@ func (tc *h2TestConn) data(id uint32, endStream bool, payload []byte) {
 	tc.write(append(h2AppendFrameHeader(nil, h2FrameData, flags, id, len(payload)), payload...))
 }
 
-// response reads one stream's response headers and body.
+// response reads until a stream has its whole response, and returns its
+// header and body.
 func (tc *h2TestConn) response(id uint32) (map[string]string, []byte) {
 	tc.t.Helper()
-	header := map[string]string{}
-	var body []byte
-	for {
-		f := tc.read()
-		if f.streamID != id {
-			continue
-		}
-		switch f.typ {
-		case h2FrameHeaders:
-			if err := tc.dec.Decode(f.payload, func(hf hpack.HeaderField) error {
-				header[hf.Name] = hf.Value
-				return nil
-			}); err != nil {
-				tc.t.Fatal(err)
-			}
-		case h2FrameData:
-			body = append(body, f.payload...)
-		case h2FrameRSTStream:
-			tc.t.Fatalf("stream %d reset: %v", id, H2ErrorCode(binary.BigEndian.Uint32(f.payload)))
-		}
-		if f.has(h2FlagEndStream) && (f.typ == h2FrameHeaders || f.typ == h2FrameData) {
-			return header, body
-		}
+	st := tc.stream(id)
+	for !st.done {
+		tc.read()
 	}
+	if st.resetSet {
+		tc.t.Fatalf("stream %d reset: %v", id, st.reset)
+	}
+	return st.header, st.body
 }
 
 func get(path string) []string {
@@ -298,9 +393,8 @@ func TestH2ServerRespectsClientFlowControl(t *testing.T) {
 		t.Fatalf("sent %d bytes into a window of 10", len(body))
 	}
 	tc.write(h2AppendWindowUpdate(nil, 1, 1000))
-	_, rest := tc.response(1)
-	if len(body)+len(rest) != 100 {
-		t.Fatalf("body %d bytes, want 100", len(body)+len(rest))
+	if _, all := tc.response(1); len(all) != 100 {
+		t.Fatalf("body %d bytes, want 100", len(all))
 	}
 }
 
