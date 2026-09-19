@@ -1,7 +1,7 @@
 package fib
 
 // Layer carries a connection's sends, transforming them on the way to the
-// socket. TLSHandler installs one that encrypts; any other protocol that
+// socket. The tls package installs one that encrypts; any other protocol that
 // frames or encrypts what a connection sends, such as a DTLS implementation
 // over UDP, installs its own the same way.
 //
@@ -18,6 +18,15 @@ type Layer interface {
 	// out, after whatever closing message the layer's protocol calls for.
 	CloseAfterSend()
 }
+
+// CloseWithError closes the connection, as Close does, and hands err to
+// OnClose. A layer uses it to report why its protocol ended the connection,
+// such as a failed handshake. Only the first close's error is reported.
+func (c *Connection) CloseWithError(err error) { c.closeWithError(err) }
+
+// Handler returns the handler the engine serves accepted connections with,
+// which is also what a dial that names no handler of its own gets.
+func (e *Engine) Handler() Handler { return e.handler }
 
 // SetLayer installs l, or removes the layer with nil. Install it in OnOpen,
 // before anything can send, so that no send bypasses it.

@@ -16,6 +16,7 @@ import (
 	fib "github.com/lesismal/fib/go"
 	"github.com/lesismal/fib/go/examples/internal/certs"
 	"github.com/lesismal/fib/go/examples/internal/example"
+	fibtls "github.com/lesismal/fib/go/tls"
 	"github.com/lesismal/fib/go/websocket"
 )
 
@@ -32,8 +33,8 @@ func main() {
 	config := fib.DefaultConfig()
 	config.Addr = *addr
 	// The WebSocket handler is the same one the plain server uses:
-	// NewTLSServer decrypts in front of it and encrypts what it sends.
-	engine, err := fib.Bind(config, fib.NewTLSServer(tlsConfig, echo(*compress)))
+	// fibtls.NewServer decrypts in front of it and encrypts what it sends.
+	engine, err := fib.Bind(config, fibtls.NewServer(tlsConfig, echo(*compress)))
 	if err != nil {
 		example.Fatal(err)
 	}

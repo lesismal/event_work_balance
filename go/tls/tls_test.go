@@ -1,21 +1,24 @@
 //go:build linux || darwin || windows
 
-package fib
+package tls
 
 import (
 	"bytes"
-	"crypto/tls"
+	stdtls "crypto/tls"
 	"errors"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	fib "github.com/lesismal/fib/go"
 	"github.com/lesismal/fib/go/internal/tlstest"
 )
 
-func tlsConfigs(t *testing.T) (server, client *tls.Config) {
+func tlsConfigs(t *testing.T) (server, client *stdtls.Config) {
 	t.Helper()
 	server, client, err := tlstest.Configs()
 	if err != nil {
@@ -27,19 +30,19 @@ func tlsConfigs(t *testing.T) (server, client *tls.Config) {
 // A standard TLS client talks to a TLS server on the engine. Large payloads
 // arrive as many records split across read rounds, and the echoes queue up
 // behind backpressure, so every path through the layer is exercised.
-func TestTLSServerEchoesStandardClient(t *testing.T) {
-	for _, version := range []uint16{tls.VersionTLS12, tls.VersionTLS13} {
-		t.Run(tls.VersionName(version), func(t *testing.T) {
+func TestServerEchoesStandardClient(t *testing.T) {
+	for _, version := range []uint16{stdtls.VersionTLS12, stdtls.VersionTLS13} {
+		t.Run(stdtls.VersionName(version), func(t *testing.T) {
 			serverConfig, clientConfig := tlsConfigs(t)
 			clientConfig.MaxVersion = version
-			_, addr := startEchoServer(t, DefaultConfig(), NewTLSServer(serverConfig, echoHandler()))
+			_, addr := startEchoServer(t, fib.DefaultConfig(), NewServer(serverConfig, echoHandler()))
 
 			var wg sync.WaitGroup
 			for i := 0; i < 8; i++ {
 				wg.Add(1)
 				go func(value byte) {
 					defer wg.Done()
-					conn, err := tls.Dial("tcp", addr, clientConfig)
+					conn, err := stdtls.Dial("tcp", addr, clientConfig)
 					if err != nil {
 						t.Error(err)
 						return
@@ -68,11 +71,11 @@ func TestTLSServerEchoesStandardClient(t *testing.T) {
 
 // The engine dials a standard TLS server. What done sends goes out before the
 // handshake has finished, so it has to wait for it.
-func TestDialTLSReachesStandardServer(t *testing.T) {
+func TestDialReachesStandardServer(t *testing.T) {
 	serverConfig, clientConfig := tlsConfigs(t)
 	serverConfig.NextProtos = []string{"fib-test"}
 	clientConfig.NextProtos = []string{"fib-test"}
-	listener, err := tls.Listen("tcp", "127.0.0.1:0", serverConfig)
+	listener, err := stdtls.Listen("tcp", "127.0.0.1:0", serverConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,30 +93,30 @@ func TestDialTLSReachesStandardServer(t *testing.T) {
 		}
 	}()
 
-	client, _ := startEchoServer(t, DefaultConfig(), nil)
+	client, _ := startEchoServer(t, fib.DefaultConfig(), nil)
 	payload := []byte("hello over tls")
 	received := make(chan []byte, 1)
 	var mu sync.Mutex
 	var got []byte
-	var state tls.ConnectionState
-	handler := HandlerFuncs{Data: func(c *Connection, b []byte) {
+	var state stdtls.ConnectionState
+	handler := fib.HandlerFuncs{Data: func(c *fib.Connection, b []byte) {
 		mu.Lock()
 		defer mu.Unlock()
 		got = append(got, b...)
 		if len(got) == len(payload) {
-			state, _ = c.TLSConnectionState()
+			state, _ = ConnectionState(c)
 			received <- got
 		}
 	}}
-	// ServerName is left for DialTLS to fill in from the address.
+	// ServerName is left for Dial to fill in from the address.
 	clientConfig.ServerName = ""
-	err = client.DialTLS("tcp", listener.Addr().String(), 5*time.Second, clientConfig, handler,
-		func(c *Connection, err error) {
+	err = Dial(client, "tcp", listener.Addr().String(), 5*time.Second, clientConfig, handler,
+		func(c *fib.Connection, err error) {
 			if err != nil {
 				t.Error(err)
 				return
 			}
-			if _, ok := c.TLSConnectionState(); ok {
+			if _, ok := ConnectionState(c); ok {
 				t.Error("handshake reported complete before it started")
 			}
 			if err := c.Send(payload); err != nil {
@@ -138,10 +141,10 @@ func TestDialTLSReachesStandardServer(t *testing.T) {
 
 // Both ends on engines: SendParts encrypts two parts as one message, and
 // CloseAfterSend ends the stream with close_notify after the data it follows.
-func TestTLSEngineToEngineCloseAfterSend(t *testing.T) {
+func TestEngineToEngineCloseAfterSend(t *testing.T) {
 	serverConfig, clientConfig := tlsConfigs(t)
-	_, addr := startEchoServer(t, DefaultConfig(), NewTLSServer(serverConfig, HandlerFuncs{
-		Open: func(c *Connection) {
+	_, addr := startEchoServer(t, fib.DefaultConfig(), NewServer(serverConfig, fib.HandlerFuncs{
+		Open: func(c *fib.Connection) {
 			// Sent from OnOpen, before the handshake: held, then flushed.
 			_ = c.SendParts([]byte("hello, "), []byte("tls"))
 			c.CloseAfterSend()
@@ -150,19 +153,19 @@ func TestTLSEngineToEngineCloseAfterSend(t *testing.T) {
 			}
 		},
 	}))
-	client, _ := startEchoServer(t, DefaultConfig(), nil)
+	client, _ := startEchoServer(t, fib.DefaultConfig(), nil)
 	var mu sync.Mutex
 	var got []byte
 	closed := make(chan error, 1)
-	handler := HandlerFuncs{
-		Data: func(_ *Connection, b []byte) {
+	handler := fib.HandlerFuncs{
+		Data: func(_ *fib.Connection, b []byte) {
 			mu.Lock()
 			got = append(got, b...)
 			mu.Unlock()
 		},
-		Close: func(_ *Connection, err error) { closed <- err },
+		Close: func(_ *fib.Connection, err error) { closed <- err },
 	}
-	if err := client.DialTLS("tcp", addr, 5*time.Second, clientConfig, handler, nil); err != nil {
+	if err := Dial(client, "tcp", addr, 5*time.Second, clientConfig, handler, nil); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -182,17 +185,17 @@ func TestTLSEngineToEngineCloseAfterSend(t *testing.T) {
 
 // A client that rejects the server's certificate fails the handshake, and the
 // handler hears about it in OnClose.
-func TestTLSHandshakeFailureClosesConnection(t *testing.T) {
+func TestHandshakeFailureClosesConnection(t *testing.T) {
 	serverConfig, _ := tlsConfigs(t)
 	serverClosed := make(chan error, 1)
-	_, addr := startEchoServer(t, DefaultConfig(), NewTLSServer(serverConfig, HandlerFuncs{
-		Close: func(_ *Connection, err error) { serverClosed <- err },
+	_, addr := startEchoServer(t, fib.DefaultConfig(), NewServer(serverConfig, fib.HandlerFuncs{
+		Close: func(_ *fib.Connection, err error) { serverClosed <- err },
 	}))
-	client, _ := startEchoServer(t, DefaultConfig(), nil)
+	client, _ := startEchoServer(t, fib.DefaultConfig(), nil)
 	clientClosed := make(chan error, 1)
-	handler := HandlerFuncs{Close: func(_ *Connection, err error) { clientClosed <- err }}
+	handler := fib.HandlerFuncs{Close: func(_ *fib.Connection, err error) { clientClosed <- err }}
 	// No RootCAs: the self-signed certificate is not trusted.
-	if err := client.DialTLS("tcp", addr, 5*time.Second, &tls.Config{ServerName: "localhost"}, handler, nil); err != nil {
+	if err := Dial(client, "tcp", addr, 5*time.Second, &stdtls.Config{ServerName: "localhost"}, handler, nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, closed := range []chan error{clientClosed, serverClosed} {
@@ -209,12 +212,12 @@ func TestTLSHandshakeFailureClosesConnection(t *testing.T) {
 
 // A peer that connects and never starts the handshake is closed once the
 // handshake timeout runs out.
-func TestTLSHandshakeTimeout(t *testing.T) {
+func TestHandshakeTimeout(t *testing.T) {
 	serverConfig, _ := tlsConfigs(t)
 	closed := make(chan error, 1)
-	handler := NewTLSServer(serverConfig, HandlerFuncs{Close: func(_ *Connection, err error) { closed <- err }})
+	handler := NewServer(serverConfig, fib.HandlerFuncs{Close: func(_ *fib.Connection, err error) { closed <- err }})
 	handler.HandshakeTimeout = 100 * time.Millisecond
-	_, addr := startEchoServer(t, DefaultConfig(), handler)
+	_, addr := startEchoServer(t, fib.DefaultConfig(), handler)
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
@@ -228,4 +231,79 @@ func TestTLSHandshakeTimeout(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("handshake did not time out")
 	}
+}
+
+// TLS runs over a Unix socket as it does over TCP. The server name is given,
+// since a socket path has no host to take it from.
+func TestOverUnixSocket(t *testing.T) {
+	serverConfig, clientConfig := tlsConfigs(t)
+	dir, err := os.MkdirTemp("", "fib")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "s.sock")
+	config := fib.DefaultConfig()
+	config.Network = "unix"
+	config.Addr = path
+	server, err := fib.Bind(config, NewServer(serverConfig, echoHandler()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- server.Run() }()
+	defer func() {
+		server.Stop()
+		<-runDone
+		_ = server.Close()
+	}()
+
+	conn, err := stdtls.Dial("unix", path, clientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	payload := bytes.Repeat([]byte("unix+tls "), 10000)
+	go func() { _, _ = conn.Write(payload) }()
+	received := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, received); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(received, payload) {
+		t.Fatal("echo mismatch")
+	}
+}
+
+// startEchoServer runs an engine listening on a loopback port, or, with a nil
+// handler, one that only dials, and returns it with its address.
+func startEchoServer(t *testing.T, config fib.Config, handler fib.Handler) (*fib.Engine, string) {
+	t.Helper()
+	config.Addr = "127.0.0.1:0"
+	engine, err := fib.Bind(config, handler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := engine.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- engine.Run() }()
+	t.Cleanup(func() {
+		engine.Stop()
+		if err := <-runDone; err != nil {
+			t.Error(err)
+		}
+		_ = engine.Close()
+	})
+	return engine, addr.String()
+}
+
+func echoHandler() fib.Handler {
+	return fib.HandlerFuncs{Data: func(c *fib.Connection, b []byte) {
+		if err := c.Send(b); err != nil {
+			c.Close()
+		}
+	}}
 }

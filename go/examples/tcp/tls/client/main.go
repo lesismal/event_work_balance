@@ -16,6 +16,7 @@ import (
 	fib "github.com/lesismal/fib/go"
 	"github.com/lesismal/fib/go/examples/internal/certs"
 	"github.com/lesismal/fib/go/examples/internal/example"
+	fibtls "github.com/lesismal/fib/go/tls"
 )
 
 func main() {
@@ -41,7 +42,7 @@ func main() {
 	var conn *fib.Connection
 	// done runs once TCP is connected; the TLS handshake follows, and what is
 	// sent before it completes waits for it.
-	err = engine.DialTLS("tcp", *addr, 3*time.Second, tlsConfig, handler, func(c *fib.Connection, err error) {
+	err = fibtls.Dial(engine, "tcp", *addr, 3*time.Second, tlsConfig, handler, func(c *fib.Connection, err error) {
 		conn = c
 		dialed <- err
 	})
@@ -70,7 +71,7 @@ func main() {
 			}
 		}
 		if i == 1 {
-			if state, ok := conn.TLSConnectionState(); ok {
+			if state, ok := fibtls.ConnectionState(conn); ok {
 				fmt.Printf("TLS %s, %s\n", tls.VersionName(state.Version), tls.CipherSuiteName(state.CipherSuite))
 			}
 		}

@@ -170,34 +170,6 @@ err := server.Dial("tcp", "127.0.0.1:9001", 3*time.Second, func(c *fib.Connectio
 - `fib.NewEngine(config, handler)` 创建不监听任何地址的 Engine，只用于 Dial 出去
   的连接；它的 `LocalAddr` 返回错误。
 
-### TLS
-
-TLS 以 handler 包装的方式提供，基于标准库 `crypto/tls`，不需要额外依赖：
-
-```go
-// server：把任意 handler 包在 NewTLSServer 里
-server, err := fib.Bind(config, fib.NewTLSServer(tlsConfig, handler))
-
-// client：DialTLS 在 config 没有 ServerName 时取 addr 的 host
-err = engine.DialTLS("tcp", "example.com:443", 3*time.Second, tlsConfig, handler, done)
-```
-
-- 被包装的 handler 看到的是普通连接：`OnData` 收到的是明文，`Send`、`SendOwned`、
-  `SendParts`、`CloseAfterSend` 自动加密，所以 http、websocket 子 package 不用改动
-  就能跑在 TLS 上。`CloseAfterSend` 会先发送 close_notify。
-- `OnOpen`（以及 Dial 的 done）在 TCP 连接建立后立即调用，早于 TLS 握手；此时就可以
-  `Send`，数据会先缓存，握手完成后按顺序加密发出。握手失败或超时会关闭连接，
-  `OnClose` 收到对应错误。
-- `crypto/tls` 的握手是阻塞调用，所以每条连接的握手在单独的 goroutine 里进行，握手
-  结束后 goroutine 退出；之后的记录由 worker 在 `OnData` 中非阻塞解密，跨多轮读到达
-  的记录会被正确拼接。
-- `TLSHandler.HandshakeTimeout` 限制握手时长，0 表示 `DefaultTLSHandshakeTimeout`
-  （10 秒），负数表示不限制。
-- `Connection.TLSConnectionState()` 在握手完成后返回协商结果（版本、ALPN、对端证书等）。
-- 加密是通过 `Connection.SetLayer` 安装的 `fib.Layer` 完成的；其他加密或分帧协议
-  也可以用同样的方式接入，并通过 `SendRaw`、`CloseAfterSendRaw` 直接写 socket。
-  本库不内置 DTLS，UDP 上需要加密时可以用这个接口接入自己选择的实现。
-
 ### Unix Socket
 
 `Config.Network` 设为 `"unix"` 时，`Config.Addr` 是 socket 文件路径，Engine 在
@@ -261,6 +233,40 @@ addr, _ := server.LocalUDPAddr()
 cd go
 go test ./...
 ```
+
+## TLS 子 package
+
+`tls` package 以 handler 包装的方式在 Engine 的连接上提供 TLS，加解密由标准库
+`crypto/tls` 完成，不需要额外依赖：
+
+```go
+import fibtls "github.com/lesismal/fib/go/tls"
+
+// server：把任意 handler 包在 fibtls.NewServer 里
+server, err := fib.Bind(config, fibtls.NewServer(tlsConfig, handler))
+
+// client：config 没有 ServerName 时取 addr 的 host
+err = fibtls.Dial(engine, "tcp", "example.com:443", 3*time.Second, tlsConfig, handler, done)
+```
+
+- 被包装的 handler 看到的是普通连接：`OnData` 收到的是明文，`Send`、`SendOwned`、
+  `SendParts`、`CloseAfterSend` 自动加密，所以 http、websocket 子 package 不用改动
+  就能跑在 TLS 上（它们的 client 通过 `ClientConfig.TLSConfig`、
+  `DialerConfig.TLSConfig` 支持 https://、wss://）。`CloseAfterSend` 会先发送 close_notify。
+- TCP 和 Unix socket 上都可以使用。
+- `OnOpen`（以及 Dial 的 done）在连接建立后立即调用，早于 TLS 握手；此时就可以
+  `Send`，数据会先缓存，握手完成后按顺序加密发出。握手失败或超时会关闭连接，
+  `OnClose` 收到对应错误。
+- `crypto/tls` 的握手是阻塞调用，所以每条连接的握手在单独的 goroutine 里进行，握手
+  结束后 goroutine 退出；之后的记录由 worker 在 `OnData` 中非阻塞解密，跨多轮读到达
+  的记录会被正确拼接。
+- `Handler.HandshakeTimeout` 限制握手时长，0 表示 `DefaultHandshakeTimeout`
+  （10 秒），负数表示不限制。
+- `fibtls.ConnectionState(c)` 在握手完成后返回协商结果（版本、ALPN、对端证书等）。
+- 这个 package 只使用 fib 的公开 API：它通过 `Connection.SetLayer` 安装一个
+  `fib.Layer` 来加密发送，用 `SendRaw`、`CloseAfterSendRaw` 直接写 socket，用
+  `CloseWithError` 把握手失败的原因交给 `OnClose`。其他加密或分帧协议也可以用同样
+  的方式接入；本库不内置 DTLS，UDP 上需要加密时可以用这个接口接入自己选择的实现。
 
 ## HTTP 子 package
 
@@ -453,8 +459,8 @@ go run ./examples/tcp/tls/client -n 10
 - TLS server 未指定 `-cert`/`-key` 时，会为 localhost 和 127.0.0.1 签发一张自签名
   证书，并把证书（不含私钥）写到临时目录的 `fib-example-cert.pem`；TLS client 默认
   信任这个文件（`-ca` 修改），因此会像正式部署一样校验服务端证书。`-insecure` 跳过校验。
-- 不同协议的 TLS 写法：TCP、HTTP、WebSocket server 用 `fib.NewTLSServer` 包装原本的
-  handler，client 分别用 `Engine.DialTLS`、`ClientConfig.TLSConfig`、
+- 不同协议的 TLS 写法：TCP、HTTP、WebSocket server 用 `fibtls.NewServer` 包装原本的
+  handler，client 分别用 `fibtls.Dial`、`ClientConfig.TLSConfig`、
   `DialerConfig.TLSConfig`。
 - WebSocket server 的 `-compress` 开启 permessage-deflate，CI 用它跑 Autobahn 测试。
 

@@ -15,6 +15,7 @@ import (
 	fib "github.com/lesismal/fib/go"
 	"github.com/lesismal/fib/go/examples/internal/certs"
 	"github.com/lesismal/fib/go/examples/internal/example"
+	fibtls "github.com/lesismal/fib/go/tls"
 )
 
 func main() {
@@ -27,7 +28,7 @@ func main() {
 		example.Fatal(err)
 	}
 	echo := fib.HandlerFuncs{
-		// The handler is the same as without TLS: NewTLSServer hands it
+		// The handler is the same as without TLS: fibtls.NewServer hands it
 		// plaintext, and its Send encrypts.
 		Data: func(c *fib.Connection, data []byte) {
 			if c.Send(data) != nil {
@@ -37,7 +38,7 @@ func main() {
 	}
 	config := fib.DefaultConfig()
 	config.Addr = *addr
-	engine, err := fib.Bind(config, fib.NewTLSServer(tlsConfig, echo))
+	engine, err := fib.Bind(config, fibtls.NewServer(tlsConfig, echo))
 	if err != nil {
 		example.Fatal(err)
 	}

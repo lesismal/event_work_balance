@@ -22,6 +22,7 @@ import (
 
 	fib "github.com/lesismal/fib/go"
 	"github.com/lesismal/fib/go/internal/tlstest"
+	fibtls "github.com/lesismal/fib/go/tls"
 )
 
 // startClientEngine runs an engine with no listener, for clients only.
@@ -160,7 +161,7 @@ func TestClientEchoesThroughServer(t *testing.T) {
 // The server's close reaches the client handler with the server's code, and
 // the client answers it.
 // wss:// runs the same exchange over TLS, against the package's own server
-// behind fib.NewTLSServer, with compression on so frames of every size cross
+// behind fibtls.NewServer, with compression on so frames of every size cross
 // record boundaries.
 func TestClientEchoesOverTLS(t *testing.T) {
 	serverTLS, clientTLS, err := tlstest.Configs()
@@ -171,7 +172,7 @@ func TestClientEchoesOverTLS(t *testing.T) {
 	engineConfig.Addr = "127.0.0.1:0"
 	serverConfig := DefaultConfig()
 	serverConfig.EnableCompression = true
-	server, err := fib.Bind(engineConfig, fib.NewTLSServer(serverTLS,
+	server, err := fib.Bind(engineConfig, fibtls.NewServer(serverTLS,
 		NewHandlerWithConfig(serverConfig, echoServerHandler())))
 	if err != nil {
 		t.Fatal(err)

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	fib "github.com/lesismal/fib/go"
+	fibtls "github.com/lesismal/fib/go/tls"
 )
 
 var (
@@ -133,7 +134,7 @@ func (d *Dialer) Dial(rawURL string, header stdhttp.Header, handler Handler,
 		_ = conn.SendOwned(cc.request)
 	}
 	if secure {
-		err = d.engine.DialTLS("tcp", addr, d.config.HandshakeTimeout, d.config.TLSConfig, cc, connected)
+		err = fibtls.Dial(d.engine, "tcp", addr, d.config.HandshakeTimeout, d.config.TLSConfig, cc, connected)
 	} else {
 		err = d.engine.DialWithHandler("tcp", addr, d.config.HandshakeTimeout, cc, connected)
 	}

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	fib "github.com/lesismal/fib/go"
+	fibtls "github.com/lesismal/fib/go/tls"
 )
 
 var (
@@ -332,7 +333,7 @@ func (c *Client) dial(h *hostPool) {
 	done := func(_ *fib.Connection, err error) { c.dialed(cc, err) }
 	var err error
 	if h.target.secure {
-		err = c.engine.DialTLS("tcp", h.target.addr, c.config.DialTimeout, c.config.TLSConfig, cc, done)
+		err = fibtls.Dial(c.engine, "tcp", h.target.addr, c.config.DialTimeout, c.config.TLSConfig, cc, done)
 	} else {
 		err = c.engine.DialWithHandler("tcp", h.target.addr, c.config.DialTimeout, cc, done)
 	}

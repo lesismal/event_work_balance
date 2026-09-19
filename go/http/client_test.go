@@ -21,6 +21,7 @@ import (
 
 	fib "github.com/lesismal/fib/go"
 	"github.com/lesismal/fib/go/internal/tlstest"
+	fibtls "github.com/lesismal/fib/go/tls"
 )
 
 // startClientEngine runs an engine with no listener, for clients only.
@@ -371,8 +372,8 @@ func TestClientHTTPSKeepsConnectionAlive(t *testing.T) {
 	}
 }
 
-// The package's own server runs behind fib.NewTLSServer unchanged.
-func TestClientHTTPSToTLSHandler(t *testing.T) {
+// The package's own server runs behind fibtls.NewServer unchanged.
+func TestClientHTTPSToTLSServer(t *testing.T) {
 	serverConfig, clientConfig, err := tlstest.Configs()
 	if err != nil {
 		t.Fatal(err)
@@ -383,7 +384,7 @@ func TestClientHTTPSToTLSHandler(t *testing.T) {
 	}))
 	config := fib.DefaultConfig()
 	config.Addr = "127.0.0.1:0"
-	server, err := fib.Bind(config, fib.NewTLSServer(serverConfig, handler))
+	server, err := fib.Bind(config, fibtls.NewServer(serverConfig, handler))
 	if err != nil {
 		t.Fatal(err)
 	}

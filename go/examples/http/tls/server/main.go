@@ -19,6 +19,7 @@ import (
 	"github.com/lesismal/fib/go/examples/internal/certs"
 	"github.com/lesismal/fib/go/examples/internal/example"
 	fibhttp "github.com/lesismal/fib/go/http"
+	fibtls "github.com/lesismal/fib/go/tls"
 )
 
 func main() {
@@ -32,9 +33,9 @@ func main() {
 	}
 	config := fib.DefaultConfig()
 	config.Addr = *addr
-	// The HTTP handler is the same one the plain server uses: NewTLSServer
+	// The HTTP handler is the same one the plain server uses: fibtls.NewServer
 	// decrypts in front of it and encrypts what it sends.
-	engine, err := fib.Bind(config, fib.NewTLSServer(tlsConfig, fibhttp.NewHandler(echo())))
+	engine, err := fib.Bind(config, fibtls.NewServer(tlsConfig, fibhttp.NewHandler(echo())))
 	if err != nil {
 		example.Fatal(err)
 	}
