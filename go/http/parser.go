@@ -40,6 +40,9 @@ type Parser struct {
 	config     Config
 	buffer     []byte
 	headerScan int
+	// remoteAddr is the peer's address, which the server handler fills in
+	// once per connection for every request's RemoteAddr.
+	remoteAddr string
 }
 
 type frameInfo struct {

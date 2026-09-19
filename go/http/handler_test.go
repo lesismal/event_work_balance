@@ -81,3 +81,45 @@ func TestMarshalHeadResponse(t *testing.T) {
 		t.Fatalf("HEAD body = %q", body)
 	}
 }
+
+// Requests carry the peer's address, as net/http's do.
+func TestServerHandlerSetsRemoteAddr(t *testing.T) {
+	handler := NewHandler(HandlerFunc(func(c *Context, request *stdhttp.Request) {
+		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(request.RemoteAddr))
+	}))
+	config := fib.DefaultConfig()
+	config.Addr = "127.0.0.1:0"
+	server, err := fib.Bind(config, handler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := server.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- server.Run() }()
+	defer func() {
+		server.Stop()
+		<-runDone
+		_ = server.Close()
+	}()
+
+	conn, err := net.DialTimeout("tcp4", addr.String(), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err = io.WriteString(conn, "GET / HTTP/1.1\r\nHost: test\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	response, err := stdhttp.ReadResponse(bufio.NewReader(conn), &stdhttp.Request{Method: stdhttp.MethodGet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	if string(body) != conn.LocalAddr().String() {
+		t.Fatalf("RemoteAddr = %q, want %q", body, conn.LocalAddr())
+	}
+}

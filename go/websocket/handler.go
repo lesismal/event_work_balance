@@ -44,10 +44,37 @@ type Handler interface {
 	OnClose(*Connection, uint16, string, error)
 }
 
+// PingHandler is implemented by a Handler that handles pings itself. OnPing
+// replaces the default reply, so it sends the pong itself, with
+// Connection.Pong, if it wants one sent. A Handler that does not implement it
+// has every ping answered with a pong carrying the same payload, as RFC 6455
+// requires.
+//
+// The payload is valid only for the duration of the callback.
+type PingHandler interface {
+	OnPing(*Connection, []byte)
+}
+
+// PongHandler is implemented by a Handler that wants the pongs it receives,
+// to measure round trips or to tell that a peer is alive. Without it pongs
+// are discarded.
+//
+// The payload is valid only for the duration of the callback.
+type PongHandler interface {
+	OnPong(*Connection, []byte)
+}
+
+// HandlerFuncs implements Handler, PingHandler and PongHandler from whichever
+// functions are set. A nil Ping keeps the default reply to pings, and a nil
+// Pong discards pongs.
 type HandlerFuncs struct {
 	Open    func(*Connection, *stdhttp.Request)
 	Message func(*Connection, Opcode, []byte)
 	Close   func(*Connection, uint16, string, error)
+	// Ping replaces the default reply to a ping: it has to call
+	// Connection.Pong itself for a pong to be sent.
+	Ping func(*Connection, []byte)
+	Pong func(*Connection, []byte)
 }
 
 func (h HandlerFuncs) OnOpen(c *Connection, r *stdhttp.Request) {
@@ -63,6 +90,18 @@ func (h HandlerFuncs) OnMessage(c *Connection, opcode Opcode, data []byte) {
 func (h HandlerFuncs) OnClose(c *Connection, code uint16, reason string, err error) {
 	if h.Close != nil {
 		h.Close(c, code, reason, err)
+	}
+}
+func (h HandlerFuncs) OnPing(c *Connection, payload []byte) {
+	if h.Ping != nil {
+		h.Ping(c, payload)
+		return
+	}
+	_ = c.replyPing(payload)
+}
+func (h HandlerFuncs) OnPong(c *Connection, payload []byte) {
+	if h.Pong != nil {
+		h.Pong(c, payload)
 	}
 }
 
@@ -106,8 +145,23 @@ func (c *Connection) WriteBinary(payload []byte) error {
 	return c.WriteMessage(Binary, payload)
 }
 
+// Ping sends a ping. The peer answers with a pong carrying the same payload,
+// which reaches a PongHandler. The payload is at most 125 bytes.
 func (c *Connection) Ping(payload []byte) error { return c.writeFrame(Ping, payload) }
+
+// Pong sends a pong. Pongs are sent on their own only to answer pings, which
+// the default handling already does, or as an unsolicited heartbeat.
 func (c *Connection) Pong(payload []byte) error { return c.writeFrame(Pong, payload) }
+
+// replyPing is the default answer to a ping. A connection that cannot even
+// send a pong is closed, and replyPing reports false.
+func (c *Connection) replyPing(payload []byte) bool {
+	if err := c.Pong(payload); err != nil {
+		c.conn.Close()
+		return false
+	}
+	return true
+}
 
 func (c *Connection) Close(code uint16, reason string) error {
 	if !validCloseCode(code) || !utf8.ValidString(reason) {
@@ -314,6 +368,9 @@ func (h *ServerHandler) upgrade(c *fib.Connection, state *connectionState, reque
 	}
 	h.releaseHandshakeParser(state)
 	if request != nil {
+		if addr := c.RemoteAddr(); addr != nil {
+			request.RemoteAddr = addr.String()
+		}
 		h.handler.OnOpen(&state.websocket, request)
 	}
 	if len(remainder) != 0 {
@@ -326,9 +383,10 @@ func (h *ServerHandler) handleFrames(state *connectionState, data []byte) {
 }
 
 // serveFrames feeds bytes from the peer through parser and acts on every frame
-// they complete: messages go to handler, pings are answered, and a close is
-// echoed. Both ends of a connection run it; they differ only in the parser's
-// direction and in whether ws masks what it sends.
+// they complete: messages go to handler, pings are answered or handed to a
+// PingHandler, pongs go to a PongHandler, and a close is echoed. Both ends of
+// a connection run it; they differ only in the parser's direction and in
+// whether ws masks what it sends.
 func serveFrames(handler Handler, ws *Connection, parser *Parser, data []byte) {
 	defer parser.ReleaseBorrowed()
 	for {
@@ -345,9 +403,14 @@ func serveFrames(handler Handler, ws *Connection, parser *Parser, data []byte) {
 		case Text, Binary:
 			handler.OnMessage(ws, event.Opcode, event.Payload)
 		case Ping:
-			if sendErr := ws.Pong(event.Payload); sendErr != nil {
-				ws.conn.Close()
+			if pinged, ok := handler.(PingHandler); ok {
+				pinged.OnPing(ws, event.Payload)
+			} else if !ws.replyPing(event.Payload) {
 				return
+			}
+		case Pong:
+			if ponged, ok := handler.(PongHandler); ok {
+				ponged.OnPong(ws, event.Payload)
 			}
 		case Close:
 			_ = ws.sendClose(event.Payload)

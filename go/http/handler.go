@@ -84,17 +84,28 @@ func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 }
 
 func (h *ServerHandler) OnOpen(c *fib.Connection) {
-	c.SetAttachment(NewParser(h.config))
+	c.SetAttachment(h.newParser(c))
+}
+
+// newParser starts a connection's parser, recording the peer's address so
+// that each request carries it in RemoteAddr as net/http's do.
+func (h *ServerHandler) newParser(c *fib.Connection) *Parser {
+	parser := NewParser(h.config)
+	if addr := c.RemoteAddr(); addr != nil {
+		parser.remoteAddr = addr.String()
+	}
+	return parser
 }
 
 func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 	parser, _ := c.Attachment().(*Parser)
 	if parser == nil {
-		parser = NewParser(h.config)
+		parser = h.newParser(c)
 		c.SetAttachment(parser)
 	}
 	requests, err := parser.Feed(data)
 	for _, request := range requests {
+		request.RemoteAddr = parser.remoteAddr
 		context := &Context{Conn: c, Request: request}
 		h.handler.ServeHTTP(context, request)
 		if request.Close {
