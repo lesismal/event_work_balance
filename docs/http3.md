@@ -18,7 +18,7 @@ from scratch. The TLS 1.3 handshake is the standard library's
 | Area | Content |
 | --- | --- |
 | QUIC | Version 1; Initial, Handshake and 1-RTT packet number spaces; AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 packet and header protection; answering peer-initiated key updates; Retry on the client; Version Negotiation; stateless reset; RFC 9002 loss detection, PTO and NewReno congestion control; the server's 3x amplification limit; connection- and stream-level flow control in both directions; MAX_STREAMS; idle timeout and optional keep-alive |
-| Server | Shares one `Handler` and `Context` with HTTP/1 and HTTP/2; 1xx interim responses, automatic 100 Continue, request trailers, graceful `Response.Close` via GOAWAY, 413/431, malformed requests reset with H3_MESSAGE_ERROR, protocol errors closing the connection with RFC 9114 codes, `Request.TLS`, an `AltSvc` helper |
+| Server | Shares one `Handler` and `Context` with HTTP/1 and HTTP/2; 1xx interim responses, automatic 100 Continue, request and response trailers, graceful `Response.Close` via GOAWAY, 413/431, malformed requests reset with H3_MESSAGE_ERROR, protocol errors closing the connection with RFC 9114 codes, `Request.TLS`, an `AltSvc` helper |
 | Client | Asynchronous `Do`/`Go`; one multiplexed connection per host:port; honors MAX_STREAMS and queues the rest; cancellation resets only its own stream; requests the server marks as unprocessed (GOAWAY, H3_REQUEST_REJECTED) are retried on a new connection; response trailers |
 | Interop | quic-go client and server, both directions, including 5% packet loss; the client against the live services of Cloudflare, Google, nginx, Facebook (mvfst), Varnish and quiche |
 
@@ -60,9 +60,10 @@ Behavior users need to be aware of.
 
 - A request body is read into memory in full before the handler runs, and a
   response is given at once as `Response.Body []byte`; the client likewise
-  buffers the whole response body before the callback. This is the same model
-  as HTTP/1 and HTTP/2, so SSE and streaming uploads or downloads are not
-  possible.
+  buffers the whole response body before the callback, so SSE and streaming
+  uploads or downloads are not possible. `Context`'s `http.ResponseWriter`
+  methods work, trailers included, but as on HTTP/2 the response they write
+  is held until the handler returns and sent whole; only HTTP/1 streams it.
 - Memory bounds: a server connection can hold up to about
   `MaxConcurrentStreams × MaxBodyBytes` (100 × 16MB by default); a single
   client response is bounded by `MaxResponseBodyBytes`.
@@ -110,8 +111,8 @@ exposed through `http3.Config` or `http3.ClientConfig`:
   for (`EAGAIN`) is dropped and treated as lost.
 - **The peer's `SETTINGS_MAX_FIELD_SECTION_SIZE`** is parsed but not checked
   when sending.
-- **Response trailers**: the server cannot send response trailers and the
-  client cannot send request trailers (both can receive them).
+- **Request trailers**: the client cannot send request trailers (both sides
+  can receive trailers, and the server sends response trailers).
 - **Priorities**: the `priority` header and PRIORITY_UPDATE frames are ignored;
   streams with data to send take turns.
 - **ECN**: ECN marks are neither set nor reported. ACK_ECN frames are parsed,
@@ -200,7 +201,7 @@ In order of priority.
 - Expose keep-alive, receive windows, the unidirectional stream limit and the
   server's handshake timeout in `http3.Config` and `http3.ClientConfig`.
 - Honor the peer's `SETTINGS_MAX_FIELD_SECTION_SIZE` when sending.
-- Send response and request trailers.
+- Send request trailers.
 - Client: pick HTTP/3 automatically from `Alt-Svc`, and fall back to TCP when
   UDP is blocked.
 

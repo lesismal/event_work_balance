@@ -54,9 +54,12 @@ make go
 make go-test
 ```
 
-The HTTP/2 implementation's current limitations, intentionally omitted features
-and planned improvements are documented in [`docs/http2.md`](docs/http2.md);
-those of HTTP/3 (and the QUIC and QPACK under it) in [`docs/http3.md`](docs/http3.md).
+HTTP/1.0 and HTTP/1.1 support (streaming responses, trailers, zero-copy
+`sendfile` for files), its limitations and its conformance tests are documented
+in [`docs/http1.md`](docs/http1.md). The HTTP/2 implementation's current
+limitations, intentionally omitted features and planned improvements are
+documented in [`docs/http2.md`](docs/http2.md); those of HTTP/3 (and the QUIC
+and QPACK under it) in [`docs/http3.md`](docs/http3.md).
 
 The public API is in [`c/include/epoll_server.h`](c/include/epoll_server.h). Regular
 input invokes `on_data`; out-of-band input raised by `EPOLLPRI` and read with

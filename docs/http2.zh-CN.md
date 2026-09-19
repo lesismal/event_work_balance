@@ -24,8 +24,13 @@
 ### 消息体整体缓存，不支持流式
 
 - 请求 body 在 handler 运行前完整读入内存，响应通过 `Response.Body []byte` 一次性给出；
-  客户端同样把响应 body 完整缓存后再回调。这与 HTTP/1 路径的模型一致。
-- 因此无法实现 SSE、长轮询流式输出、gRPC streaming、边收边处理的大文件上传等场景。
+  客户端同样把响应 body 完整缓存后再回调。
+- handler 也可以通过 `Context` 的 `http.ResponseWriter` 方法（`Header`/`WriteHeader`/
+  `Write`/`Flush`）写响应（含 trailer），或把 `Context` 交给 `http.ServeFile`、
+  `http.ServeContent`。在 HTTP/1 上这是真正的流式输出（chunked，文件走 sendfile，见
+  [`http1.zh-CN.md`](http1.zh-CN.md)）；在 HTTP/2 上响应会先缓存，handler 返回后整体
+  发送，`Flush` 不起作用。
+- 因此在 HTTP/2 上无法实现 SSE、长轮询流式输出、gRPC streaming、边收边处理的大文件上传等场景。
 - 内存上限：服务端单连接最坏约为 `MaxConcurrentStreams × MaxBodyBytes`
   （默认 250 × 16MB）；客户端单个响应受 `MaxResponseBodyBytes` 限制。
 - `CONNECT` 请求能被解析并交给 handler，但无法建立隧道（没有双向流式通道）。
@@ -62,8 +67,8 @@
   同时有待发送数据时，发送顺序由内部 map 的遍历顺序决定，没有公平性或权重保证。
 - **对端的 `SETTINGS_MAX_HEADER_LIST_SIZE`**：本端会声明自己的上限，但发送时不检查
   对端声明的上限。
-- **响应 trailer**：服务端无法发送响应 trailer，客户端无法发送请求 trailer
-  （两端都能接收）。
+- **请求 trailer**：客户端无法发送请求 trailer（两端都能接收 trailer，服务端可以发送
+  响应 trailer）。
 - **优雅关闭时的 TCP RST**：GOAWAY 后连接在所有 stream 完成时关闭，但不会先半关闭、
   排空对端仍在发送的数据；如果此时 socket 中还有未读数据，内核会发送 RST。
 - **引擎停止**：`Engine.Stop`/`Close` 不会给 HTTP/2 连接发送 GOAWAY，连接被直接关闭，
@@ -121,10 +126,9 @@
 
 ### 3. 流式 body 与 handler 模型（中）
 
-- 提供流式的请求 body 读取和响应写出（类似 `http.ResponseWriter` + `Flusher`），
-  以支持 SSE、gRPC、大文件传输；同时可以把接收窗口的补充与实际消费挂钩，形成真正的
-  端到端背压，而不是现在“收到即补充窗口”。
-- 这是跨 HTTP/1、HTTP/2 的 API 设计变更，需要单独讨论。
+- 让 `Context` 已有的 `http.ResponseWriter` 方法在 HTTP/2 上也像 HTTP/1 一样流式输出，
+  并提供流式的请求 body 读取，以支持 SSE、gRPC、大文件传输；同时可以把接收窗口的补充
+  与实际消费挂钩，形成真正的端到端背压，而不是现在“收到即补充窗口”。
 
 ### 4. 性能（中）
 
@@ -146,4 +150,4 @@
 - 服务端：可配置的空闲超时和 PING 保活；`Engine` 停止时对 HTTP/2 连接发送 GOAWAY
   并等待在途 stream 完成（优雅停机）；GOAWAY 后半关闭并排空输入，避免 RST。
 - 客户端：可选的 PING 健康检查、按负载选择连接、SETTINGS 确认超时检测。
-- 支持发送响应 / 请求 trailer。
+- 支持发送请求 trailer。

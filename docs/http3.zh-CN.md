@@ -16,7 +16,7 @@
 | 方向 | 内容 |
 | --- | --- |
 | QUIC | version 1；Initial、Handshake、1-RTT 三个包号空间；AES-128-GCM、AES-256-GCM、ChaCha20-Poly1305 包保护与头部保护；响应对端发起的 key update；客户端处理 Retry；Version Negotiation；stateless reset；RFC 9002 丢包检测、PTO 与 NewReno 拥塞控制；服务端 3 倍放大限制；连接级与 stream 级双向流控；MAX_STREAMS；空闲超时与可选 keep-alive |
-| 服务端 | 与 HTTP/1、HTTP/2 共用同一个 `Handler` 和 `Context`；1xx 中间响应、自动 100 Continue、请求 trailer、`Response.Close` 通过 GOAWAY 优雅关闭、413/431、非法请求以 H3_MESSAGE_ERROR 重置、协议错误按 RFC 9114 错误码关闭连接、`Request.TLS`、`AltSvc` 辅助函数 |
+| 服务端 | 与 HTTP/1、HTTP/2 共用同一个 `Handler` 和 `Context`；1xx 中间响应、自动 100 Continue、请求与响应 trailer、`Response.Close` 通过 GOAWAY 优雅关闭、413/431、非法请求以 H3_MESSAGE_ERROR 重置、协议错误按 RFC 9114 错误码关闭连接、`Request.TLS`、`AltSvc` 辅助函数 |
 | 客户端 | 异步 `Do`/`Go`；每个 host:port 一条连接、多路复用；遵守 MAX_STREAMS 并排队；取消只重置单个 stream；GOAWAY 与 H3_REQUEST_REJECTED 的请求自动在新连接上重发；响应 trailer |
 | 互通验证 | quic-go 客户端与服务端（双向，含 5% 丢包）；客户端访问 Cloudflare、Google、nginx、Facebook（mvfst）、Varnish、quiche 的线上服务 |
 
@@ -52,8 +52,9 @@
 ### 消息体整体缓存，handler 同步执行
 
 - 请求 body 在 handler 运行前完整读入内存，响应通过 `Response.Body []byte` 一次性给出；
-  客户端同样把响应 body 完整缓存后再回调。这与 HTTP/1、HTTP/2 的模型一致，因此不支持
-  SSE、流式上传下载等场景。
+  客户端同样把响应 body 完整缓存后再回调，因此不支持 SSE、流式上传下载等场景。
+  `Context` 的 `http.ResponseWriter` 方法可以使用（含 trailer），但与 HTTP/2 一样，
+  写出的响应会先缓存，handler 返回后整体发送；只有 HTTP/1 是流式的。
 - 内存上限：服务端单连接最坏约为 `MaxConcurrentStreams × MaxBodyBytes`（默认
   100 × 16MB），客户端单个响应受 `MaxResponseBodyBytes` 限制。
 - 同一连接上的 handler 调用是串行的，同步阻塞的 handler 会推迟同一连接上其他请求的处理。
@@ -94,8 +95,8 @@
   持续拥塞（persistent congestion）判定。发送缓冲区满（`EAGAIN`）时数据报直接丢弃，
   按丢包处理。
 - **对端的 `SETTINGS_MAX_FIELD_SECTION_SIZE`**：能解析，但发送时不检查。
-- **响应 trailer**：服务端无法发送响应 trailer，客户端无法发送请求 trailer（两端都能
-  接收）。
+- **请求 trailer**：客户端无法发送请求 trailer（两端都能接收 trailer，服务端可以发送
+  响应 trailer）。
 - **优先级**：`priority` 头和 PRIORITY_UPDATE 帧都被忽略，待发送的 stream 轮流发送。
 - **ECN**：不设置也不上报 ECN 标记。ACK_ECN 帧能解析，但其中的计数被忽略。
 
@@ -168,7 +169,7 @@
 - 在 `http3.Config` 和 `http3.ClientConfig` 中暴露 keep-alive、接收窗口、单向 stream
   上限、握手超时（服务端）等参数。
 - 发送时遵守对端的 `SETTINGS_MAX_FIELD_SECTION_SIZE`。
-- 支持发送响应 / 请求 trailer。
+- 支持发送请求 trailer。
 - 客户端：根据 `Alt-Svc` 自动选择 HTTP/3，并在 UDP 不通时回退到 TCP。
 
 ### 5. 测试覆盖（低）

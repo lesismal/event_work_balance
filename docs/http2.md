@@ -27,10 +27,16 @@ Behaviour to be aware of when using it.
 
 - A request body is read completely into memory before the handler runs, and a
   response is given all at once as `Response.Body []byte`. The client likewise
-  buffers the whole response body before its callback. This matches the HTTP/1
-  path.
+  buffers the whole response body before its callback.
+- A handler may write its response through `Context`'s `http.ResponseWriter`
+  methods (`Header`/`WriteHeader`/`Write`/`Flush`), trailers included, and
+  hand `Context` to `http.ServeFile` or `http.ServeContent`. On HTTP/1 that
+  streams, chunked, with files sent by sendfile (see [`http1.md`](http1.md));
+  on HTTP/2 the response is held until the handler returns and then sent
+  whole, and `Flush` does nothing.
 - Server-sent events, streamed long-polling output, gRPC streaming and
-  processing large uploads as they arrive are therefore not possible.
+  processing large uploads as they arrive are therefore not possible over
+  HTTP/2.
 - Memory bound: on the server, one connection can hold up to about
   `MaxConcurrentStreams × MaxBodyBytes` (250 × 16MB by default); on the client,
   one response is bounded by `MaxResponseBodyBytes`.
@@ -74,8 +80,8 @@ These are constants today and cannot be configured:
   weighting.
 - **The peer's `SETTINGS_MAX_HEADER_LIST_SIZE`**: this side advertises its own
   limit but does not check the peer's when sending.
-- **Trailers**: the server cannot send response trailers and the client cannot
-  send request trailers (both can receive them).
+- **Request trailers**: the client cannot send request trailers (both sides
+  can receive trailers, and the server sends response trailers).
 - **TCP RST on graceful close**: after GOAWAY the connection closes once every
   stream has finished, but it does not half-close and drain what the peer is
   still sending first; if unread data is left in the socket, the kernel sends a
@@ -150,12 +156,11 @@ still lacks:
 
 ### 3. Streaming bodies and the handler model (medium)
 
-- Offer streaming request-body reads and response writes (along the lines of
-  `http.ResponseWriter` + `Flusher`) for SSE, gRPC and large transfers. Window
-  updates could then follow actual consumption, giving real end-to-end
-  backpressure instead of today's replenish-on-receipt.
-- This is an API design change across HTTP/1 and HTTP/2 and needs its own
-  discussion.
+- Make the `http.ResponseWriter` methods `Context` already has stream on
+  HTTP/2 as they do on HTTP/1, and offer streaming request-body reads, for SSE,
+  gRPC and large transfers. Window updates could then follow actual
+  consumption, giving real end-to-end backpressure instead of today's
+  replenish-on-receipt.
 
 ### 4. Performance (medium)
 
@@ -184,4 +189,4 @@ still lacks:
   shutdown); half-close and drain input after GOAWAY to avoid RST.
 - Client: optional PING health checks, least-loaded connection selection, and
   a SETTINGS acknowledgement timeout.
-- Support sending response and request trailers.
+- Support sending request trailers.

@@ -134,6 +134,26 @@ if err := server.Run(); err != nil { panic(err) }
 config.Addrs = []string{"127.0.0.1:9000", "127.0.0.1:9001"}
 ```
 
+### SendFile 零拷贝发送
+
+`Connection.SendFile(f, offset, count)` 把文件的一段排进发送队列，与前后的 `Send` 保持
+顺序。Linux 和 macOS 上由 `sendfile(2)` 直接从文件发到 socket，数据不经过用户态；
+Windows 上按 socket 的发送进度每次读取一块再发送。无论哪种方式，文件都是随对端的接收
+进度读取的，大文件也不会占用更多内存：
+
+```go
+f, _ := os.Open("video.mp4")
+_ = c.Send(header)
+_ = c.SendFile(f, 0, size) // 连接使用自己复制的描述符，f 可以立即关闭
+f.Close()
+```
+
+- 带 layer 的连接（如 TLS）需要先加密，无法零拷贝：`SendFile` 会在返回前读出这段文件
+  并经 layer 发送。UDP 连接返回 `ErrSendFileDatagram`。
+- 文件比声明的范围短时会关闭连接，因为对端已经在等这些字节。
+- `OnData` 里的发送会被暂存（cork），在 handler 返回后合并成一次写入；需要在 handler
+  运行期间就把已发送的数据交给 socket 时（例如流式响应），调用 `Connection.Flush()`。
+
 ### 异步 Dial
 
 `Engine.Dial` 发起四层（TCP）连接，立即返回，不阻塞调用方。连接建立后的 fd 与
@@ -272,7 +292,7 @@ err = fibtls.Dial(engine, "tcp", "example.com:443", 3*time.Second, tlsConfig, ha
 
 `http` package 在原始连接之上提供 HTTP/1.0、HTTP/1.1 和 HTTP/2 的增量解析和响应
 处理，支持 TCP 分包/粘包、流水线请求、`Content-Length`、chunked body、trailer、
-keep-alive 以及请求大小限制：
+keep-alive、流式响应、sendfile 零拷贝发送文件以及请求大小限制：
 
 ```go
 handler := epollhttp.NewHandler(epollhttp.HandlerFunc(
@@ -289,6 +309,50 @@ server, err := fib.Bind(config, handler)
 cd go
 go run ./examples/http/nontls/server   # 另开终端：go run ./examples/http/nontls/client
 ```
+
+### HTTP/1.x：流式响应、trailer 与 sendfile
+
+除了 `Respond`/`WriteResponse` 一次性回复，`Context` 还实现了 `http.ResponseWriter`、
+`http.Flusher` 和 `io.ReaderFrom`，可以像 `net/http` 的 handler 一样边写边发，也可以直接
+交给 `net/http` 的 `ServeFile`、`ServeContent`、`FileServer` 等函数：
+
+```go
+func(c *fibhttp.Context, r *http.Request) {
+    switch r.URL.Path {
+    case "/events":
+        c.Header().Set("Trailer", "X-Count")
+        for i := 0; i < 10; i++ {
+            fmt.Fprintf(c, "event %d\n", i)
+            c.Flush() // 立即发出这一块，不等 handler 返回
+        }
+        c.Header().Set("X-Count", "10") // 作为 trailer 在 body 之后发送
+    case "/download":
+        http.ServeFile(c, r, "big.iso") // Range、If-Modified-Since 等由 net/http 处理，文件走 sendfile
+    }
+}
+```
+
+- 帧格式自动选择：handler 设置了 `Content-Length`，或写的内容不超过 4KB 且在返回前写完，
+  就用 `Content-Length`；否则 HTTP/1.1 用 chunked（trailer 也靠它携带），HTTP/1.0 不支持
+  chunked，body 以关闭连接结束。未设置 `Content-Type` 时像 `net/http` 一样嗅探。
+- trailer：在 `Trailer` 头里声明名字，写完 body 后设置对应的值；也可以在任何时候设置带
+  `http.TrailerPrefix` 前缀的键。`Response.Trailer` 同样可以随 `WriteResponse` 发送。
+  HTTP/1.0 客户端收不到 trailer。
+- `ReadFrom`（`io.Copy`、`http.ServeContent` 都会用到）遇到普通文件，或包着文件的
+  `*io.LimitedReader` 时，通过 `Connection.SendFile` 发送；TLS 连接退化为读取后加密发送。
+- handler 返回时响应自动结束（写出剩余数据、结束 chunk、发送 trailer），与 `net/http`
+  一致；也可以提前调用 `Context.Finish()`。只有用过这些方法的响应才会被自动结束，所以
+  没有开始写的响应仍然可以之后在其他 goroutine 中用 `WriteResponse` 异步回复。
+- 同一个响应不能混用两种方式：开始用 `Write`/`WriteHeader` 之后，`WriteResponse` 返回
+  `ErrResponseWritten`。
+- HTTP/2 和 HTTP/3 上这些方法同样可用，但响应会先缓存，handler 返回后整体发送。
+
+服务端还会：为 HTTP/1.1 缺少 `Host` 或有多个 `Host` 的请求返回 400；不支持的
+`Transfer-Encoding` 返回 501；无法满足的 `Expect` 返回 417；同时带 `Content-Length`
+和 chunked 的请求按 chunked 处理并在响应后关闭连接；HTTP/1.0 请求带
+`Transfer-Encoding` 时返回 400；204 和 1xx 响应不带 `Content-Length`；自动添加 `Date`。
+完整的 HTTP/1.x 支持情况、限制和一致性测试见
+[`docs/http1.zh-CN.md`](../docs/http1.zh-CN.md)。
 
 ### HTTP/2
 
@@ -372,7 +436,7 @@ HTTP/2 当前的限制（body 整体缓存、handler 同步执行、固定的窗
 
 ### 异步 HTTP client
 
-`http.Client` 在 Engine 上发送 HTTP/1.1 和 HTTP/2 请求，调用方不会阻塞。响应由 Engine 的
+`http.Client` 在 Engine 上发送 HTTP/1.0、HTTP/1.1 和 HTTP/2 请求，调用方不会阻塞。响应由 Engine 的
 worker 读取，body 完整缓存后再交给回调；也可以用 `Go` 拿到 Future 等待结果：
 
 ```go
@@ -402,7 +466,11 @@ resp, err := client.Go(req).Wait() // Future：Wait 阻塞，Done() 可用于 se
   建立的连接数，超出的请求排队；`MaxIdleConnsPerHost`、`IdleConnTimeout` 控制空闲
   连接的保留。HTTP/1.1 连接同时只跑一个请求，不做 pipelining。
 - 支持 `Content-Length`、chunked（含 trailer）、以关闭连接为结束的 body，HEAD、
-  204、304 不读 body，1xx 中间响应自动跳过。`MaxResponseHeaderBytes`、
+  204、304 不读 body，1xx 中间响应自动跳过。请求的 `ContentLength` 为 -1 时 body 以
+  chunked 发送，可以携带 `req.Trailer`。
+- HTTP/1.0：把请求的 `Proto`、`ProtoMajor`、`ProtoMinor` 设为 `HTTP/1.0`、1、0，就会以
+  HTTP/1.0 发送（body 用 `Content-Length`，不带 trailer）；请求带
+  `Connection: keep-alive` 且服务端同意时连接才会复用。`MaxResponseHeaderBytes`、
   `MaxResponseBodyBytes` 限制单个响应大小。
 - `Timeout` 覆盖从 `Do` 到响应完整的全过程（排队、建连、发送、读取），超时错误满足
   `errors.Is(err, os.ErrDeadlineExceeded)`；取消请求的 context 同样会结束请求。被
@@ -637,6 +705,9 @@ go run ./examples/tcp/tls/client -n 10
 - HTTP/3 server 在同一端口号上同时监听 UDP（HTTP/3）和 TCP（HTTPS，HTTP/2 与
   HTTP/1.1），TCP 上的响应带 `Alt-Svc`，浏览器据此切换到 HTTP/3。
 - WebSocket server 的 `-compress` 开启 permessage-deflate，CI 用它跑 Autobahn 测试。
+- HTTP server 的 `-dir` 用 `net/http` 的 `FileServer` 在 `/files/` 下提供该目录的文件
+  （支持 Range、条件请求，文件走 sendfile），例如 `go run ./examples/http/nontls/server -dir .`
+  后 `curl -O http://127.0.0.1:8080/files/go.mod`。
 
 ## GOMAXPROCS
 
