@@ -27,8 +27,18 @@ var requestReaderPool = sync.Pool{New: func() any {
 const maxRetainedBuffer = 64 << 10
 
 type Config struct {
+	// MaxHeaderBytes bounds a request's header: its bytes in HTTP/1, and in
+	// HTTP/2 both its encoded block and its decoded size as RFC 9113
+	// counts it.
 	MaxHeaderBytes int
 	MaxBodyBytes   int64
+	// DisableHTTP2 serves HTTP/1 only. Otherwise a connection that opens with
+	// the HTTP/2 preface, over TLS after ALPN chose "h2" or in cleartext with
+	// prior knowledge, is served as HTTP/2.
+	DisableHTTP2 bool
+	// MaxConcurrentStreams is how many requests an HTTP/2 client may have
+	// open on one connection. Zero means DefaultMaxConcurrentStreams.
+	MaxConcurrentStreams uint32
 }
 
 func DefaultConfig() Config {
@@ -43,6 +53,9 @@ type Parser struct {
 	// remoteAddr is the peer's address, which the server handler fills in
 	// once per connection for every request's RemoteAddr.
 	remoteAddr string
+	// sniffed records that the server handler has seen enough of the
+	// connection to know it is not HTTP/2.
+	sniffed bool
 }
 
 type frameInfo struct {

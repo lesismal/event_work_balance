@@ -1,7 +1,8 @@
 //go:build linux || darwin || windows
 
 // Command server is an HTTPS echo server: it answers each request with its
-// method, path and body.
+// protocol, method, path and body. It speaks HTTP/2 to clients that choose it
+// through ALPN and HTTP/1.1 to the rest.
 //
 //	go run ./examples/http/tls/server
 //
@@ -34,8 +35,9 @@ func main() {
 	config := fib.DefaultConfig()
 	config.Addr = *addr
 	// The HTTP handler is the same one the plain server uses: fibtls.NewServer
-	// decrypts in front of it and encrypts what it sends.
-	engine, err := fib.Bind(config, fibtls.NewServer(tlsConfig, fibhttp.NewHandler(echo())))
+	// decrypts in front of it and encrypts what it sends. ConfigureTLS offers
+	// h2 through ALPN; the handler serves HTTP/2 and HTTP/1.1 alike.
+	engine, err := fib.Bind(config, fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(echo())))
 	if err != nil {
 		example.Fatal(err)
 	}
@@ -45,7 +47,7 @@ func main() {
 func echo() fibhttp.HandlerFunc {
 	return func(c *fibhttp.Context, r *stdhttp.Request) {
 		body, _ := io.ReadAll(r.Body)
-		reply := fmt.Sprintf("%s %s %s", r.Method, r.URL.Path, body)
+		reply := fmt.Sprintf("%s %s %s %s", r.Proto, r.Method, r.URL.Path, body)
 		if err := c.Respond(stdhttp.StatusOK, "text/plain; charset=utf-8", []byte(reply)); err != nil {
 			c.Conn.Close()
 		}

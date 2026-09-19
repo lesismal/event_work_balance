@@ -149,6 +149,15 @@ func (h *Handler) OnClose(c *fib.Connection, err error) {
 	h.inner().OnClose(c, err)
 }
 
+// HandshakeHandler is implemented by a wrapped handler that wants to know
+// when the handshake completes, such as one that speaks whichever protocol
+// ALPN negotiated. OnHandshake runs once, on the handshake's goroutine, after
+// what OnOpen sent has been encrypted and before OnData receives any
+// plaintext. A handshake that fails reaches OnClose instead.
+type HandshakeHandler interface {
+	OnHandshake(*fib.Connection, stdtls.ConnectionState)
+}
+
 // layer sits between a connection's socket and crypto/tls. To crypto/tls it is
 // the transport: Read serves the ciphertext OnData collected and Write queues
 // records on the connection. To the connection it is the fib.Layer that
@@ -205,6 +214,13 @@ func (t *layer) handshake(handler fib.Handler, timeout time.Duration) {
 	}
 	t.wmu.Unlock()
 
+	if err == nil {
+		// Before any plaintext reaches OnData, so that a handler can pick its
+		// protocol from what ALPN chose.
+		if h, ok := handler.(HandshakeHandler); ok {
+			h.OnHandshake(t.c, t.conn.ConnectionState())
+		}
+	}
 	t.mu.Lock()
 	t.handshaking = false
 	t.mu.Unlock()

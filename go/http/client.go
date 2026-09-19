@@ -12,6 +12,7 @@ import (
 	"net"
 	stdhttp "net/http"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,8 +58,16 @@ type ClientConfig struct {
 	MaxResponseHeaderBytes int
 	MaxResponseBodyBytes   int64
 	// TLSConfig is used for https:// requests. Nil means the defaults; either
-	// way a config naming no server gets the request's host.
+	// way a config naming no server gets the request's host. Unless it sets
+	// NextProtos itself, ALPN offers HTTP/2 and HTTP/1.1.
 	TLSConfig *tls.Config
+	// DisableHTTP2 keeps https:// requests on HTTP/1.1. Otherwise they speak
+	// HTTP/2 to any server that chooses it through ALPN.
+	DisableHTTP2 bool
+	// UnencryptedHTTP2 sends http:// requests as HTTP/2 with prior knowledge
+	// (h2c), for servers known to speak it. It is off by default, since an
+	// HTTP/1-only server cannot answer it.
+	UnencryptedHTTP2 bool
 }
 
 func DefaultClientConfig() ClientConfig {
@@ -73,14 +82,17 @@ func DefaultClientConfig() ClientConfig {
 	}
 }
 
-// Client sends HTTP/1.1 requests over connections an engine dials and
-// serves, without blocking the caller. Responses are read by the engine's
+// Client sends HTTP/1.1 and HTTP/2 requests over connections an engine dials
+// and serves, without blocking the caller. Responses are read by the engine's
 // workers and handed to a callback with their body already buffered, so a
 // callback never waits on the network.
 //
-// A client keeps its connections alive between requests and sends one request
-// at a time on each; it does not pipeline. http:// and https:// are
-// supported; https speaks HTTP/1.1 over TLS.
+// A client keeps its connections alive between requests. An HTTP/1.1
+// connection carries one request at a time; it does not pipeline. An HTTP/2
+// connection carries as many at once as the server allows. http:// and
+// https:// are supported; https speaks HTTP/2 when the server chooses it
+// through ALPN and HTTP/1.1 over TLS otherwise, and http:// speaks HTTP/1.1
+// unless ClientConfig.UnencryptedHTTP2 is set.
 //
 // The engine may be one made by fib.NewEngine for clients alone, or a server's
 // own engine: client connections carry their own handler, so the two never
@@ -90,9 +102,11 @@ func DefaultClientConfig() ClientConfig {
 type Client struct {
 	engine *fib.Engine
 	config ClientConfig
-	mu     sync.Mutex
-	hosts  map[hostTarget]*hostPool
-	closed bool
+	// tlsConfig is config.TLSConfig with the client's ALPN offer.
+	tlsConfig *tls.Config
+	mu        sync.Mutex
+	hosts     map[hostTarget]*hostPool
+	closed    bool
 }
 
 // NewClient returns a client that dials through engine. Zero limits in config
@@ -105,7 +119,16 @@ func NewClient(engine *fib.Engine, config ClientConfig) *Client {
 	if config.MaxResponseBodyBytes <= 0 {
 		config.MaxResponseBodyBytes = defaults.MaxResponseBodyBytes
 	}
-	return &Client{engine: engine, config: config, hosts: make(map[hostTarget]*hostPool)}
+	tlsConfig := config.TLSConfig
+	if !config.DisableHTTP2 && (tlsConfig == nil || len(tlsConfig.NextProtos) == 0) {
+		if tlsConfig == nil {
+			tlsConfig = &tls.Config{}
+		} else {
+			tlsConfig = tlsConfig.Clone()
+		}
+		tlsConfig.NextProtos = []string{"h2", "http/1.1"}
+	}
+	return &Client{engine: engine, config: config, tlsConfig: tlsConfig, hosts: make(map[hostTarget]*hostPool)}
 }
 
 // Do sends req and calls callback exactly once with its response or the
@@ -130,12 +153,24 @@ func (c *Client) Do(req *stdhttp.Request, callback func(*stdhttp.Response, error
 		callback(nil, err)
 		return
 	}
+	// The body is read once and kept, since whether it travels in HTTP/1.1 or
+	// HTTP/2 framing is only known once a connection has been chosen.
+	var body []byte
+	if req.Body != nil && req.Body != stdhttp.NoBody {
+		body, err = io.ReadAll(req.Body)
+		_ = req.Body.Close()
+		if err != nil {
+			callback(nil, err)
+			return
+		}
+		req.Body = io.NopCloser(bytes.NewReader(body))
+	}
 	var buf bytes.Buffer
 	if err = req.Write(&buf); err != nil {
 		callback(nil, err)
 		return
 	}
-	r := &clientRequest{req: req, data: buf.Bytes(), callback: callback}
+	r := &clientRequest{req: req, data: buf.Bytes(), body: body, callback: callback}
 	// Either hook can fire before it has been stored, so both are stored under
 	// the lock finish reads them under.
 	r.mu.Lock()
@@ -193,6 +228,11 @@ func (c *Client) Close() {
 		h.idle = nil
 		waiting = append(waiting, h.waiting...)
 		h.waiting = nil
+		for _, cc := range h.h2 {
+			if cc.streams == 0 {
+				idle = append(idle, cc)
+			}
+		}
 	}
 	c.mu.Unlock()
 	for _, cc := range idle {
@@ -247,6 +287,13 @@ type hostPool struct {
 	dialing int
 	idle    []*clientConn
 	waiting []*clientRequest
+	// h2 holds the HTTP/2 connections that take new streams, busy or not.
+	// multiplexed records that the host has spoken HTTP/2, and probed that a
+	// connection to it has told which protocol it speaks. Until then, and
+	// for good when it is HTTP/2, one dial at a time is enough.
+	h2          []*clientConn
+	multiplexed bool
+	probed      bool
 }
 
 // assignment pairs a request with the connection that will carry it. They are
@@ -289,12 +336,21 @@ func (c *Client) dispatchLocked(h *hostPool) (work []assignment, dials int) {
 			h.waiting = h.waiting[1:]
 			continue
 		}
-		n := len(h.idle)
-		if n == 0 {
+		var cc *clientConn
+		for _, m := range h.h2 {
+			if m.streams < m.maxStreams {
+				cc = m
+				break
+			}
+		}
+		if cc != nil {
+			cc.streams++
+		} else if n := len(h.idle); n > 0 {
+			cc = h.idle[n-1]
+			h.idle = h.idle[:n-1]
+		} else {
 			break
 		}
-		cc := h.idle[n-1]
-		h.idle = h.idle[:n-1]
 		if cc.idleTimer != nil {
 			cc.idleTimer.Stop()
 			cc.idleTimer = nil
@@ -302,7 +358,12 @@ func (c *Client) dispatchLocked(h *hostPool) (work []assignment, dials int) {
 		h.waiting = h.waiting[1:]
 		work = append(work, assignment{conn: cc, req: r})
 	}
-	for need := len(h.waiting) - h.dialing; need > 0; need-- {
+	need := len(h.waiting) - h.dialing
+	if h.multiplexed || !h.probed && c.mayMultiplex(h.target) {
+		// The next connection may well be HTTP/2, and carry all of them.
+		need = min(need, 1-h.dialing)
+	}
+	for ; need > 0; need-- {
 		if c.config.MaxConnsPerHost > 0 && h.open >= c.config.MaxConnsPerHost {
 			break
 		}
@@ -315,6 +376,14 @@ func (c *Client) dispatchLocked(h *hostPool) (work []assignment, dials int) {
 		h.waiting = nil
 	}
 	return work, dials
+}
+
+// mayMultiplex reports whether a connection to target might speak HTTP/2.
+func (c *Client) mayMultiplex(target hostTarget) bool {
+	if !target.secure {
+		return c.config.UnencryptedHTTP2
+	}
+	return c.tlsConfig != nil && slices.Contains(c.tlsConfig.NextProtos, "h2")
 }
 
 func (c *Client) carryOut(h *hostPool, work []assignment, dials int) {
@@ -333,8 +402,23 @@ func (c *Client) dial(h *hostPool) {
 	done := func(_ *fib.Connection, err error) { c.dialed(cc, err) }
 	var err error
 	if h.target.secure {
-		err = fibtls.Dial(c.engine, "tcp", h.target.addr, c.config.DialTimeout, c.config.TLSConfig, cc, done)
+		// The dial is settled once the handshake has told which protocol to
+		// speak, in OnHandshake, or failed, in OnClose.
+		done = func(_ *fib.Connection, err error) {
+			if err != nil {
+				c.dialed(cc, err)
+			}
+		}
+		err = fibtls.Dial(c.engine, "tcp", h.target.addr, c.config.DialTimeout, c.tlsConfig, cc, done)
 	} else {
+		if c.config.UnencryptedHTTP2 {
+			done = func(_ *fib.Connection, err error) {
+				if err == nil {
+					cc.startH2()
+				}
+				c.dialed(cc, err)
+			}
+		}
 		err = c.engine.DialWithHandler("tcp", h.target.addr, c.config.DialTimeout, cc, done)
 	}
 	if err != nil {
@@ -347,8 +431,30 @@ func (c *Client) dial(h *hostPool) {
 // likely to have caused it, and the rest try again.
 func (c *Client) dialed(cc *clientConn, err error) {
 	h := cc.host
+	cc.mu.Lock()
+	settled := cc.settled
+	cc.settled = true
+	cc.mu.Unlock()
+	if settled {
+		return
+	}
 	c.mu.Lock()
 	h.dialing--
+	h.probed = h.probed || err == nil
+	if err == nil && cc.h2 != nil {
+		h.multiplexed = true
+		if !cc.isClosed() {
+			h.h2 = append(h.h2, cc)
+		}
+		work, dials := c.dispatchLocked(h)
+		discard := c.idleH2Locked(cc)
+		c.mu.Unlock()
+		if discard {
+			cc.discard()
+		}
+		c.carryOut(h, work, dials)
+		return
+	}
 	if err == nil {
 		c.mu.Unlock()
 		c.release(cc)
@@ -407,11 +513,62 @@ func (c *Client) release(cc *clientConn) {
 // request took it in the meantime.
 func (c *Client) expireIdle(cc *clientConn) {
 	c.mu.Lock()
-	idle := removeConn(&cc.host.idle, cc)
+	var idle bool
+	if cc.h2 != nil {
+		idle = cc.streams == 0 && cc.idleTimer != nil && removeConn(&cc.host.h2, cc)
+	} else {
+		idle = removeConn(&cc.host.idle, cc)
+	}
 	c.mu.Unlock()
 	if idle {
 		cc.discard()
 	}
+}
+
+// streamDone gives back the stream an HTTP/2 connection carried, and hands
+// the room to a waiting request.
+func (c *Client) streamDone(cc *clientConn) {
+	h := cc.host
+	c.mu.Lock()
+	cc.streams--
+	work, dials := c.dispatchLocked(h)
+	discard := c.idleH2Locked(cc)
+	c.mu.Unlock()
+	if discard {
+		cc.discard()
+	}
+	c.carryOut(h, work, dials)
+}
+
+// idleH2Locked starts the idle clock on an HTTP/2 connection left with no
+// streams, or reports that it should be closed because the client keeps no
+// more idle connections than MaxIdleConnsPerHost.
+func (c *Client) idleH2Locked(cc *clientConn) bool {
+	h := cc.host
+	if cc.streams > 0 || cc.idleTimer != nil {
+		return false
+	}
+	idle := 0
+	for _, m := range h.h2 {
+		if m.streams == 0 {
+			idle++
+		}
+	}
+	if c.closed || idle > c.config.MaxIdleConnsPerHost {
+		return removeConn(&h.h2, cc)
+	}
+	if c.config.IdleConnTimeout > 0 {
+		cc.idleTimer = time.AfterFunc(c.config.IdleConnTimeout, func() { c.expireIdle(cc) })
+	}
+	return false
+}
+
+// retire stops an HTTP/2 connection taking new streams, once the server has
+// said it is going away.
+func (c *Client) retire(cc *clientConn) {
+	c.mu.Lock()
+	removeConn(&cc.host.h2, cc)
+	c.mu.Unlock()
 }
 
 // forget drops a closed connection from its host and lets waiting requests
@@ -420,6 +577,11 @@ func (c *Client) forget(cc *clientConn) {
 	h := cc.host
 	c.mu.Lock()
 	removeConn(&h.idle, cc)
+	removeConn(&h.h2, cc)
+	if cc.idleTimer != nil {
+		cc.idleTimer.Stop()
+		cc.idleTimer = nil
+	}
 	h.open--
 	work, dials := c.dispatchLocked(h)
 	c.mu.Unlock()
@@ -438,14 +600,20 @@ func removeConn(conns *[]*clientConn, cc *clientConn) bool {
 
 // clientRequest is one call to Do, from the queue to its callback.
 type clientRequest struct {
-	req      *stdhttp.Request
+	req *stdhttp.Request
+	// data is the request in HTTP/1.1 framing, and body its body alone, which
+	// is what HTTP/2 sends after the header block.
 	data     []byte
+	body     []byte
 	callback func(*stdhttp.Response, error)
 	done     atomic.Bool
 	// retried records that the request has already been sent again once, after
 	// a reused connection turned out to be closed.
 	retried bool
-	mu      sync.Mutex
+	// streamID is the HTTP/2 stream carrying the request, guarded by that
+	// connection's lock.
+	streamID uint32
+	mu       sync.Mutex
 	// conn is the connection carrying the request, so that abandoning the
 	// request can also abandon its half-finished exchange. timer and
 	// stopContext are the hooks that abandon it. Guarded by mu.
@@ -483,9 +651,15 @@ func (r *clientRequest) abort(err error) {
 	cc := r.conn
 	r.conn = nil
 	r.mu.Unlock()
-	if cc != nil {
-		cc.discard()
+	if cc == nil {
+		return
 	}
+	if cc.h2 != nil {
+		// Only this request's stream is abandoned, not the connection.
+		cc.h2.cancel(r)
+		return
+	}
+	cc.discard()
 }
 
 // attach records the connection carrying the request. It reports false if the
@@ -535,6 +709,16 @@ type clientConn struct {
 	closed   bool
 	// idleTimer is armed while the connection is idle. Guarded by Client.mu.
 	idleTimer *time.Timer
+	// settled records that the dial has been reported to the client, which
+	// for TLS happens once the handshake is done. Guarded by mu.
+	settled bool
+	// h2 is set once the connection is known to speak HTTP/2, before it
+	// carries anything, and never changes after. streams counts the streams
+	// it carries or has been given, and maxStreams how many the server
+	// allows. Both are guarded by Client.mu.
+	h2         *h2ClientConn
+	streams    int
+	maxStreams int
 }
 
 func (cc *clientConn) isClosed() bool {
@@ -546,6 +730,10 @@ func (cc *clientConn) isClosed() bool {
 // send puts r on the connection. A connection that closed in the meantime
 // hands r back to the queue.
 func (cc *clientConn) send(r *clientRequest) {
+	if cc.h2 != nil {
+		cc.h2.send(r)
+		return
+	}
 	cc.mu.Lock()
 	if cc.closed {
 		cc.mu.Unlock()
@@ -583,7 +771,19 @@ func (cc *clientConn) OnOpen(conn *fib.Connection) { cc.conn = conn }
 
 func (cc *clientConn) OnPriorityData(*fib.Connection, []byte) {}
 
+// OnHandshake settles a TLS dial, with the protocol ALPN chose.
+func (cc *clientConn) OnHandshake(_ *fib.Connection, state tls.ConnectionState) {
+	if state.NegotiatedProtocol == "h2" {
+		cc.startH2()
+	}
+	cc.client.dialed(cc, nil)
+}
+
 func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
+	if cc.h2 != nil {
+		cc.h2.feed(data)
+		return
+	}
 	cc.mu.Lock()
 	r := cc.current
 	closed := cc.closed
@@ -625,6 +825,28 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 }
 
 func (cc *clientConn) OnClose(_ *fib.Connection, err error) {
+	cc.mu.Lock()
+	settled := cc.settled
+	cc.mu.Unlock()
+	if !settled {
+		// A TLS handshake that failed: the dial failed.
+		cc.mu.Lock()
+		cc.closed = true
+		cc.mu.Unlock()
+		if err == nil {
+			err = io.ErrUnexpectedEOF
+		}
+		cc.client.dialed(cc, err)
+		return
+	}
+	if cc.h2 != nil {
+		cc.mu.Lock()
+		cc.closed = true
+		cc.mu.Unlock()
+		cc.client.forget(cc)
+		cc.h2.shutdown(err)
+		return
+	}
 	cc.mu.Lock()
 	r := cc.current
 	cc.current = nil

@@ -270,8 +270,8 @@ err = fibtls.Dial(engine, "tcp", "example.com:443", 3*time.Second, tlsConfig, ha
 
 ## HTTP 子 package
 
-`http` package 在原始连接之上提供 HTTP/1.0、HTTP/1.1 的增量解析和响应处理，
-支持 TCP 分包/粘包、流水线请求、`Content-Length`、chunked body、trailer、
+`http` package 在原始连接之上提供 HTTP/1.0、HTTP/1.1 和 HTTP/2 的增量解析和响应
+处理，支持 TCP 分包/粘包、流水线请求、`Content-Length`、chunked body、trailer、
 keep-alive 以及请求大小限制：
 
 ```go
@@ -290,9 +290,38 @@ cd go
 go run ./examples/http/nontls/server   # 另开终端：go run ./examples/http/nontls/client
 ```
 
+### HTTP/2
+
+同一个 `ServerHandler` 同时服务 HTTP/1 和 HTTP/2，不需要额外配置：连接以 HTTP/2
+preface 开头时按 HTTP/2 处理，否则按 HTTP/1。这覆盖了两种场景：
+
+- TLS + ALPN（h2）：用 `fibhttp.ConfigureTLS` 让 TLS 配置在 ALPN 中优先提供 `h2`，
+  浏览器、`net/http` 等客户端就会选择 HTTP/2；不支持 h2 的客户端继续走 HTTP/1.1。
+- 明文 HTTP/2（h2c，prior knowledge）：客户端直接发送 preface 即可。
+
+```go
+tlsConfig = fibhttp.ConfigureTLS(tlsConfig) // ALPN: h2, http/1.1
+server, err := fib.Bind(config, fibtls.NewServer(tlsConfig, fibhttp.NewHandler(handler)))
+```
+
+- Handler 不用改：每个 stream 就是一个普通的 `*http.Request`（`Proto` 为 `HTTP/2.0`），
+  用 `Context.Respond`/`WriteResponse` 回复即可，响应会被编成该 stream 的 HEADERS/DATA
+  帧。HTTP/2 连接上不要直接调用 `Context.Conn.Send`。
+- 多路复用：一个连接上的多个 stream 并发进行，handler 可以在其他 goroutine 中稍后
+  回复（异步响应），不同 stream 的响应互不阻塞；`Response.Close` 对 HTTP/2 无效。
+- 流控：遵守对端的连接级与 stream 级窗口，窗口不足的响应 body 暂存，等 WINDOW_UPDATE
+  后继续发送；接收方向每个 stream 窗口 1MB、连接窗口 16MB，按消费量自动补充。
+- 实现了 HPACK（含 Huffman 与动态表）、CONTINUATION、trailer、多个 cookie 字段合并、
+  PING、SETTINGS、RST_STREAM、GOAWAY，以及 RFC 9113 的请求合法性校验（非法请求用
+  RST_STREAM 拒绝，协议错误用 GOAWAY 关闭连接）。
+- `Config.MaxConcurrentStreams` 限制单连接并发 stream 数（默认 250，超出的 stream 被
+  REFUSED_STREAM 拒绝）；`MaxHeaderBytes`、`MaxBodyBytes` 同样作用于 HTTP/2，超限时
+  返回 431/413。`Config.DisableHTTP2` 关闭 HTTP/2，只服务 HTTP/1。
+- 不支持 server push、HTTP/1.1 `Upgrade: h2c`（RFC 9113 已废弃）和 1xx 中间响应。
+
 ### 异步 HTTP client
 
-`http.Client` 在 Engine 上发送 HTTP/1.1 请求，调用方不会阻塞。响应由 Engine 的
+`http.Client` 在 Engine 上发送 HTTP/1.1 和 HTTP/2 请求，调用方不会阻塞。响应由 Engine 的
 worker 读取，body 完整缓存后再交给回调；也可以用 `Go` 拿到 Future 等待结果：
 
 ```go
@@ -311,15 +340,22 @@ resp, err := client.Go(req).Wait() // Future：Wait 阻塞，Done() 可用于 se
 - 支持 `http://` 和 `https://`；https 使用 `ClientConfig.TLSConfig`（nil 表示默认
   配置，未设置 ServerName 时取 URL 的 host）。其他 scheme 返回 `ErrUnsupportedScheme`。
   http 与 https 即使地址相同也各自使用独立的连接池。
+- HTTP/2：https 默认在 ALPN 中提供 `h2`、`http/1.1`（`TLSConfig.NextProtos` 已设置时
+  以它为准），服务端选择 h2 时自动走 HTTP/2，一个连接并发承载多个请求（数量受服务端
+  `MAX_CONCURRENT_STREAMS` 限制），对同一 host 只保持必要数量的连接。
+  `ClientConfig.DisableHTTP2` 强制 HTTP/1.1；`ClientConfig.UnencryptedHTTP2` 让 http://
+  以 prior knowledge 方式直接使用明文 HTTP/2（h2c）。HTTP/2 上超时或取消只会用
+  RST_STREAM 结束对应 stream，不影响同连接上的其他请求；收到 GOAWAY 或
+  REFUSED_STREAM 时，服务端未处理的请求会自动在新连接上重发。
 - 每个 host:port 维护连接池：keep-alive 复用，`MaxConnsPerHost` 限制同时打开或正在
   建立的连接数，超出的请求排队；`MaxIdleConnsPerHost`、`IdleConnTimeout` 控制空闲
-  连接的保留。每条连接同时只跑一个请求，不做 pipelining。
+  连接的保留。HTTP/1.1 连接同时只跑一个请求，不做 pipelining。
 - 支持 `Content-Length`、chunked（含 trailer）、以关闭连接为结束的 body，HEAD、
   204、304 不读 body，1xx 中间响应自动跳过。`MaxResponseHeaderBytes`、
   `MaxResponseBodyBytes` 限制单个响应大小。
 - `Timeout` 覆盖从 `Do` 到响应完整的全过程（排队、建连、发送、读取），超时错误满足
   `errors.Is(err, os.ErrDeadlineExceeded)`；取消请求的 context 同样会结束请求。被
-  放弃的请求所在连接会被关闭。
+  放弃的请求所在的 HTTP/1.1 连接会被关闭。
 - 复用的空闲连接如果已被服务端关闭、且没有收到任何响应字节，GET/HEAD/OPTIONS/TRACE
   会在新连接上自动重试一次；其他方法直接返回错误。
 - 回调可能在任意 goroutine 上执行：成功的响应在读取它的 worker 上回调，超时和取消在

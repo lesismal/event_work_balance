@@ -29,10 +29,16 @@ type Response struct {
 	Close      bool
 }
 
+// Context is the connection a request arrived on. Respond with Respond or
+// WriteResponse rather than by sending on Conn: on an HTTP/2 connection the
+// response is framed for its stream, and bytes sent on Conn directly would
+// corrupt the connection.
 type Context struct {
 	Conn    *fib.Connection
 	Request *stdhttp.Request
 	wrote   bool
+	// stream is the HTTP/2 stream the request arrived on, or nil for HTTP/1.
+	stream *h2ServerStream
 }
 
 func (c *Context) Respond(status int, contentType string, body []byte) error {
@@ -49,6 +55,14 @@ func (c *Context) WriteResponse(response Response) error {
 	}
 	if response.StatusCode == 0 {
 		response.StatusCode = stdhttp.StatusOK
+	}
+	if c.stream != nil {
+		// HTTP/2 multiplexes the connection, so Close does not apply to it.
+		if err := c.stream.respond(c.Request, response); err != nil {
+			return err
+		}
+		c.wrote = true
+		return nil
 	}
 	closeConnection := response.Close || c.Request.Close
 	data, err := marshalResponse(c.Request, response, closeConnection)
@@ -98,10 +112,23 @@ func (h *ServerHandler) newParser(c *fib.Connection) *Parser {
 }
 
 func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
-	parser, _ := c.Attachment().(*Parser)
-	if parser == nil {
+	var parser *Parser
+	switch state := c.Attachment().(type) {
+	case *h2ServerConn:
+		state.feed(data)
+		return
+	case *Parser:
+		parser = state
+	default:
 		parser = h.newParser(c)
 		c.SetAttachment(parser)
+	}
+	if !parser.sniffed {
+		if h.config.DisableHTTP2 {
+			parser.sniffed = true
+		} else if data = h.sniff(c, parser, data); data == nil {
+			return
+		}
 	}
 	requests, err := parser.Feed(data)
 	for _, request := range requests {
@@ -130,8 +157,31 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 	}
 }
 
+// sniff tells HTTP/2 from HTTP/1 by whether the connection opens with the
+// HTTP/2 preface. It returns the bytes to parse as HTTP/1, or nil when they
+// are HTTP/2 or too few to tell yet.
+func (h *ServerHandler) sniff(c *fib.Connection, parser *Parser, data []byte) []byte {
+	parser.buffer = append(parser.buffer, data...)
+	n := min(len(parser.buffer), len(h2Preface))
+	if string(parser.buffer[:n]) == h2Preface[:n] {
+		if n < len(h2Preface) {
+			return nil
+		}
+		sc := newH2ServerConn(h, c, parser.remoteAddr)
+		c.SetAttachment(sc)
+		sc.start()
+		sc.feed(parser.TakeBuffered())
+		return nil
+	}
+	parser.sniffed = true
+	return parser.TakeBuffered()
+}
+
 func (h *ServerHandler) OnPriorityData(*fib.Connection, []byte) {}
 func (h *ServerHandler) OnClose(c *fib.Connection, _ error) {
+	if sc, ok := c.Attachment().(*h2ServerConn); ok {
+		sc.shutdown()
+	}
 	c.SetAttachment(nil)
 }
 
