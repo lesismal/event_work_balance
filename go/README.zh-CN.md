@@ -238,7 +238,8 @@ resp, err := client.Go(req).Wait() // Future：Wait 阻塞，Done() 可用于 se
 ## WebSocket 子 package
 
 `websocket` package 实现 RFC 6455 Upgrade 握手、增量帧解析、
-分片消息重组、客户端掩码校验、Ping/Pong、Close 握手、子协议协商和消息大小限制：
+分片消息重组、客户端掩码校验、Ping/Pong、Close 握手、子协议协商、消息大小限制和
+permessage-deflate 压缩（RFC 7692）：
 
 ```go
 handler := websocket.NewHandler(websocket.HandlerFuncs{
@@ -249,12 +250,28 @@ handler := websocket.NewHandler(websocket.HandlerFuncs{
 server, err := fib.Bind(config, handler)
 ```
 
-运行 WebSocket echo 示例：
+运行 WebSocket echo 示例（`-compress` 开启压缩）：
 
 ```sh
 cd go
 go run ./examples/websocket_server
 ```
+
+### permessage-deflate 压缩
+
+`Config.EnableCompression`（server）和 `DialerConfig.EnableCompression`（client）
+开启 permessage-deflate，默认关闭。协商成功后 Text/Binary 消息压缩发送，控制帧不压缩；
+收到的压缩消息解压后再交给 `OnMessage`，未协商时收到 RSV1 帧按协议错误以 1002 关闭。
+
+- 发送端总是不保留上下文（server 响应里始终带 `server_no_context_takeover`，client
+  offer 里带 `client_no_context_takeover`），每条消息从 `sync.Pool` 借一个
+  `flate.BestSpeed` 压缩器，连接本身不持有压缩器。
+- 对端保留上下文时，连接保存最近 32 KiB 解压结果作为下一条消息的字典；对端声明
+  no_context_takeover 时不保存。
+- 对端限制窗口（`server_max_window_bits` / `client_max_window_bits` 为 8–15）时，
+  消息按窗口大小分段、各段独立压缩后拼成一个 DEFLATE 流，保证回溯距离不超过窗口。
+- `MaxMessageBytes` 限制的是解压后的大小，超过时以 1009 关闭；解压失败或解压后的
+  Text 不是合法 UTF-8 时以 1007 关闭。
 
 ### 异步 WebSocket client
 

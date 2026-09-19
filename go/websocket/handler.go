@@ -25,7 +25,11 @@ type Config struct {
 	MaxMessageBytes int64
 	Subprotocols    []string
 	CheckOrigin     func(*stdhttp.Request) bool
-	HTTP            epollhttp.Config
+	// EnableCompression accepts a client's offer of permessage-deflate (RFC
+	// 7692). Messages are then sent compressed, and a client may send its own
+	// compressed. MaxMessageBytes bounds a message once decompressed.
+	EnableCompression bool
+	HTTP              epollhttp.Config
 }
 
 func DefaultConfig() Config {
@@ -68,7 +72,11 @@ type Connection struct {
 	conn        *fib.Connection
 	subprotocol string
 	// client marks the dialing side, whose frames must be masked.
-	client     bool
+	client bool
+	// compress says permessage-deflate is in use, and windowBits bounds how
+	// far back what this side sends may refer.
+	compress   bool
+	windowBits int
 	closeSent  atomic.Bool
 	closeState atomic.Pointer[connectionCloseState]
 }
@@ -118,18 +126,27 @@ func (c *Connection) writeFrame(opcode Opcode, payload []byte) error {
 	if c.closeSent.Load() {
 		return errors.New("websocket: close already sent")
 	}
-	return c.sendFrame(opcode, payload)
+	if c.compress && (opcode == Text || opcode == Binary) {
+		compressor, compressed := compressMessage(payload, c.windowBits)
+		err := c.sendFrame(opcode, compressed, true)
+		compressor.release()
+		return err
+	}
+	return c.sendFrame(opcode, payload, false)
 }
 
 // sendFrame frames payload for the peer. A server's frames go out as they are.
 // A client has to mask every frame with a key the server cannot predict (RFC
 // 6455 section 5.3), and masking rewrites the payload, which is the caller's
 // buffer and not this connection's to scramble, so a client frame is built in a
-// buffer of its own.
-func (c *Connection) sendFrame(opcode Opcode, payload []byte) error {
+// buffer of its own. compressed sets RSV1, which marks a compressed message.
+func (c *Connection) sendFrame(opcode Opcode, payload []byte, compressed bool) error {
 	header, headerLen, err := frameHeader(opcode, len(payload))
 	if err != nil {
 		return err
+	}
+	if compressed {
+		header[0] |= 0x40
 	}
 	if !c.client {
 		return c.conn.SendParts(header[:headerLen], payload)
@@ -153,7 +170,7 @@ func (c *Connection) sendClose(payload []byte) error {
 	}
 	code, reason := closePayload(payload)
 	c.closeState.Store(&connectionCloseState{code: code, reason: reason})
-	if err := c.sendFrame(Close, payload); err != nil {
+	if err := c.sendFrame(Close, payload, false); err != nil {
 		return err
 	}
 	c.conn.CloseAfterSend()
@@ -225,13 +242,13 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 		return
 	}
 	if !h.needsRequest && state.handshake == nil {
-		key, subprotocol, remainder, complete, err := h.validateMinimalHandshake(data)
+		key, result, remainder, complete, err := h.validateMinimalHandshake(data)
 		if err != nil {
 			h.reject(c, nil, stdhttp.StatusBadRequest)
 			return
 		}
 		if complete {
-			h.upgrade(c, state, nil, key, subprotocol, remainder)
+			h.upgrade(c, state, nil, key, result, remainder)
 			return
 		}
 	}
@@ -255,22 +272,42 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 	if !complete {
 		return
 	}
-	subprotocol, err := h.validateHandshake(request)
+	result, err := h.validateHandshake(request)
 	if err != nil {
 		h.reject(c, request, stdhttp.StatusBadRequest)
 		return
 	}
 	key := []byte(request.Header.Get("Sec-Websocket-Key"))
-	h.upgrade(c, state, request, key, subprotocol, remainder)
+	h.upgrade(c, state, request, key, result, remainder)
 }
 
-func (h *ServerHandler) upgrade(c *fib.Connection, state *connectionState, request *stdhttp.Request, key []byte, subprotocol string, remainder []byte) {
-	if err := sendHandshakeResponse(c, key, subprotocol); err != nil {
+// handshakeResult is what the server agreed to in the opening handshake.
+type handshakeResult struct {
+	subprotocol string
+	// extensions is the Sec-WebSocket-Extensions response, empty when no
+	// extension is in use.
+	extensions string
+	deflate    deflateParams
+}
+
+// negotiateExtensions accepts what the server supports of the client's offers.
+func (h *ServerHandler) negotiateExtensions(result *handshakeResult, offers []string) {
+	if h.config.EnableCompression && len(offers) != 0 {
+		result.extensions, result.deflate = acceptDeflateOffer(offers)
+	}
+}
+
+func (h *ServerHandler) upgrade(c *fib.Connection, state *connectionState, request *stdhttp.Request, key []byte, result handshakeResult, remainder []byte) {
+	if err := sendHandshakeResponse(c, key, result); err != nil {
 		c.Close()
 		return
 	}
-	state.websocket = Connection{conn: c, subprotocol: subprotocol}
+	compress := result.extensions != ""
+	state.websocket = Connection{conn: c, subprotocol: result.subprotocol, compress: compress,
+		windowBits: result.deflate.windowBits}
 	state.wsParser.maxMessageBytes = h.config.MaxMessageBytes
+	state.wsParser.deflate = compress
+	state.wsParser.contextTakeover = compress && result.deflate.peerContextTakeover
 	state.upgraded = true
 	if state.handshake != nil && remainder == nil {
 		remainder = state.handshake.TakeBuffered()
@@ -331,7 +368,18 @@ func closeParserError(ws *Connection, err error) {
 	_ = ws.sendClose(payload[:])
 }
 
-func (h *ServerHandler) validateHandshake(request *stdhttp.Request) (string, error) {
+func (h *ServerHandler) validateHandshake(request *stdhttp.Request) (handshakeResult, error) {
+	var result handshakeResult
+	var err error
+	result.subprotocol, err = h.validateHandshakeRequest(request)
+	if err != nil {
+		return handshakeResult{}, err
+	}
+	h.negotiateExtensions(&result, request.Header.Values("Sec-Websocket-Extensions"))
+	return result, nil
+}
+
+func (h *ServerHandler) validateHandshakeRequest(request *stdhttp.Request) (string, error) {
 	if request.Method != stdhttp.MethodGet || request.ProtoMajor != 1 || request.ProtoMinor < 1 {
 		return "", ErrProtocol
 	}
@@ -369,50 +417,51 @@ func (h *ServerHandler) validateHandshake(request *stdhttp.Request) (string, err
 	return "", nil
 }
 
-func (h *ServerHandler) validateMinimalHandshake(data []byte) ([]byte, string, []byte, bool, error) {
+func (h *ServerHandler) validateMinimalHandshake(data []byte) ([]byte, handshakeResult, []byte, bool, error) {
 	headerAt := bytes.Index(data, []byte("\r\n\r\n"))
 	if headerAt < 0 {
 		if len(data) > h.config.HTTP.MaxHeaderBytes {
-			return nil, "", nil, false, errHandshakeHeaderTooLarge
+			return nil, handshakeResult{}, nil, false, errHandshakeHeaderTooLarge
 		}
-		return nil, "", nil, false, nil
+		return nil, handshakeResult{}, nil, false, nil
 	}
 	headerEnd := headerAt + 4
 	if headerEnd > h.config.HTTP.MaxHeaderBytes {
-		return nil, "", nil, false, errHandshakeHeaderTooLarge
+		return nil, handshakeResult{}, nil, false, errHandshakeHeaderTooLarge
 	}
 	lineEnd := bytes.Index(data[:headerAt], []byte("\r\n"))
 	if lineEnd <= len("GET  HTTP/1.1") || !bytes.HasPrefix(data[:lineEnd], []byte("GET ")) ||
 		!bytes.HasSuffix(data[:lineEnd], []byte(" HTTP/1.1")) {
-		return nil, "", nil, false, errMalformedHandshake
+		return nil, handshakeResult{}, nil, false, errMalformedHandshake
 	}
 	requestURI := data[len("GET ") : lineEnd-len(" HTTP/1.1")]
 	if !validMinimalRequestURI(requestURI) {
-		return nil, "", nil, false, errMalformedHandshake
+		return nil, handshakeResult{}, nil, false, errMalformedHandshake
 	}
 
 	var key []byte
 	var subprotocol string
+	var offers []string
 	hostSeen, connectionUpgrade, upgradeWebsocket, version13 := false, false, false, false
 	for offset := lineEnd + 2; offset < headerAt; {
 		relativeEnd := bytes.Index(data[offset:headerAt+2], []byte("\r\n"))
 		if relativeEnd <= 0 {
-			return nil, "", nil, false, errMalformedHandshake
+			return nil, handshakeResult{}, nil, false, errMalformedHandshake
 		}
 		line := data[offset : offset+relativeEnd]
 		offset += relativeEnd + 2
 		colon := bytes.IndexByte(line, ':')
 		if colon <= 0 || line[0] == ' ' || line[0] == '\t' || !validTokenBytes(line[:colon]) {
-			return nil, "", nil, false, errMalformedHandshake
+			return nil, handshakeResult{}, nil, false, errMalformedHandshake
 		}
 		name, value := line[:colon], trimOWS(line[colon+1:])
 		if !validHeaderValue(value) {
-			return nil, "", nil, false, errMalformedHandshake
+			return nil, handshakeResult{}, nil, false, errMalformedHandshake
 		}
 		switch {
 		case bytes.EqualFold(name, []byte("Host")):
 			if hostSeen || len(value) == 0 {
-				return nil, "", nil, false, errMalformedHandshake
+				return nil, handshakeResult{}, nil, false, errMalformedHandshake
 			}
 			hostSeen = true
 		case bytes.EqualFold(name, []byte("Connection")):
@@ -428,14 +477,18 @@ func (h *ServerHandler) validateMinimalHandshake(data []byte) ([]byte, string, [
 		case bytes.EqualFold(name, []byte("Sec-WebSocket-Protocol")):
 			selected, valid := h.selectMinimalSubprotocol(value)
 			if !valid {
-				return nil, "", nil, false, ErrProtocol
+				return nil, handshakeResult{}, nil, false, ErrProtocol
 			}
 			if subprotocol == "" {
 				subprotocol = selected
 			}
+		case bytes.EqualFold(name, []byte("Sec-WebSocket-Extensions")):
+			if h.config.EnableCompression {
+				offers = append(offers, string(value))
+			}
 		case bytes.EqualFold(name, []byte("Content-Length")), bytes.EqualFold(name, []byte("Transfer-Encoding")):
 			if len(value) != 0 {
-				return nil, "", nil, false, errMalformedHandshake
+				return nil, handshakeResult{}, nil, false, errMalformedHandshake
 			}
 		}
 	}
@@ -443,9 +496,11 @@ func (h *ServerHandler) validateMinimalHandshake(data []byte) ([]byte, string, [
 	n, decodeErr := base64.StdEncoding.Decode(decodedKey[:], key)
 	if !hostSeen || !connectionUpgrade || !upgradeWebsocket || !version13 ||
 		decodeErr != nil || len(key) != 24 || n != len(decodedKey) {
-		return nil, "", nil, false, ErrProtocol
+		return nil, handshakeResult{}, nil, false, ErrProtocol
 	}
-	return key, subprotocol, data[headerEnd:], true, nil
+	result := handshakeResult{subprotocol: subprotocol}
+	h.negotiateExtensions(&result, offers)
+	return key, result, data[headerEnd:], true, nil
 }
 
 func (h *ServerHandler) selectMinimalSubprotocol(value []byte) (string, bool) {
@@ -555,20 +610,27 @@ func (h *ServerHandler) releaseHandshakeParser(state *connectionState) {
 
 var handshakeResponsePrefix = []byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ")
 
-func sendHandshakeResponse(c *fib.Connection, key []byte, subprotocol string) error {
+func sendHandshakeResponse(c *fib.Connection, key []byte, result handshakeResult) error {
 	var accept [28]byte
 	websocketAccept(accept[:], key)
-	if subprotocol == "" {
+	subprotocol := result.subprotocol
+	if subprotocol == "" && result.extensions == "" {
 		var tail [32]byte
 		copy(tail[:], accept[:])
 		copy(tail[len(accept):], "\r\n\r\n")
 		return c.SendParts(handshakeResponsePrefix, tail[:])
 	}
-	response := make([]byte, 0, len(handshakeResponsePrefix)+len(accept)+31+len(subprotocol))
+	response := make([]byte, 0, len(handshakeResponsePrefix)+len(accept)+60+len(subprotocol)+len(result.extensions))
 	response = append(response, handshakeResponsePrefix...)
 	response = append(response, accept[:]...)
-	response = append(response, "\r\nSec-WebSocket-Protocol: "...)
-	response = append(response, subprotocol...)
+	if subprotocol != "" {
+		response = append(response, "\r\nSec-WebSocket-Protocol: "...)
+		response = append(response, subprotocol...)
+	}
+	if result.extensions != "" {
+		response = append(response, "\r\nSec-WebSocket-Extensions: "...)
+		response = append(response, result.extensions...)
+	}
 	response = append(response, "\r\n\r\n"...)
 	return c.SendOwned(response)
 }

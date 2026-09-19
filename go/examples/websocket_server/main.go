@@ -13,9 +13,12 @@ import (
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
+	compress := flag.Bool("compress", false, "accept permessage-deflate compression")
 	flag.Parse()
 
-	handler := websocket.NewHandler(websocket.HandlerFuncs{
+	wsConfig := websocket.DefaultConfig()
+	wsConfig.EnableCompression = *compress
+	handler := websocket.NewHandlerWithConfig(wsConfig, websocket.HandlerFuncs{
 		Open: func(_ *websocket.Connection, request *stdhttp.Request) {
 			fmt.Printf("WebSocket opened: %s\n", request.RemoteAddr)
 		},

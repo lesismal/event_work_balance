@@ -54,8 +54,9 @@ type Event struct {
 }
 
 type fragmentedMessage struct {
-	opcode Opcode
-	data   []byte
+	opcode     Opcode
+	compressed bool
+	data       []byte
 }
 
 type Parser struct {
@@ -75,6 +76,14 @@ type Parser struct {
 	textChecked    int
 	pendingConsume int
 	borrowedBuffer bool
+	// deflate says permessage-deflate was negotiated, so a data message may
+	// arrive compressed. contextTakeover says the peer compresses each message
+	// with the context of the ones before it, whose tail window then keeps.
+	deflate         bool
+	contextTakeover bool
+	window          []byte
+	// inflated holds the last message FeedOneBorrowed decompressed.
+	inflated *frameBuffer
 }
 
 func NewParser(maxMessageBytes int64) *Parser {
@@ -108,6 +117,8 @@ func (p *Parser) Reset() {
 	}
 	p.text.reset()
 	p.textChecked = 0
+	p.window = nil
+	p.releaseInflated()
 	p.pendingConsume = 0
 	p.borrowedBuffer = false
 	p.borrowedTail = nil
@@ -153,6 +164,7 @@ func (p *Parser) ReleaseBorrowed() {
 		p.pendingConsume = 0
 	}
 	p.borrowedTail = nil
+	p.releaseInflated()
 	if p.borrowedBuffer {
 		p.buffer = nil
 		p.borrowedBuffer = false
@@ -210,6 +222,8 @@ func (p *Parser) feedOne(data []byte, borrowPayload bool) (Event, bool, error) {
 			p.fragment = nil
 			p.text.reset()
 			p.textChecked = 0
+			p.window = nil
+			p.releaseInflated()
 			return Event{}, false, err
 		}
 		if !complete {
@@ -333,7 +347,11 @@ func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 	fin := first&0x80 != 0
 	opcode := Opcode(first & 0x0f)
 	masked := second&0x80 != 0
-	if first&0x70 != 0 || masked == p.fromServer {
+	// RSV1 marks the first frame of a compressed message (RFC 7692 section
+	// 6), and only once permessage-deflate is in use.
+	compressed := first&0x40 != 0
+	if first&0x30 != 0 || masked == p.fromServer ||
+		(compressed && (!p.deflate || (opcode != Text && opcode != Binary))) {
 		return Event{}, false, false, ErrProtocol
 	}
 	control := opcode >= 0x8
@@ -393,7 +411,9 @@ func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 		mask = p.buffer[offset : offset+4]
 		offset += 4
 	}
-	text := opcode == Text || (opcode == Continuation && p.fragment.opcode == Text)
+	// A compressed message's text is checked once it is decompressed.
+	text := (opcode == Text && !compressed) ||
+		(opcode == Continuation && p.fragment.opcode == Text && !p.fragment.compressed)
 	if payloadLen > uint64(len(p.buffer)-offset) {
 		if text && !p.checkPartialText(p.buffer[offset:], mask) {
 			return Event{}, false, false, ErrInvalidPayload
@@ -431,6 +451,17 @@ func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 		return Event{Opcode: opcode, Payload: payload}, true, true, nil
 	}
 	if opcode == Text || opcode == Binary {
+		if fin && compressed {
+			payload, err := p.inflate(payload, borrowPayload)
+			if err != nil {
+				return Event{}, false, false, err
+			}
+			if opcode == Text && !utf8.Valid(payload) {
+				return Event{}, false, false, ErrInvalidPayload
+			}
+			p.finishFrame(frameEnd, borrowPayload)
+			return Event{Opcode: opcode, Payload: payload}, true, true, nil
+		}
 		if fin {
 			if text {
 				if checked == 0 {
@@ -448,7 +479,7 @@ func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 		if text && !p.text.write(payload[checked:]) {
 			return Event{}, false, false, ErrInvalidPayload
 		}
-		p.fragment = &fragmentedMessage{opcode: opcode, data: append([]byte(nil), payload...)}
+		p.fragment = &fragmentedMessage{opcode: opcode, compressed: compressed, data: append([]byte(nil), payload...)}
 		p.consume(frameEnd)
 		return Event{}, false, true, nil
 	}
@@ -461,9 +492,58 @@ func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 		return Event{}, false, true, nil
 	}
 	event := Event{Opcode: p.fragment.opcode, Payload: p.fragment.data}
+	if p.fragment.compressed {
+		var err error
+		if event.Payload, err = p.inflate(event.Payload, borrowPayload); err != nil {
+			return Event{}, false, false, err
+		}
+		if event.Opcode == Text && !utf8.Valid(event.Payload) {
+			return Event{}, false, false, ErrInvalidPayload
+		}
+	}
 	p.text.reset()
 	p.fragment = nil
 	return event, true, true, nil
+}
+
+// inflate decompresses a message. For FeedOneBorrowed it decompresses into a
+// pooled array the parser holds until ReleaseBorrowed, since the payload need
+// only last until the next parser call; Feed hands each message out, so each
+// gets an array of its own.
+func (p *Parser) inflate(compressed []byte, borrowed bool) ([]byte, error) {
+	var dst []byte
+	if borrowed {
+		if p.inflated == nil {
+			p.inflated = frameBuffers.Get().(*frameBuffer)
+		}
+		dst = p.inflated.data[:0]
+	}
+	var window []byte
+	if p.contextTakeover {
+		window = p.window
+	}
+	message, err := decompressMessage(dst, compressed, window, p.maxMessageBytes)
+	if err != nil {
+		return nil, err
+	}
+	if borrowed {
+		p.inflated.data = message
+	}
+	if p.contextTakeover {
+		p.window = keepWindow(p.window, message)
+	}
+	return message, nil
+}
+
+func (p *Parser) releaseInflated() {
+	if p.inflated == nil {
+		return
+	}
+	if cap(p.inflated.data) <= maxRetainedFrameBuffer {
+		p.inflated.data = p.inflated.data[:0]
+		frameBuffers.Put(p.inflated)
+	}
+	p.inflated = nil
 }
 
 // checkPartialText validates the payload bytes of an incomplete text frame

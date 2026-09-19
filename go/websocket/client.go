@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,6 +47,9 @@ type DialerConfig struct {
 	MaxMessageBytes int64
 	// MaxHandshakeBytes bounds the server's handshake response header.
 	MaxHandshakeBytes int
+	// EnableCompression offers the server permessage-deflate (RFC 7692). If
+	// the server accepts, messages are sent compressed and may arrive so.
+	EnableCompression bool
 }
 
 func DefaultDialerConfig() DialerConfig {
@@ -199,6 +203,9 @@ func (d *Dialer) handshakeRequest(rawURL string, header stdhttp.Header) (*stdhtt
 	for _, protocol := range d.config.Subprotocols {
 		h.Add("Sec-WebSocket-Protocol", protocol)
 	}
+	if d.config.EnableCompression {
+		h.Set("Sec-WebSocket-Extensions", deflateOffer)
+	}
 	// The request goes on the wire as http://, which is what the handshake is.
 	target := *u
 	target.Scheme = "http"
@@ -310,7 +317,7 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 	}
 	_ = resp.Body.Close()
 	resp.Body = stdhttp.NoBody
-	subprotocol, err := cc.checkResponse(resp)
+	subprotocol, deflate, compress, err := cc.checkResponse(resp)
 	if err != nil {
 		cc.fail(resp, err, false)
 		return
@@ -322,8 +329,10 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 	// read; they are the connection's first.
 	remainder := cc.response[headerEnd:]
 	cc.response = nil
-	cc.ws = Connection{conn: conn, subprotocol: subprotocol, client: true}
-	cc.parser = Parser{maxMessageBytes: cc.dialer.config.MaxMessageBytes, fromServer: true}
+	cc.ws = Connection{conn: conn, subprotocol: subprotocol, client: true, compress: compress,
+		windowBits: deflate.windowBits}
+	cc.parser = Parser{maxMessageBytes: cc.dialer.config.MaxMessageBytes, fromServer: true, deflate: compress,
+		contextTakeover: compress && deflate.peerContextTakeover}
 	cc.upgraded.Store(true)
 	cc.handler.OnOpen(&cc.ws, cc.req)
 	cc.done(&cc.ws, resp, nil)
@@ -333,25 +342,35 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 }
 
 // checkResponse confirms that the server switched protocols, answered this
-// handshake's own key, and chose nothing that was not offered.
-func (cc *clientConn) checkResponse(resp *stdhttp.Response) (string, error) {
+// handshake's own key, and chose nothing that was not offered. compress
+// reports that the server accepted permessage-deflate, with deflate its
+// parameters.
+func (cc *clientConn) checkResponse(resp *stdhttp.Response) (subprotocol string, deflate deflateParams, compress bool, err error) {
+	extensions := resp.Header.Values("Sec-Websocket-Extensions")
 	switch {
 	case resp.StatusCode != stdhttp.StatusSwitchingProtocols:
-		return "", fmt.Errorf("%w: status %s", ErrBadHandshake, resp.Status)
+		return "", deflateParams{}, false, fmt.Errorf("%w: status %s", ErrBadHandshake, resp.Status)
 	case !headerHasToken(resp.Header, "Upgrade", "websocket"):
-		return "", fmt.Errorf("%w: missing Upgrade: websocket", ErrBadHandshake)
+		return "", deflateParams{}, false, fmt.Errorf("%w: missing Upgrade: websocket", ErrBadHandshake)
 	case !headerHasToken(resp.Header, "Connection", "upgrade"):
-		return "", fmt.Errorf("%w: missing Connection: Upgrade", ErrBadHandshake)
+		return "", deflateParams{}, false, fmt.Errorf("%w: missing Connection: Upgrade", ErrBadHandshake)
 	case resp.Header.Get("Sec-Websocket-Accept") != string(cc.accept[:]):
-		return "", fmt.Errorf("%w: Sec-WebSocket-Accept does not match the key", ErrBadHandshake)
-	case len(resp.Header.Values("Sec-Websocket-Extensions")) != 0:
-		return "", fmt.Errorf("%w: server chose an extension that was not offered", ErrBadHandshake)
+		return "", deflateParams{}, false, fmt.Errorf("%w: Sec-WebSocket-Accept does not match the key", ErrBadHandshake)
+	case len(extensions) != 0 && !cc.dialer.config.EnableCompression:
+		return "", deflateParams{}, false, fmt.Errorf("%w: server chose an extension that was not offered", ErrBadHandshake)
 	}
-	subprotocol := resp.Header.Get("Sec-Websocket-Protocol")
+	if len(extensions) != 0 {
+		var ok bool
+		if deflate, compress, ok = acceptDeflateResponse(extensions); !ok {
+			return "", deflateParams{}, false, fmt.Errorf("%w: server answered permessage-deflate with %q",
+				ErrBadHandshake, strings.Join(extensions, ", "))
+		}
+	}
+	subprotocol = resp.Header.Get("Sec-Websocket-Protocol")
 	if subprotocol != "" && !slices.Contains(cc.dialer.config.Subprotocols, subprotocol) {
-		return "", fmt.Errorf("%w: server chose subprotocol %q, which was not offered", ErrBadHandshake, subprotocol)
+		return "", deflateParams{}, false, fmt.Errorf("%w: server chose subprotocol %q, which was not offered", ErrBadHandshake, subprotocol)
 	}
-	return subprotocol, nil
+	return subprotocol, deflate, compress, nil
 }
 
 func (cc *clientConn) OnClose(_ *fib.Connection, err error) {

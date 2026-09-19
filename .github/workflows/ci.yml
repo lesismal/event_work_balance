@@ -152,7 +152,7 @@ jobs:
         run: go build -o "$RUNNER_TEMP/websocket_server" ./examples/websocket_server
       - name: Start echo server
         run: |
-          "$RUNNER_TEMP/websocket_server" -addr 127.0.0.1:9001 > "$RUNNER_TEMP/server.log" 2>&1 &
+          "$RUNNER_TEMP/websocket_server" -addr 127.0.0.1:9001 -compress > "$RUNNER_TEMP/server.log" 2>&1 &
           for _ in $(seq 50); do
             nc -z 127.0.0.1 9001 && exit 0
             sleep 0.2
@@ -160,8 +160,7 @@ jobs:
           echo "server did not start"
           cat "$RUNNER_TEMP/server.log"
           exit 1
-      # permessage-deflate (cases 12.* and 13.*) is not implemented and is
-      # excluded in fuzzingclient.json. TLS is not covered.
+      # TLS is not covered.
       - name: Run fuzzingclient
         run: |
           mkdir -p reports
