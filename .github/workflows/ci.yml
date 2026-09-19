@@ -96,6 +96,49 @@ jobs:
           fi
           exit "$status"
 
+  # HTTP/1.0 and HTTP/1.1 conformance: the fib server against net/http's
+  # client, raw sockets and curl, the fib client against net/http's server and
+  # raw servers, and SendFile under both. The peers are the standard library
+  # and the curl every runner ships, so the module gains no dependency.
+  http1-conformance:
+    name: HTTP/1.x conformance (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: go/go.mod
+      - name: curl version
+        shell: bash
+        run: curl --version
+      - name: Conformance tests
+        shell: bash
+        env:
+          # Fail rather than skip the curl cases if curl is missing.
+          FIB_REQUIRE_CURL: '1'
+        run: |
+          go test -race -count=1 -timeout 10m -v \
+            -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter' \
+            . ./http/ 2>&1 | tee "$RUNNER_TEMP/conformance.log"
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            summary=$(grep -E -B2 -A20 -- '--- FAIL|^panic:|^FAIL' "$RUNNER_TEMP/conformance.log" | head -c 60000)
+            summary=${summary//'%'/'%25'}
+            summary=${summary//$'\r'/'%0D'}
+            summary=${summary//$'\n'/'%0A'}
+            echo "::error title=HTTP/1.x conformance failed::$summary"
+          fi
+          exit "$status"
+
   cross-build:
     name: Cross build
     runs-on: ubuntu-latest
