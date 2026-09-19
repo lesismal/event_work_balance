@@ -18,10 +18,15 @@ type sendBuffer struct{ data []byte }
 // when the caller handed over an array the connection does not own. Returning
 // buf to the pool as soon as the item drains is what keeps a backpressured
 // connection from allocating a fresh array per reply.
+//
+// file, when set, makes the item a stretch of a file, which SendFile queued.
+// Where the file goes to the socket by sendfile, data stays nil; otherwise data
+// is the chunk of it read so far and not yet sent.
 type sendItem struct {
 	data   []byte
 	offset int
 	buf    *sendBuffer
+	file   *fileSegment
 }
 
 type connectionAttachment struct{ value any }
@@ -143,12 +148,50 @@ func (c *Connection) resetQueueLocked() {
 
 // releaseItemLocked returns a drained item's buffer to the server pool. An
 // outsized buffer is dropped instead so that one large message does not leave
-// every pooled buffer permanently inflated. Callers hold c.mu.
+// every pooled buffer permanently inflated. A file item closes its descriptor.
+// Callers hold c.mu.
 func (c *Connection) releaseItemLocked(item *sendItem) {
 	if item.buf != nil {
 		c.engine.releaseSendBuffer(item.buf)
 	}
+	if item.file != nil {
+		item.file.close()
+	}
 	*item = sendItem{}
+}
+
+// consumeLocked takes n bytes the socket accepted off the head of the queue.
+// Callers hold c.mu.
+func (c *Connection) consumeLocked(n int) {
+	left := int64(n)
+	for c.sendHead < len(c.sends) {
+		item := &c.sends[c.sendHead]
+		if item.file != nil && item.data == nil {
+			// Sent from the file itself, by sendfile.
+			if left < item.file.remaining {
+				item.file.advance(left)
+				break
+			}
+			left -= item.file.remaining
+			c.releaseItemLocked(item)
+			c.sendHead++
+			continue
+		}
+		remaining := int64(len(item.data) - item.offset)
+		if left < remaining {
+			item.offset += int(left)
+			break
+		}
+		left -= remaining
+		if item.file != nil && item.file.remaining > 0 {
+			// A staged chunk of a file went out; the next is read when the
+			// socket can take it. Nothing queued behind the file was sent.
+			item.data, item.offset = nil, 0
+			break
+		}
+		c.releaseItemLocked(item)
+		c.sendHead++
+	}
 }
 
 // queueLocked copies the parts into the send queue. Consecutive chunks merge
@@ -548,6 +591,19 @@ func (c *Connection) uncork() error {
 	return c.flushOutput()
 }
 
+// Flush hands what has been sent so far to the socket now. Sends made from
+// OnData are normally held until the handler returns, so that the replies to
+// one read reach the socket in a single write; a handler that streams a
+// response, and wants its first part on the wire while it produces the rest,
+// calls Flush. Sends made outside OnData are written at once and need no
+// Flush. What the socket cannot take yet stays queued, as for any send.
+func (c *Connection) Flush() error {
+	if c.udp != nil {
+		return nil
+	}
+	return c.uncork()
+}
+
 // overWriteWatermark reports whether queued output has reached the budget that
 // bounds how much this connection, or the server as a whole, buffers in
 // userspace.
@@ -669,8 +725,13 @@ func (c *Connection) flushOutput() error {
 		var n int
 		var err error
 		attempted := 0
+		// fromFile marks bytes sendfile took straight from a file, which were
+		// never counted as pending since they occupied no memory.
+		fromFile := false
 		pending := len(c.sends) - c.sendHead
-		if c.engine.useWritev && pending > 1 {
+		if head := &c.sends[c.sendHead]; head.file != nil {
+			n, attempted, fromFile, err = c.sysSendFileLocked(head)
+		} else if c.engine.useWritev && pending > 1 {
 			count := pending
 			if count > maxWritevItems {
 				count = maxWritevItems
@@ -679,6 +740,12 @@ func (c *Connection) flushOutput() error {
 			buffers := batch[:count]
 			for i := 0; i < count; i++ {
 				item := &c.sends[c.sendHead+i]
+				if item.file != nil {
+					// A file is sent on its own once everything before it
+					// has gone.
+					buffers = buffers[:i]
+					break
+				}
 				buffers[i] = item.data[item.offset:]
 				attempted += len(buffers[i])
 			}
@@ -689,19 +756,10 @@ func (c *Connection) flushOutput() error {
 			n, err = c.sysWrite(item.data[item.offset:])
 		}
 		if n > 0 {
-			c.subPending(int64(n))
-			left := n
-			for c.sendHead < len(c.sends) {
-				item := &c.sends[c.sendHead]
-				remaining := len(item.data) - item.offset
-				if left < remaining {
-					item.offset += left
-					break
-				}
-				left -= remaining
-				c.releaseItemLocked(item)
-				c.sendHead++
+			if !fromFile {
+				c.subPending(int64(n))
 			}
+			c.consumeLocked(n)
 			if n < attempted {
 				// A short write means the socket send buffer is full, so
 				// retrying now would only earn an EAGAIN. Wait for the socket

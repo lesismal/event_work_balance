@@ -621,18 +621,7 @@ func (e *Engine) completeWrite(c *Connection, n int, err error) *Connection {
 	}
 	if n > 0 {
 		c.subPending(int64(n))
-		left := n
-		for c.sendHead < len(c.sends) {
-			item := &c.sends[c.sendHead]
-			remaining := len(item.data) - item.offset
-			if left < remaining {
-				item.offset += left
-				break
-			}
-			left -= remaining
-			c.releaseItemLocked(item)
-			c.sendHead++
-		}
+		c.consumeLocked(n)
 	}
 	closeAfterSend := false
 	if c.sendHead == len(c.sends) {
@@ -793,8 +782,14 @@ func (c *Connection) awaitWritableLocked() error {
 	}
 	var bufs [maxWritevItems]syscall.WSABuf
 	count := 0
+	var stageErr error
 	for i := c.sendHead; i < len(c.sends) && count < len(bufs); i++ {
 		item := &c.sends[i]
+		if item.file != nil {
+			if stageErr = c.stageLocked(item); stageErr != nil {
+				break
+			}
+		}
 		data := item.data[item.offset:]
 		if len(data) == 0 {
 			continue
@@ -805,14 +800,15 @@ func (c *Connection) awaitWritableLocked() error {
 		bufs[count] = syscall.WSABuf{Len: uint32(len(data)), Buf: &data[0]}
 		c.inFlight[count] = data
 		count++
-		if len(data) < len(item.data)-item.offset {
+		if len(data) < len(item.data)-item.offset || item.file != nil && item.file.remaining > 0 {
 			// A truncated item has to be the last one, or the bytes after it
-			// would be sent ahead of its remainder.
+			// would be sent ahead of its remainder, and so does a file whose
+			// next chunk is still to be read.
 			break
 		}
 	}
 	if count == 0 {
-		return nil
+		return stageErr
 	}
 	c.writeOp.ov = syscall.Overlapped{}
 	c.writeInFlight = true

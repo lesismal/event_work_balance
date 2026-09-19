@@ -121,6 +121,10 @@ func (c *Connection) sendRaw(data []byte) error {
 	return nil
 }
 
+// Flush does nothing on the portable backend, whose sends have reached the
+// socket by the time they return.
+func (c *Connection) Flush() error { return nil }
+
 // SendOwned is equivalent to Send on the synchronous portable backend.
 func (c *Connection) SendOwned(data []byte) error { return c.Send(data) }
 
