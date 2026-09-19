@@ -364,6 +364,12 @@ _ = c.Respond(http.StatusOK, "text/html", page)
 - 带 `Expect: 100-continue` 的请求会自动收到 100 Continue（HTTP/1.1 与 HTTP/2），
   因为 body 总是在 handler 运行前完整读取，客户端不必等待超时才发送 body。
 
+#### 限制与待优化
+
+HTTP/2 当前的限制（body 整体缓存、handler 同步执行、固定的窗口参数等）、有意未实现的
+功能及原因、以及待优化项（安全加固、h2spec 一致性测试、流式 body、性能等）见
+[`docs/http2.zh-CN.md`](../docs/http2.zh-CN.md)。
+
 ### 异步 HTTP client
 
 `http.Client` 在 Engine 上发送 HTTP/1.1 和 HTTP/2 请求，调用方不会阻塞。响应由 Engine 的

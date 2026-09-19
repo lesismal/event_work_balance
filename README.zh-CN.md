@@ -53,7 +53,8 @@ make go
 make go-test
 ```
 
-HTTP/3（及其下的 QUIC、QPACK）当前的限制、有意未实现的功能和待优化项整理在
+HTTP/2 实现当前的限制、有意未实现的功能和待优化项整理在
+[`docs/http2.zh-CN.md`](docs/http2.zh-CN.md)；HTTP/3（及其下的 QUIC、QPACK）的整理在
 [`docs/http3.zh-CN.md`](docs/http3.zh-CN.md)。
 
 公共接口位于 [`c/include/epoll_server.h`](c/include/epoll_server.h)。普通数据调用
