@@ -82,15 +82,17 @@ func DefaultClientConfig() ClientConfig {
 	}
 }
 
-// Client sends HTTP/1.1 and HTTP/2 requests over connections an engine dials
+// Client sends HTTP/1.x and HTTP/2 requests over connections an engine dials
 // and serves, without blocking the caller. Responses are read by the engine's
 // workers and handed to a callback with their body already buffered, so a
 // callback never waits on the network.
 //
 // A client keeps its connections alive between requests. An HTTP/1.1
-// connection carries one request at a time; it does not pipeline. An HTTP/2
-// connection carries as many at once as the server allows. http:// and
-// https:// are supported; https speaks HTTP/2 when the server chooses it
+// connection carries one request at a time; it does not pipeline. A request
+// whose ProtoMinor is 0 is sent as HTTP/1.0 over an HTTP/1 connection, which
+// is kept only if the request asks for it with "Connection: keep-alive" and
+// the server agrees. An HTTP/2 connection carries as many at once as the
+// server allows. http:// and https:// are supported; https speaks HTTP/2 when the server chooses it
 // through ALPN and HTTP/1.1 over TLS otherwise, and http:// speaks HTTP/1.1
 // unless ClientConfig.UnencryptedHTTP2 is set.
 //
@@ -165,12 +167,12 @@ func (c *Client) Do(req *stdhttp.Request, callback func(*stdhttp.Response, error
 		}
 		req.Body = io.NopCloser(bytes.NewReader(body))
 	}
-	var buf bytes.Buffer
-	if err = req.Write(&buf); err != nil {
+	data, err := marshalRequest(req, body)
+	if err != nil {
 		callback(nil, err)
 		return
 	}
-	r := &clientRequest{req: req, data: buf.Bytes(), body: body, callback: callback}
+	r := &clientRequest{req: req, data: data, body: body, callback: callback}
 	// Either hook can fire before it has been stored, so both are stored under
 	// the lock finish reads them under.
 	r.mu.Lock()
@@ -182,6 +184,39 @@ func (c *Client) Do(req *stdhttp.Request, callback func(*stdhttp.Response, error
 	}
 	r.mu.Unlock()
 	c.enqueue(target, r, false)
+}
+
+// marshalRequest frames req, whose body has already been read into body, for
+// an HTTP/1 connection. net/http writes every request as HTTP/1.1; one whose
+// ProtoMajor and ProtoMinor ask for HTTP/1.0 is written as that instead, with
+// its body framed by Content-Length, since HTTP/1.0 has no chunks, and so
+// without trailers.
+func marshalRequest(req *stdhttp.Request, body []byte) ([]byte, error) {
+	http10 := req.ProtoMajor == 1 && req.ProtoMinor == 0
+	out := req
+	if http10 {
+		clone := *req
+		clone.ContentLength = int64(len(body))
+		clone.TransferEncoding = nil
+		clone.Trailer = nil
+		if len(body) == 0 {
+			clone.Body = nil
+		}
+		out = &clone
+	}
+	var buf bytes.Buffer
+	if err := out.Write(&buf); err != nil {
+		return nil, err
+	}
+	data := buf.Bytes()
+	if http10 {
+		lineEnd := bytes.Index(data, []byte("\r\n"))
+		if lineEnd < 0 || !bytes.HasSuffix(data[:lineEnd], []byte(" HTTP/1.1")) {
+			return nil, fmt.Errorf("http: cannot write request line %q as HTTP/1.0", data[:max(lineEnd, 0)])
+		}
+		data[lineEnd-1] = '0'
+	}
+	return data, nil
 }
 
 // Future is a request in flight, for callers that would rather wait on it than
@@ -810,8 +845,10 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 	}
 	// Bytes past the response, a protocol switch, or either side asking to
 	// close all mean the connection cannot carry another request.
+	// An HTTP/1.0 request only keeps its connection if it asked to.
 	reusable := !resp.Close && !r.req.Close && !cc.parser.buffered() &&
-		resp.StatusCode != stdhttp.StatusSwitchingProtocols
+		resp.StatusCode != stdhttp.StatusSwitchingProtocols &&
+		(r.req.ProtoAtLeast(1, 1) || headerHasToken(r.req.Header, "Connection", "keep-alive"))
 	cc.mu.Lock()
 	cc.current = nil
 	cc.mu.Unlock()
