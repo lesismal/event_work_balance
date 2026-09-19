@@ -43,7 +43,8 @@ make test
 ## Go implementation
 
 The matching Go implementation lives in [`go/`](go/README.zh-CN.md). It includes
-the public API, an echo-server example, and concurrent backpressure tests for
+the public API, TCP, UDP, TLS, HTTP and WebSocket echo server and client
+examples, and concurrent backpressure tests for
 both the regular `write` and batched `writev` paths. It has native backends on
 Linux (epoll), macOS (kqueue) and Windows (IOCP); other systems use a portable
 backend that preserves connection-level FIFO scheduling:

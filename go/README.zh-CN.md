@@ -91,6 +91,8 @@
 Windows 后端不会调用 `OnPriorityData`：零字节读不报告带外数据。Windows 上
 `Connection.FD()` 返回 socket handle。
 
+三个原生后端都支持 UDP（见下文 UDP 一节）。
+
 其他系统（如 FreeBSD）使用 Go 标准库网络轮询器的兼容后端：公共 API 相同，读取
 事件仍以 connection 为单位进入 TaskPool 并保持 FIFO 串行执行，但 `Backlog`、
 `UseWritev`、带外数据和背压统计不生效，`Connection.FD()` 返回 `-1`。
@@ -192,12 +194,71 @@ err = engine.DialTLS("tcp", "example.com:443", 3*time.Second, tlsConfig, handler
 - `TLSHandler.HandshakeTimeout` 限制握手时长，0 表示 `DefaultTLSHandshakeTimeout`
   （10 秒），负数表示不限制。
 - `Connection.TLSConnectionState()` 在握手完成后返回协商结果（版本、ALPN、对端证书等）。
+- 加密是通过 `Connection.SetLayer` 安装的 `fib.Layer` 完成的；其他加密或分帧协议
+  也可以用同样的方式接入，并通过 `SendRaw`、`CloseAfterSendRaw` 直接写 socket。
+  本库不内置 DTLS，UDP 上需要加密时可以用这个接口接入自己选择的实现。
 
-运行示例和测试：
+### Unix Socket
+
+`Config.Network` 设为 `"unix"` 时，`Config.Addr` 是 socket 文件路径，Engine 在
+Unix domain stream socket 上监听；`Dial`/`DialWithHandler` 的 network 传 `"unix"`、
+addr 传路径即可拨号。连接的调度、发送队列、背压、TLS 以及 http/websocket 子
+package 与 TCP 完全相同：
+
+```go
+config.Network = "unix"
+config.Addr = "/tmp/fib.sock"
+server, err := fib.Bind(config, handler)
+
+err = engine.Dial("unix", "/tmp/fib.sock", 3*time.Second, done)
+```
+
+- 语义与 `net.Listen("unix", path)` 一致：路径已存在时 `Bind` 失败（不会删除别人的
+  socket 文件），Engine `Close` 时删除自己创建的文件；Linux 上以 `@` 开头的路径是
+  abstract socket，没有文件。
+- `Connection.RemoteAddr()` 返回 `*net.UnixAddr`（对端未 bind 时名字为空）；
+  `Engine.ListenAddrs()` 返回所有监听地址（TCP、Unix、UDP 均可），`LocalAddr` 只
+  报告 TCP 地址。
+- macOS 的 Unix socket 没有带外数据，不会调用 `OnPriorityData`；Linux 5.15 起支持。
+- Windows 10 1803 起支持 AF_UNIX。由于 `ConnectEx` 只支持 TCP，Windows 上的 Unix
+  拨号在 event loop 上使用普通 `connect`（与 net 包相同），本地连接会立即完成或被拒绝。
+- 目前只支持 stream 类型（`"unix"`），不支持 `"unixgram"` 和 `"unixpacket"`。
+
+### UDP
+
+`Config.Network` 设为 `"udp"`、`"udp4"` 或 `"udp6"` 时，`Bind` 绑定 UDP socket；
+`Dial`/`DialWithHandler` 的 network 传 `"udp"` 时拨号一个已 connect 的 UDP socket。
+UDP 沿用同一套 Handler、worker 和 `Connection`：
+
+```go
+config.Network = "udp"
+config.Addr = "127.0.0.1:9001"
+server, err := fib.Bind(config, fib.HandlerFuncs{
+    Data: func(c *fib.Connection, datagram []byte) { _ = c.Send(datagram) },
+})
+addr, _ := server.LocalUDPAddr()
+```
+
+- 监听 socket 上，每个对端地址是一条独立的 `Connection`：该地址的第一个数据报触发
+  `OnOpen`，之后它的数据报都交给这条连接；`Connection.RemoteAddr()` 返回对端地址，
+  `IsUDP()` 返回 true。UDP 没有关闭报文，对端静默超过 `Config.UDPIdleTimeout`
+  （默认 `DefaultUDPIdleTimeout`，60 秒；负数表示不超时）后连接被关闭，`OnClose`
+  收到 `ErrUDPIdleTimeout`。拨号出去的 UDP 连接不做超时。
+- 数据报边界保持不变：每次 `OnData` 恰好是一个数据报，每次 `Send`/`SendParts`
+  恰好发送一个数据报。
+- UDP socket 由 event loop 自己读取（level-triggered，每轮每个 socket 最多读
+  256 个数据报），按对端地址分发到各连接的队列，再由 worker 依次调用 `OnData`；
+  每条连接最多排队 1024 个数据报，超出的直接丢弃，和内核接收缓冲满时一样。
+- 发送直接写 socket，从不排队：socket 没有空间时这个数据报被丢弃，`Send` 返回错误，
+  连接保持打开。因此 UDP 连接不参与写水位和背压。
+- Windows 上监听 socket 用 overlapped `WSARecvFrom`、拨号 socket 用带缓冲区的
+  overlapped `WSARecv` 接收，并关闭 `SIO_UDP_CONNRESET`，以免某个对端的 ICMP
+  端口不可达导致整个监听 socket 的接收失败。兼容后端用 `net.ListenUDP` 实现同样的语义。
+
+运行测试：
 
 ```sh
 cd go
-go run ./examples/echo_server 9000 true
 go test ./...
 ```
 
@@ -220,7 +281,7 @@ server, err := fib.Bind(config, handler)
 
 ```sh
 cd go
-go run ./examples/http_server
+go run ./examples/http/nontls/server   # 另开终端：go run ./examples/http/nontls/client
 ```
 
 ### 异步 HTTP client
@@ -277,11 +338,35 @@ handler := websocket.NewHandler(websocket.HandlerFuncs{
 server, err := fib.Bind(config, handler)
 ```
 
+收到的 Ping 默认自动回复同样 payload 的 Pong，收到的 Pong 默认丢弃。
+`HandlerFuncs` 的 `Ping`、`Pong` 字段可以自定义这两种行为；自己实现 Handler 时，
+额外实现 `PingHandler`（`OnPing`）或 `PongHandler`（`OnPong`）接口即可：
+
+```go
+handler := websocket.HandlerFuncs{
+    Message: onMessage,
+    // 设置 Ping 后不再自动回复，是否回 Pong 由它自己决定
+    Ping: func(c *websocket.Connection, payload []byte) {
+        _ = c.Pong(payload)
+    },
+    // 例如用于心跳检测、计算 RTT
+    Pong: func(c *websocket.Connection, payload []byte) {
+        lastPong.Store(time.Now().UnixNano())
+    },
+}
+```
+
+- 与 gorilla/websocket 的约定相同：自定义 Ping handler 会替换默认回复，需要回复时
+  自己调用 `Connection.Pong`。
+- payload 只在回调期间有效，需要保留时先复制；回调与 `OnMessage` 在同一个 worker
+  上串行执行。server 和 client（`Dialer`）两端都支持。
+- `Connection.Ping` 主动发送 Ping，payload 最多 125 字节。
+
 运行 WebSocket echo 示例（`-compress` 开启压缩）：
 
 ```sh
 cd go
-go run ./examples/websocket_server
+go run ./examples/websocket/nontls/server   # 另开终端：go run ./examples/websocket/nontls/client
 ```
 
 ### permessage-deflate 压缩
@@ -341,6 +426,37 @@ conn, resp, err := dialer.Go(url, header, handler).Wait() // Future 形式
   带掩码的服务端帧按协议错误以 1002 关闭。与握手响应同一次读到的首帧也会正常交付。
 - done 可能在任意 goroutine 上执行：握手成功在读取它的 worker 上，超时在定时器
   goroutine 上，连接失败在单独的 goroutine 上，URL 非法时在调用方 goroutine 上。
+
+## Examples
+
+每种协议一个目录，每个目录下分 TLS 与非 TLS 两个子目录（UDP 只有非 TLS：本库
+不内置 DTLS），各有一个 echo server 和一个 echo client：
+
+```text
+examples/
+├── tcp/        nontls/{server,client}  127.0.0.1:9000    tls/{server,client}  127.0.0.1:9443
+├── udp/        nontls/{server,client}  127.0.0.1:9001
+├── http/       nontls/{server,client}  127.0.0.1:8080    tls/{server,client}  127.0.0.1:8443 (HTTPS)
+└── websocket/  nontls/{server,client}  127.0.0.1:8081    tls/{server,client}  127.0.0.1:8444 (wss)
+```
+
+先启动 server，再在另一个终端运行对应的 client，例如：
+
+```sh
+cd go
+go run ./examples/tcp/tls/server
+go run ./examples/tcp/tls/client -n 10
+```
+
+- client 默认发送 5 条消息（`-n` 修改），逐条打印回显后退出；server 按 Ctrl-C 退出。
+  地址用 `-addr`（TCP、UDP）或 `-url`（HTTP、WebSocket）修改。
+- TLS server 未指定 `-cert`/`-key` 时，会为 localhost 和 127.0.0.1 签发一张自签名
+  证书，并把证书（不含私钥）写到临时目录的 `fib-example-cert.pem`；TLS client 默认
+  信任这个文件（`-ca` 修改），因此会像正式部署一样校验服务端证书。`-insecure` 跳过校验。
+- 不同协议的 TLS 写法：TCP、HTTP、WebSocket server 用 `fib.NewTLSServer` 包装原本的
+  handler，client 分别用 `Engine.DialTLS`、`ClientConfig.TLSConfig`、
+  `DialerConfig.TLSConfig`。
+- WebSocket server 的 `-compress` 开启 permessage-deflate，CI 用它跑 Autobahn 测试。
 
 ## GOMAXPROCS
 

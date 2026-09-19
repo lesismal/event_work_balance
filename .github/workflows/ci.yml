@@ -149,7 +149,7 @@ jobs:
           cache-dependency-path: go/go.mod
       - name: Build echo server
         working-directory: go
-        run: go build -o "$RUNNER_TEMP/websocket_server" ./examples/websocket_server
+        run: go build -o "$RUNNER_TEMP/websocket_server" ./examples/websocket/nontls/server
       - name: Start echo server
         run: |
           "$RUNNER_TEMP/websocket_server" -addr 127.0.0.1:9001 -compress > "$RUNNER_TEMP/server.log" 2>&1 &
